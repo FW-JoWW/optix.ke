@@ -1,0 +1,26 @@
+import pandas as pd
+from state.state import AnalystState
+from nodes.eda_node import eda_node
+from nodes.statistical_analysis_node import statistical_analysis_node
+from nodes.insight_synthesis_node import insight_synthesis_node
+import pprint
+
+# Dummy dataset
+df = pd.DataFrame({
+    "revenue": [1000, 1100, 950, 1300, 5000],
+    "ad_spend": [100, 120, 130, 115, 500],
+    "channel": ["email", "social", "email", "social", "email"]
+})
+
+state: AnalystState = {"dataset": df, "business_question": "Analyze revenue vs ad spend by channel."}
+
+# Run full pipeline
+state = eda_node(state)
+state = statistical_analysis_node(state)
+state = insight_synthesis_node(state)
+
+# Print insights
+print("=== INSIGHTS ===")
+pprint.pprint(state["insights"])
+print("\n=== CLARIFICATION QUESTIONS ===")
+pprint.pprint(state["clarification_questions"])
