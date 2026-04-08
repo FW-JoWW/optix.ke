@@ -11,6 +11,16 @@ __pycache__/
 # Virtual enviroment
 myenv/
 
+# Data
+data/
+*.csv
+*.xlsx
+
+# Outputs 
+charts/
+*.png
+*.jpg
+
 # OS files
 .DS_Store
 Thumbs.db

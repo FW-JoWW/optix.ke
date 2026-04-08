@@ -1,14 +1,66 @@
 # nodes/column_selection_node.py
 from state.state import AnalystState
 from utils.semantic_matcher import semantic_column_match
+
+def column_selection_node(state: AnalystState) -> AnalystState:
+
+    column_registry = state.get("column_registry")
+    df = state.get("analysis_dataset")
+
+    if column_registry is None:
+        raise ValueError("Column registry missing")
+
+    if df is None:
+        raise ValueError("Filtered dataset missing")
+
+    question = state.get("business_question", "")
+    intent = state.get("intent", {})
+
+    candidate_columns = list(column_registry.keys())
+
+    matched_columns = semantic_column_match(
+        question,
+        candidate_columns,
+        threshold=0.4
+    )
+
+    intent_columns = [f["column"] for f in intent.get("filters", [])]
+
+    if intent_columns:
+        selected_columns = list(set(intent_columns + matched_columns))
+    else:
+        selected_columns = matched_columns
+
+    if not selected_columns:
+        selected_columns = df.columns.tolist()[:5]
+
+    selected_columns = [c for c in selected_columns if c in df.columns]
+
+    if not selected_columns:
+        raise ValueError("No valid colimns selected after filtering")
+
+    analysis_df = df[selected_columns].copy()
+
+    state["selected_columns"] = selected_columns
+    state["analysis_dataset"] = analysis_df
+
+    print("\n=== COLUMN SELECTION ===")
+    print(selected_columns)
+
+    return state
+
+
+"""# nodes/column_selection_node.py
+from state.state import AnalystState
+from utils.semantic_matcher import semantic_column_match
 import pandas as pd
 
 def column_selection_node(state: AnalystState) -> AnalystState:
-    """
+    '''
     Selects columns for analysis using semantic roles and
     embedding-based matching with the business question.
     Works for any dataset.
-    """
+    '''
 
     # Load column registry and dataset
     column_registry = state.get("column_registry")
@@ -39,8 +91,9 @@ def column_selection_node(state: AnalystState) -> AnalystState:
     intent_columns = [f["column"] for f in intent.get("filters", [])]
     if intent.get("group_by"):
         intent_columns.append(intent["group_by"])
-    matched_columns = list(set(intent_columns + candidate_columns))
-    #matched_columns = semantic_column_match(question, candidate_columns, threshold=0.4)
+        
+    #matched_columns = list(set(intent_columns + candidate_columns))
+    matched_columns = semantic_column_match(question, candidate_columns, threshold=0.4)
 
     # Further classify columns by type for analysis heuristics
     numeric_cols = [col for col in matched_columns if column_registry[col]["semantic_role"] == "numeric_measure"]
@@ -62,20 +115,52 @@ def column_selection_node(state: AnalystState) -> AnalystState:
     elif any(k in question_lower for k in trend_keywords):
         selected_columns = datetime_cols[:1] + numeric_cols[:2]
     else:
-        selected_columns = matched_columns[:4]
+        selected_columns = list(set(
+            intent_columns +
+            numeric_cols[:3] + 
+            categorical_cols[:2]
+        ))
+        #selected_columns = matched_columns[:4]
 
     
     # Force include columns explicitly mentioned in question
-    forced_columns = [
+    '''forced_columns = [
         col for col in df.columns
         if col.lower() in question_lower
-    ]
+    ]'''
 
-    selected_columns = list(set(selected_columns + forced_columns))   
+    # selected_columns = list(set(selected_columns + forced_columns))
 
-    # Ensure columns exist in the dataframe
-    selected_columns = [col for col in selected_columns if col in df.columns]
+    # -------------------------
+    # FORCE INCLUDE INTENT COLUMNS
+    # -------------------------
+    intent = state.get("intent", {})
+    
+    needed_cols = []
 
+    for f in intent.get("filters", []):
+        needed_cols.append(f["column"])
+    
+    if intent.get("group_by"):
+        needed_cols.append(intent["group_by"])
+     
+    if intent.get("aggregate_column"):
+        needed_cols.append(intent["aggregate_column"])
+
+    needed_cols = [c for c in needed_cols if c in df.columns]
+    
+    selected_columns = list(set(selected_columns + needed_cols))
+    '''# Ensure columns exist in the dataframe
+    selected_columns = [col for col in selected_columns if col in df.columns]'''
+
+    '''# Store original dataset for filter recovery
+    if "analysis_dataset_original" not in state:
+        state["analysis_dataset_original"] = df.copy()'''
+    
+    # Remove invalid columns
+    if not needed_cols:
+        raise ValueError("No valid selected after validation.")
+    
     # Build the analysis dataset
     analysis_df = df[selected_columns].copy()
 
@@ -96,3 +181,4 @@ def column_selection_node(state: AnalystState) -> AnalystState:
 
     return state
 
+"""

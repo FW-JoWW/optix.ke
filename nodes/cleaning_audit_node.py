@@ -28,11 +28,15 @@ def cleaning_audit_node(state: AnalystState) -> AnalystState:
         status = "not_checked"
 
         # -----------------------------
-        # Check missing value imputation
+        # NUMERIC CLEANING VALIDATION
         # -----------------------------
-        if action == "impute" and col in df.columns:
-            remaining_missing = df[col].isnull().sum()
-            status = f"{remaining_missing} missing values remaining" if remaining_missing > 0 else "OK"
+        if action == "numeric_cleaning":
+            numeric_col = df.select_dtypes(include=[np.number]).columns.tolist
+            non_numeric_col = [
+                c for c in df.columns
+                if c not in numeric_col
+            ]
+            status = f"{len(numeric_col)} numeric columns validated"
 
         # -----------------------------
         # Check duplicates removal
@@ -41,6 +45,14 @@ def cleaning_audit_node(state: AnalystState) -> AnalystState:
             duplicates = df.duplicated().sum()
             status = f"{duplicates} duplicates remaining" if duplicates > 0 else "OK"
 
+        # -------------------------------
+        # Check missing value imputation
+        # -------------------------------
+        elif action == "impute" and col in df.columns:
+            remaining_missing = df[col].isnull().sum()
+            status = f"{remaining_missing} missing values remaining" if remaining_missing > 0 else "OK"
+
+        
         # -----------------------------
         # Check column drop
         # -----------------------------
@@ -58,13 +70,16 @@ def cleaning_audit_node(state: AnalystState) -> AnalystState:
         # Check outliers capping
         # -----------------------------
         elif action == "investigate_or_cap" and col in df.columns:
-            Q1 = df[col].quantile(0.25)
-            Q3 = df[col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower = Q1 - 1.5 * IQR
-            upper = Q3 + 1.5 * IQR
-            outliers = df[(df[col] < lower) | (df[col] > upper)]
-            status = f"{len(outliers)} outliers remaining" if len(outliers) > 0 else "OK"
+            if pd.api.types.is_numeric_dtype(df[col]):
+                Q1 = df[col].quantile(0.25)
+                Q3 = df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower = Q1 - 1.5 * IQR
+                upper = Q3 + 1.5 * IQR
+                outliers = df[(df[col] < lower) | (df[col] > upper)]
+                status = f"{len(outliers)} outliers remaining" if len(outliers) > 0 else "OK"
+            else:
+                status = "Skipped (not numeric)"
 
         audit_results.append({
             "column": col,
@@ -72,6 +87,22 @@ def cleaning_audit_node(state: AnalystState) -> AnalystState:
             "status": status
         })
 
+    # ------------------------------------
+    # GLOBAL VALIDATION: SCALING WARNING
+    # ------------------------------------
+    scaling_warnings = state.get("analysis_evidence", {}).get("scaling_warnings", [])
+
+    if scaling_warnings:
+        audit_results.append({
+            "column": None,
+            "action": "scaling_validation",
+            "status": f"{len(scaling_warnings)} potential scaling issue detected",
+            "details": scaling_warnings
+        })
+
+    # ---------------------------
+    # SAVE RESULTS
+    # ---------------------------
     state["cleaning_audit"] = audit_results
 
     print("\n=== CLEANING AUDIT RESULTS ===")

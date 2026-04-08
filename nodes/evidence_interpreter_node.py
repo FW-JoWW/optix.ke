@@ -13,6 +13,13 @@ def evidence_interpreter_node(state: AnalystState) -> AnalystState:
     Interprets raw statistical tool outputs and converts them into
     structured, validated story candidates.
     """
+    intent = state.get("intent", {})
+    
+    # SKIP FOR AGGREGATION QUERIES
+    if intent.get("aggregation"):
+        print("\n[SKIP] Aggregation query — no statistical interpretation needed")
+        state.setdefault("analysis_evidence", {})["story_candidates"] = []
+        return state
 
     evidence = state.setdefault("analysis_evidence", {})
     tool_results = evidence.get("tool_results", {})
@@ -30,6 +37,11 @@ def evidence_interpreter_node(state: AnalystState) -> AnalystState:
     raw_df = state.get("raw_analysis_dataset")
 
     for key, result in tool_results.items():
+
+        # HARD GUARD
+        if not isinstance(result, dict):
+            print(f"[SKIP INVALID TOOL RESULT] {key}: {result}")
+            continue
 
         if result.get("tool") != "anova":
             continue
@@ -86,7 +98,6 @@ def evidence_interpreter_node(state: AnalystState) -> AnalystState:
         critic_output = {
             "issues": []
         }
-
 
         # -----------------------------
         # VALIDATION PIPELINE

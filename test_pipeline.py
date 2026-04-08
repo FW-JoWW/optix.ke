@@ -3,6 +3,7 @@ import pandas as pd
 from nodes.data_intake_node import data_intake_node
 from nodes.dataset_profiler_node import dataset_profiler_node
 from nodes.column_semantic_classifier_node import column_semantic_classifier_node
+from nodes.intent_parser_node import intent_parser_node
 from nodes.column_selection_node import column_selection_node
 
 # NEW NODES
@@ -29,7 +30,7 @@ def run_pipeline():
     # -----------------------------
     # business question
     # -----------------------------
-    state["business_question"] = "Show me car-make with price between 10k and 18k"
+    state["business_question"] = " bmw or audi"
 
     print("\n==============================")
     print("RUNNING ANALYST PIPELINE TEST")
@@ -42,15 +43,29 @@ def run_pipeline():
     state = data_intake_node(state)
     state = dataset_profiler_node(state)
     state = column_semantic_classifier_node(state)
-    state = column_selection_node(state)
+    state = intent_parser_node(state)
+    #state = column_selection_node(state)
 
     # -----------------------------
     # ANALYTICS ENGINE
-    # -----------------------------
-    state = numeric_cleaning_node(state)
-    state = row_filter_node(state)
+    # -----------------------------   
     state = initialize_analysis_evidence_node(state)
+    #state = numeric_cleaning_node(state)
+    state = row_filter_node(state)
+    # stop if filtering failed
+    if state.get("halt_pipeline"):
+        print("\n PIPELINE STOPPED:")
+        print(state.get("error"))
+        return state
+    
+    state = column_selection_node(state)
+    #state = numeric_cleaning_node(state)
     state = analysis_planner_node(state)
+    # If filter-only -> skip heavy analysis
+    if state.get("intent", {}).get("type") == "filter":
+        from nodes.output_mode_node import output_mode_node
+        state = output_mode_node(state)
+        return state
     state = tool_executor_node(state)
     state = evidence_interpreter_node(state)
     state = story_scoring_engine_node(state)
@@ -88,6 +103,8 @@ def run_pipeline():
 
     print("\nClarification Questions:")
     print(evidence.get("clarification_questions"))
+
+    return state
 
 
 if __name__ == "__main__":

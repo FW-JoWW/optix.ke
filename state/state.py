@@ -1,3 +1,4 @@
+#state/state.py
 from typing import TypedDict, Optional, Dict, Any, List
 import pandas as pd
 
@@ -9,12 +10,20 @@ class AnalystState(TypedDict):
     # dataset
     dataset_path: Optional[str]
     dataframe: Optional[pd.DataFrame]
+    data_quality_issues: Optional[Dict[str, Any]]
+    cleaning_plan: Optional[List[Dict[str, Any]]]
     cleaned_data: Optional[pd.DataFrame]
+    active_dataset: Optional[str]
 
     # dataset understanding
     dataset_profile: Optional[Dict[str, Any]]
     data_validation: Optional[Dict[str, Any]]
+    column_registry: Optional[Dict[str, Any]]
     relevant_columns: Optional[List[str]]
+        
+    # intent
+    intent: Optional[Dict[str, Any]]
+    intent_confidence: Optional[float]
     
     # analysis plan
     analysis_plan: Optional[List[str]]

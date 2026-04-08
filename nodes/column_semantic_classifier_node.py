@@ -13,9 +13,14 @@ def column_semantic_classifier_node(state: AnalystState) -> AnalystState:
     Stores results in state['column_registry'].
     """
 
-    df = state.get("cleaned_data")
+    if "cleaned_data" in state and state["cleaned_data"] is not None:
+        state["active_dataset"] = "cleaned_data"
+    else:
+        state["active_dataset"] = "dataframe"
+    '''df = state.get("cleaned_data")
     if df is None:
-        df = state.get("dataframe")
+        df = state.get("dataframe")'''
+    df = state.get(state.get("active_dataset"))
         
     profile = state.get("dataset_profile")
 

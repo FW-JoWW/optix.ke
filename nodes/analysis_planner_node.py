@@ -5,42 +5,72 @@ from typing import List, Dict
 
 def analysis_planner_node(state: AnalystState) -> AnalystState:
     """
-    Determines which analyses to perform based on:
-    - business question
-    - selected dataset
-    - existing dataset profile
-    - sementic column registry
+    Determines:
+    - What analysis to run
+    - What output mode to use
     """
 
+    intent = state.get("intent", {})
+    evidence = state.setdefault("analysis_evidence", {})
+    
+    state["output_mode"] = "analysis" # default fallback
+
+    if evidence.get("grouped_summary") is not None:
+        state["output_mode"] = "grouped_summary"
+    
+    # HANDLE FILTER QUERIES FIRST
+    if intent.get("type") == "filter":
+        if intent.get("group_by"):
+            state["analysis_evidence"]["analysis_plan"]
+        else:
+            state["output_mode"] = "raw_filter"
+    else:
+        state["output_mode"] = "analysis"
+    print("\n=== OUTPUT MODE ===")
+    print(state["output_mode"])
+    
+    # ----------------------------------------
+    # HANDLE FILTER MODES
+    # ----------------------------------------
+    
+    if state["output_mode"] in ["raw_filter", "grouped_summary"]:
+        evidence["analysis_plan"] = []
+        print("\n=== ANALYSIS PLAN ===")
+        print("No statistical analysis required.")
+        return state
+    
+    # ---------------------
+    # NORMAL ANALYSIS FLOW
+    # ---------------------
+    intent = state.get("intent", {})
     question = state.get("business_question", "").lower()
 
-    #df = state.get("analysis_dataset")
-    df = None
+    if not intent:
+        raise ValueError("Intent missing before analysis planning")
+
+    '''df = None
     if state.get("analysis_dataset") is not None:
         df = state["analysis_dataset"]
     elif state.get("cleaned_data") is not None:
         df = state["cleaned_data"]    
     elif state.get("dataframe") is not None:
-        df = state["dataframe"]
-
+        df = state["dataframe"]'''
+    if "cleaned_data" in state and state["cleaned_data"] is not None:
+        state["active_dataset"] = "cleaned_data"
+    else:
+        state["active_dataset"] = "dataframe"
+    
+    df = state.get("analysis_dataset")
+    if df is None:
+        df = state.get(state.get("active_dataset"))
 
     if df is None:
         raise ValueError("No analysis dataset found.")
 
-    evidence = state.setdefault("analysis_evidence", {})
-    #eda = state.get("eda_results", {})
-
-    #columns = [c.lower() for c in df.columns]
     dataset_profile = state.get("dataset_profile", {})
     column_registry = state.get("column_registry", {})
-    #numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
-    #categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
     selected_columns = state.get("selected_columns", list(df.columns))
     
-    #numeric_cols = dataset_profile.get("numeric_columns", [])
-    #categorical_cols = dataset_profile.get("categorical_columns", [])
-
-    #remove identifiers from analysis
     numeric_cols = [
         c for c in dataset_profile.get("numeric_columns", [])
         if c in selected_columns
@@ -72,9 +102,6 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     # -------------------------
 
     if any(word in question for word in ["relationship", "correlation", "affect", "impact"]):
-
-        #numeric_mentioned = [c for c in mentioned_columns if c in numeric_cols]
-
         if len(mentioned_numeric) >= 2:
             col1, col2 = mentioned_numeric[:2]
             plan.append({
@@ -102,8 +129,7 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     # Group comparison
     # -------------------------
 
-    if any(word in question for word in ["compare", "difference", "better"]):
-        
+    if any(word in question for word in ["compare", "difference", "better"]):  
         for num in numeric_cols:
             for cat in categorical_cols:
                 n_unique = unique_counts.get(cat, 0)
@@ -113,6 +139,7 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
                     tool = "anova"
                 else:
                     continue
+                
                 plan.append({
                     "tool": tool,
                     "columns": [num, cat]

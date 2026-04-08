@@ -12,6 +12,24 @@ def detect_issues(df: pd.DataFrame) -> dict:
 
     total_rows = len(df)
 
+    # ---------------------
+    # Build numeric cache
+    # ---------------------
+    numeric_cache = {}
+    
+    for col in df.columns:
+        cleaned = (
+            df[col]
+            .astype(str)
+            .str.replace(r"[^\d\.\-]", "", regex=True)
+        )
+
+        coerced = pd.to_numeric(cleaned, errors="coerce")
+
+        # If ≥80% values are numeric → treat as numeric column
+        if coerced.notna().mean() >= 0.8:
+            numeric_cache[col] = coerced
+
     # -----------------------------
     # Missing values
     # -----------------------------
@@ -46,7 +64,7 @@ def detect_issues(df: pd.DataFrame) -> dict:
     # -----------------------------
     # Numeric columns: outliers
     # -----------------------------
-    numeric_cols = []
+    '''numeric_cols = []
 
     for col in df.columns:
         cleaned = (
@@ -58,15 +76,15 @@ def detect_issues(df: pd.DataFrame) -> dict:
         coerced = pd.to_numeric(cleaned, errors="coerce")
 
         if coerced.notna().sum() / len(df) > 0.8:
-            numeric_cols.append(col)
+            numeric_cols.append(col)'''
     #numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    for col in numeric_cols:
-        Q1 = df[col].quantile(0.25)
-        Q3 = df[col].quantile(0.75)
+    for col, series in numeric_cache.items():
+        Q1 = series.quantile(0.25)
+        Q3 = series.quantile(0.75)
         IQR = Q3 - Q1
         lower = Q1 - 1.5 * IQR
         upper = Q3 + 1.5 * IQR
-        outlier_count = df[(df[col] < lower) | (df[col] > upper)][col].count()
+        outlier_count = series[(series < lower) | (series > upper)].count()
         if outlier_count > 0:
             issues.append({
                 "column": col,
@@ -79,7 +97,7 @@ def detect_issues(df: pd.DataFrame) -> dict:
     # Constant columns
     # -----------------------------
     for col in df.columns:
-        if df[col].nunique() == 1:
+        if df[col].nunique(dropna=False) == 1:
             issues.append({
                 "column": col,
                 "issue_type": "constant_column",
@@ -91,7 +109,10 @@ def detect_issues(df: pd.DataFrame) -> dict:
     # -----------------------------
     categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
     for col in categorical_cols:
-        if df[col].nunique() / total_rows > 0.8:
+        if total_rows == 0:
+            continue
+        unique_ratio = df[col].nunique() / total_rows 
+        if unique_ratio > 0.8:
             issues.append({
                 "column": col,
                 "issue_type": "high_cardinality",
@@ -102,15 +123,15 @@ def detect_issues(df: pd.DataFrame) -> dict:
     # Datatype mismatches (numeric stored as object)
     # -----------------------------
     for col in df.columns:
-        if df[col].dtype == "object":
-            try:
-                pd.to_numeric(df[col])
-                issues.append({
-                    "column": col,
-                    "issue_type": "numeric_as_object",
-                    "severity": "medium"
-                })
-            except:
-                pass
+        if df[col].dtype == "object" and col in numeric_cache:
+            '''try:
+                pd.to_numeric(df[col])'''
+            issues.append({
+                "column": col,
+                "issue_type": "numeric_as_object",
+                "severity": "medium"
+            })
+            '''except:
+                pass'''
 
     return {"detected_issues": issues}
