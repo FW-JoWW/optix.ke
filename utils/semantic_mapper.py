@@ -1,3 +1,4 @@
+# utils/semantic_mapper.py
 def map_semantic_filters(query, df, numeric_cols):
     """
     Converts words like 'cheap', 'expensive' into numeric filters

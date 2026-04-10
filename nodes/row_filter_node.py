@@ -2,6 +2,13 @@
 import pandas as pd
 from state.state import AnalystState
 
+def is_number(value):
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+    
 # -------------------
 #  AST EVALUATOR
 # -------------------
@@ -31,7 +38,66 @@ def evaluate_condition(df, node):
         elif op == "contains":
             return col_values.str.contains(val, na=False)
     
-    # numeric or compatible ops
+    # -------------------------
+    # NUMERIC SAFE OPERATIONS
+    # -------------------------
+
+    is_series_numeric = pd.api.types.is_numeric_dtype(series)
+    is_val_numeric = is_number(val) or (
+        isinstance(val, (list, tuple)) and all(is_number(v) for v in val)
+    )
+
+    # ❌ If operation requires numeric but data is not numeric → skip safely
+    numeric_ops = {">", "<", ">=", "<=", "between"}
+
+    if op in numeric_ops:
+        if not is_series_numeric or not is_val_numeric:
+            # return all False instead of crashing
+            return pd.Series([False] * len(df), index=df.index)
+
+        numeric_series = pd.to_numeric(series, errors="coerce")
+
+        if op == "between":
+            low, high = val
+            low, high = float(low), float(high)
+            if low > high:
+                low, high = high, low
+            return (numeric_series >= low) & (numeric_series <= high)
+
+        val = float(val)
+
+        if op == ">":
+            return numeric_series > val
+        elif op == "<":
+            return numeric_series < val
+        elif op == ">=":
+            return numeric_series >= val
+        elif op == "<=":
+            return numeric_series <= val
+
+    # -------------------------
+    # NON-NUMERIC SAFE OPS
+    # -------------------------
+
+    if op == "equals":
+        if is_series_numeric and is_val_numeric:
+            return pd.to_numeric(series, errors="coerce") == float(val)
+        else:
+            return series.astype(str).str.lower() == str(val).lower()
+
+    elif op in ["!=", "not equals"]:
+        if is_series_numeric and is_val_numeric:
+            return pd.to_numeric(series, errors="coerce") != float(val)
+        else:
+            return series.astype(str).str.lower() != str(val).lower()
+
+    elif op == "contains":
+        return series.astype(str).str.lower().str.contains(str(val).lower(), na=False)
+
+    # fallback
+    return pd.Series([False] * len(df), index=df.index)
+
+    '''# numeric or compatible ops
     numeric_series = pd.to_numeric(series, errors="coerce")
     if op == "between":
         low, high = val
@@ -54,7 +120,7 @@ def evaluate_condition(df, node):
         return numeric_series != val if pd.api.types.is_numeric_dtype(series) else series.astype(str).str.lower() != str(val).lower()
     #fallback: mark all Fales if numeric conversion fails
     #return pd.Series([False] * len(df), index=df.index)
-    raise ValueError(f"Unhandled condition: {node}")
+    raise ValueError(f"Unhandled condition: {node}")'''
     
 # --------------------
 # AST/LOGIC EVALUATOR

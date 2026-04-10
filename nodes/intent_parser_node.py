@@ -4,6 +4,7 @@ from state.state import AnalystState
 from nodes.llm_reasoning_node import llm_reasoning_node
 from utils.semantic_mapper import map_semantic_filters
 
+# --- NUMERIC SYNONYMS ---
 NUMERIC_SYNONYMS = {
     "under": "<",
     "below": "<",
@@ -12,6 +13,10 @@ NUMERIC_SYNONYMS = {
     "above": ">",
     "more than": ">",
     "not equals": "!=",
+    "newer than": ">",
+    "older than": "<",
+    "after": ">",
+    "before": "<",
     "!=": "!=",
     "<=": "<=",
     ">=": ">="
@@ -28,6 +33,30 @@ def map_numeric_synonyms(query: str):
 # ------------------
 def normalize(text: str):
     return text.lower().replace("_", "").replace(" ", "")
+
+def classify_analytic_intent(query: str):
+    """
+    Classifies high-level analytic intent from user query.
+    """
+
+    query = query.lower()
+
+    intent_map = {
+        "comparison": ["compare", "vs", "versus", "difference", "against"],
+        "temporal": ["trend", "over time", "per day", "per month", "growth", "decline"],
+        "composition": ["breakdown", "distribution", "percentage", "share", "portion"],
+        "relationship": ["correlation", "relationship", "impact", "effect", "influence"],
+        "extremes": ["top", "bottom", "highest", "lowest", "max", "min"],
+        "profiling": ["average", "mean", "median", "summary", "stats"],
+        "investigative": ["why", "drill down", "details", "explain"],
+        "predictive": ["forecast", "predict", "what if", "estimate"]
+    }
+
+    for intent, keywords in intent_map.items():
+        if any(word in query for word in keywords):
+            return intent
+
+    return "unknown"
 
 def parse_number(value: str):
     value = value.lower().strip()
@@ -55,6 +84,8 @@ def build_numeric_conditions(query: str, df):
     patterns = [
         (r'([\w_]+)\s*>\s*([\d\.kKmM]+)', '>'),
         (r'([\w_]+)\s*<\s*([\d\.kKmM]+)', '<'),
+        (r'([\w_]+)\s+(newer than|after)\s+([\d]{4})', '>'),
+        (r'([\w_]+)\s+(older than|before)\s+([\d]{4})', '<'),
         (r'([\w_]+)\s+between\s+([\d\.kKmM]+)\s+&&\s+([\d\.kKmM]+)', 'between')
     ]
     # VALIDATE COLUMN BEFORE ADDING
@@ -177,6 +208,34 @@ def apply_negation(node):
         }
     return node
 
+def convert_reasoning_to_ast(reasoning, df):
+    if not reasoning:
+        return None
+
+    constraints = reasoning.get("constraints", [])
+    logic_op = reasoning.get("logic", "and")
+
+    nodes = []
+
+    for c in constraints:
+        node = {
+            "type": "condition",
+            "column": c.get("field"),
+            "operator": c.get("operator"),
+            "value": c.get("value"),
+            "confidence": 0.8 if c.get("confidence") == "high" else 0.6
+        }
+        nodes.append(node)
+
+    if len(nodes) == 1:
+        return nodes[0]
+
+    return {
+        "type": "logic",
+        "operator": logic_op if logic_op in ["and", "or"] else "and",
+        "conditions": nodes
+    }
+
 # ----------------------------
 # AST BUILDING
 # ----------------------------
@@ -268,6 +327,30 @@ def build_ast(query: str, df):
 # FLAT FILTER EXTRACTOR
 # -----------------------
 def extract_filters(node):
+    """
+    Flattens AST into a list of filters while preserving OR blocks.
+    """
+    if node is None:
+        return []
+
+    # Leaf condition
+    if node["type"] == "condition":
+        return [node]
+
+    filters = []
+
+    if node["type"] == "logic":
+        if node["operator"] == "or":
+            # PRESERVE OR BLOCK as a single unit
+            filters.append(node)
+        else:
+            # Flatten AND
+            for child in node.get("conditions", []):
+                filters.extend(extract_filters(child))
+
+    return filters
+
+'''def extract_filters(node):
     if node is None:
         return None
 
@@ -289,9 +372,45 @@ def extract_filters(node):
             "conditions": [extract_filters(child) for child in node.get("conditions", [])]
         }
 
-    return node
+    return node'''
 
-def build_final_ast(processed_node):
+def build_final_ast(filters):
+    """
+    Rebuilds AST from flat filters while preserving OR logic blocks.
+    """
+    if not filters:
+        return None
+
+    logic_nodes = []
+    conditions = []
+
+    for f in filters:
+        if f.get("type") == "logic":
+            logic_nodes.append(f)  # keep OR blocks intact
+        else:
+            conditions.append({
+                "type": "condition",
+                "column": f["column"],
+                "operator": f["operator"],
+                "value": f["value"]
+            })
+
+    nodes = []
+    nodes.extend(logic_nodes)
+    nodes.extend(conditions)
+
+    if not nodes:
+        return None
+
+    if len(nodes) == 1:
+        return nodes[0]
+
+    return {
+        "type": "logic",
+        "operator": "and",
+        "conditions": nodes
+    }
+'''def build_final_ast(processed_node):
     # If there's nothing there, return None
     if not processed_node:
         return None
@@ -308,7 +427,65 @@ def build_final_ast(processed_node):
             "type": "logic",
             "operator": "and",
             "conditions": processed_node
-        }
+        }'''
+
+# ------------------------
+# INTENT DETECTION 
+# ------------------------
+def detect_intents(query: str):
+    query = query.lower()
+
+    intents = []
+
+    # --- COMPARISON ---
+    if any(word in query for word in ["compare", "vs", "versus", "difference", "between"]):
+        intents.append({"type": "comparison", "confidence": 0.8})
+
+    # --- TEMPORAL ---
+    if any(word in query for word in ["over time", "trend", "monthly", "yearly", "daily", "growth"]):
+        intents.append({"type": "temporal", "confidence": 0.75})
+
+    # --- EXTREMES ---
+    if any(word in query for word in ["top", "highest", "lowest", "max", "min"]):
+        intents.append({"type": "extremes", "confidence": 0.8})
+
+    # --- COMPOSITION ---
+    if any(word in query for word in ["percentage", "ratio", "breakdown", "share"]):
+        intents.append({"type": "composition", "confidence": 0.75})
+
+    # --- PROFILING ---
+    if any(word in query for word in ["average", "mean", "distribution", "median"]):
+        intents.append({"type": "profiling", "confidence": 0.7})
+
+    return intents
+# ------------------------
+# INTENT → OPERATIONS (STEP 3)
+# ------------------------
+def map_intents_to_operations(intents):
+    ops = []
+
+    mapping = {
+        "comparison": ["groupby", "aggregate"],
+        "temporal": ["time_series"],
+        "extremes": ["sort", "limit"],
+        "composition": ["ratio"],
+        "profiling": ["describe"]
+    }
+
+    for intent in intents:
+        intent_type = intent.get("type")
+        if intent_type in mapping:
+            ops.extend(mapping[intent_type])
+
+    # remove duplicates while preserving order
+    seen = set()
+    final_ops = []
+    for op in ops:
+        if op not in seen:
+            seen.add(op)
+            final_ops.append(op)
+
+    return final_ops
 
 # ------------------------
 # MAIN NODE
@@ -329,8 +506,14 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     # AST BUILDING
     # --------------
     is_negation = detect_negation(query)
-    ast = build_ast(query, df)
-    #filters = extract_filters(ast) #if ast else {}
+
+    reasoning = state.get("llm_reasoning")
+
+    if reasoning:
+        ast = convert_reasoning_to_ast(reasoning, df)
+    else:
+        ast = build_ast(query, df)
+    
     #final_filters = build_final_ast(filters)
     
     # ------------------------
@@ -344,7 +527,7 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
             semantic_ast = {
                 "type": "logic",
                 "operator": "and",
-                "condition": semantic_filters
+                "conditions": semantic_filters
             }
             if ast:
                 ast = {
@@ -379,13 +562,22 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     # -----------------------
     # INITIAL INTENT
     # -----------------------
+    analytic_intent = classify_analytic_intent(query)
+    filters = extract_filters(ast) 
+
     intent = {
         "type": "ast",
+        "analytic_intent": analytic_intent,
         "ast": ast,
-        "filters": ast,#filters,
+        "filters": filters,
         "group_by": None,
         "aggregation": None,
-        "aggregate_column": None
+        "aggregate_column": None,
+
+        "intents": [],
+        "operations_hint": [],
+        "output_mode": None,
+        "confidence": None
     }
     # ------------------------
     # AGGREGATION 
@@ -407,9 +599,22 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
                     if normalize(col) in normalize(query):
                         intent["aggregate_column"] = col
                         break
-    
                 break
-    
+
+        # If no aggregation keyword found, infer from analytic intent
+        if not intent["aggregation"]:
+            intent_type = intent.get("analytic_intent")
+            if intent_type in ["comparison", "extremes", "profiling"]:
+                # Default to mean for comparison/profiling
+                intent["aggregation"] = "mean"
+                if numeric_columns:
+                    intent["aggregate_column"] = numeric_columns[0]
+            elif intent_type == "temporal":
+                # For trends, default to sum over time
+                intent["aggregation"] = "sum"
+                if numeric_columns:
+                    intent["aggregate_column"] = numeric_columns[0]
+
     # ------------------------
     # GROUP BY )
     # ------------------------
@@ -420,39 +625,99 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
             if normalize(col) in normalize(query):
                 intent["group_by"] = col
                 break
+
+        # If no group_by detected, infer from analytic intent
+        if not intent["group_by"]:
+            if intent_type in ["comparison", "composition"]:
+                if categorical_columns:
+                    intent["group_by"] = categorical_columns[0]
+    
+    '''# --- ENSURE NEGATION APPLIED TO FILTERS ---
+    if filters:
+        for f in filters:
+            if f.get("type") == "condition" and is_negation:
+                apply_negation_to_condition(f)
+    
+    # --- MERGE SEMANTIC FILTERS INTO AST ---
+    if df is not None and filters:
+        if ast is None:
+            ast = {
+                "type": "logic",
+                "operator": "and",
+                "conditions": filters
+            }
+        else:
+            # Combine existing AST with filters
+            ast = {
+                "type": "logic",
+                "operator": "and",
+                "conditions": [ast] + filters
+            }'''
     
     state["intent"] = intent
     
+    # ------------------------
+    # APPLY INTENT DETECTION
+    # ------------------------
+    detected_intents = detect_intents(query)
+    state["intent"]["intents"] = detected_intents
+
+    # ------------------------
+    # APPLY OPERATION MAPPING
+    # ------------------------
+    operations_hint = map_intents_to_operations(detected_intents)
+    state["intent"]["operations_hint"] = operations_hint
+
     # -----------------
     # LLM REASONING
     # -----------------
-    original_ast = state["intent"].get("ast")
+
+    should_call_llm = False
+
+    # Case 1: AST failed completely
+    if ast is None:
+        should_call_llm = True
+
+    # Case 2: AST exists but is too weak (no conditions)
+    elif ast and ast.get("type") == "logic" and not ast.get("conditions"):
+        should_call_llm = True
+
+    # Case 3: No filters extracted
+    elif not filters:
+        should_call_llm = True
+
+    if should_call_llm:
+        state = llm_reasoning_node(state)
+    else:
+        print("[INFO] Skipping LLM — symbolic parsing sufficient")
+
+    
+    # Re-extract filters ONLY (AST stays untouched)
+    if state["intent"].get("ast"):
+        state["intent"]["filters"] = extract_filters(state["intent"]["ast"])
+    else:
+        state["intent"]["filters"] = []
+    
+    '''original_ast = state["intent"].get("ast")
     state = llm_reasoning_node(state)
 
     if state["intent"].get("ast") is None:
-        state["intent"]["ast"] = original_ast
+        state["intent"]["ast"] = original_ast'''
     # ---- REBUILD AST AFTER LLM ----
-    state["intent"]["ast"] = build_final_ast(state["intent"]["filters"])
+    #state["intent"]["ast"] = build_final_ast(state["intent"]["filters"])
 
     # ------------------------
     # TYPE
     # ------------------------
     
-    if intent["group_by"] and not intent["aggregation"]:
-        intent["type"] = "group"
-    elif intent["aggregation"]:
+    if intent["aggregation"]:
         intent["type"] = "aggregation"
     elif ast:
         intent["type"] = "filter"
     else:
         intent["type"] = "exploration"
-        
-    '''if state["intent"]["filters"]:
-        state["intent"]["type"] = "filter"
-    elif state["intent"]["aggregation"]:
-        state["intent"]["type"] = "aggregation"'''
+    intent["analysis_type"] = intent.get("analytic_intent", "unknown")
 
-    
 
     print("\n=== INTENT PARSER COMPLETE ===")
     print("Filters after llm reasoning:", state["intent"]["filters"])

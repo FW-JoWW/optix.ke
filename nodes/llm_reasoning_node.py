@@ -11,9 +11,9 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-# ------------------------
+# -----------------------------
 # HELPER: SAFE JSON EXTRACTOR
-# ------------------------
+# -----------------------------
 def extract_json(text: str):
     """
     Extracts JSON array from LLM output even if wrapped in text.
@@ -133,28 +133,47 @@ def llm_reasoning_node(state: AnalystState) -> AnalystState:
 
     # Build LLM prompt
     prompt = f"""
-    You are a strict data parser. 
+    You are a reasoning engine for data analysis.
+    Your job is to interpret user intent before any filtering or execution happens.
+    Do NOT think in database terms. Think in meaning first, then structure. 
     User query: "{query}"
+    Current AST: {state.get("intent", {}).get("ast")}
     Available numeric columns: {dataset_columns['numeric']}
     Available categorical columns: {dataset_columns['categorical']}
-    Existing filters: {ast_filters}
 
     your task:
-    - Extract ONLY missing or implied filters from the query.
+    - Identify ONLY missing or implied conditions NOT already in the AST
     - DO NOT repeat existing filters.
     - DO NOT invent columns.
+    - DO NOT restructure the AST.
+    - Only suggest NEW conditions
+
+    Rules:
     - Numeric columns → value must be numbers
     - Categorical columns → values must be strings
     - "between" must return [low, high] as numbers
 
-    Output rules:
-    - Return ONLY a JSON array.
-    - Each item must be:
-        {{
-            "column": string,
-            "operator": "equals" | ">" | "<" | "between" | "contains",
-            "value": string | number | [low, high]
+    Output MUST be a JSON object:
+
+    {{
+        "entities": [],
+        "intent_type": "filter | comparison | temporal | aggregation | mixed",
+        "constraints": [
+            {{
+            "field": "column name OR semantic concept",
+            "operator": "equals | > | < | between | contains",
+            "value": "raw value or list",
+            "confidence": "high | medium | low",
+            "semantic": true | false
+            }}
+        ],
+        "logic": "and | or | mixed",
+        "group_by": [],
+        "aggregation": {{
+            "type": "mean | sum | max | min | none",
+            "target": null
         }}
+    }}
 
     If no new filters → return []
 
@@ -175,6 +194,11 @@ def llm_reasoning_node(state: AnalystState) -> AnalystState:
 
     #---- SAFE PARSE ----
     llm_filters = extract_json(llm_text)
+    
+    state["llm_reasoning"] = {
+        "raw": llm_text,
+        "parsed": llm_filters
+    }
 
     if not isinstance(llm_filters, list):
         print("[WARNING] LLM output is not a list. Ignoring.")
@@ -186,6 +210,13 @@ def llm_reasoning_node(state: AnalystState) -> AnalystState:
     for f in llm_filters:
         f = normalize_filter(f)
         if not f:
+            continue
+
+        if not isinstance(f, dict):
+            continue
+
+        # LLM must ONLY return conditions
+        if "column" not in f:
             continue
 
         col = f["column"]
@@ -260,8 +291,9 @@ def llm_reasoning_node(state: AnalystState) -> AnalystState:
             ast_filters.append(f)
             continue'''
         key = (f["column"], f["operator"], str(f["value"]))
-        if key not in existing_set and f["column"] not in existing_columns:
+        if key not in existing_set: #and f["column"] not in existing_columns:
             ast_filters.append(f)
+            
 #except Exception as e:
     
     state["intent"]["filters"] = ast_filters
