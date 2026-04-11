@@ -1,6 +1,25 @@
 # nodes/column_selection_node.py
 from state.state import AnalystState
-from utils.semantic_matcher import semantic_column_match
+
+def extract_intent_columns(filters):
+    columns = []
+
+    def visit(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "condition":
+            col = node.get("column")
+            if col:
+                columns.append(col)
+            return
+        if node.get("type") == "logic":
+            for child in node.get("conditions", []):
+                visit(child)
+
+    for item in filters or []:
+        visit(item)
+
+    return list(dict.fromkeys(columns))
 
 def column_selection_node(state: AnalystState) -> AnalystState:
 
@@ -18,13 +37,27 @@ def column_selection_node(state: AnalystState) -> AnalystState:
 
     candidate_columns = list(column_registry.keys())
 
-    matched_columns = semantic_column_match(
-        question,
-        candidate_columns,
-        threshold=0.4
-    )
+    if state.get("disable_semantic_matcher"):
+        matched_columns = []
+        print("\n[INFO] Semantic column matcher disabled - using intent columns only")
+    else:
+        try:
+            from utils.semantic_matcher import semantic_column_match
+            matched_columns = semantic_column_match(
+                question,
+                candidate_columns,
+                threshold=0.4
+            )
+        except Exception as e:
+            matched_columns = []
+            print(f"\n[INFO] Semantic column matcher unavailable - using intent columns only: {e}")
 
-    intent_columns = [f["column"] for f in intent.get("filters", [])]
+    intent_columns = extract_intent_columns(intent.get("filters", []))
+
+    if intent.get("group_by"):
+        intent_columns.append(intent["group_by"])
+    if intent.get("aggregate_column"):
+        intent_columns.append(intent["aggregate_column"])
 
     if intent_columns:
         selected_columns = list(set(intent_columns + matched_columns))

@@ -15,6 +15,7 @@ from nodes.intent_parser_node import intent_parser_node
 from nodes.row_filter_node import row_filter_node
 from nodes.column_selection_node import column_selection_node
 from nodes.initialize_analysis_evidence_node import initialize_analysis_evidence_node
+from nodes.categorical_analysis_node import categorical_analysis_node
 from nodes.output_mode_node import output_mode_node
 from nodes.analysis_planner_node import analysis_planner_node
 from nodes.interaction_node import interaction_node
@@ -44,6 +45,7 @@ builder.add_node("intent_parser", intent_parser_node)
 builder.add_node("row_filter", row_filter_node)
 builder.add_node("column_selection", column_selection_node)
 builder.add_node("initialize_analysis_evidence", initialize_analysis_evidence_node)
+builder.add_node("categorical_analysis", categorical_analysis_node)
 
 builder.add_node("output_mode", output_mode_node)
 
@@ -77,20 +79,23 @@ builder.add_edge("column_selection", "initialize_analysis_evidence")
 
 def route_after_intent(state: AnalystState):
     intent = state.get("intent", {})
+    intent_type = intent.get("type")
     
-    # NO INTENT -> full analysis
-    if not intent or intent.get("type") == "unknown":
+    # Exploration / missing intent -> full analysis
+    if not intent or intent_type in [None, "unknown", "exploration"]:
         return "analysis_planner"
     
-    # FILTER -> skip analysis
-    if intent.get("type") == "filter" and not intent.get("aggregation"):
+    # Filter-only -> skip heavy analysis
+    if intent_type == "filter" and not intent.get("aggregation"):
         return "output_mode"
     
-    # EVERYTHING ELSE -> full analysis
+    # Aggregation and analysis-oriented flows continue downstream
     return "analysis_planner"
 
+builder.add_edge("initialize_analysis_evidence", "categorical_analysis")
+
 builder.add_conditional_edges(
-    "initialize_analysis_evidence", 
+    "categorical_analysis", 
     route_after_intent,
     {
        "output_mode": "output_mode",
