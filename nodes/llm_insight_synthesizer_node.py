@@ -21,6 +21,8 @@ def llm_insight_synthesizer_node(state: AnalystState) -> AnalystState:
     if not story_candidates:
         evidence["llm_insights"] = "No patterns detected to generate insights."
         evidence["clarification_questions"] = []
+        state["llm_insights"] = evidence["llm_insights"]
+        state["clarification_questions"] = evidence["clarification_questions"]
         return state
 
     prompt = f"""
@@ -80,6 +82,8 @@ CLARIFICATION QUESTIONS:
 
     evidence["llm_insights"] = insights_text
     evidence["clarification_questions"] = questions
+    state["llm_insights"] = insights_text
+    state["clarification_questions"] = questions
 
     print("\n=== LLM SYNTHESIZED INSIGHTS ===")
     print(insights_text)

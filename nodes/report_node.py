@@ -11,11 +11,16 @@ def report_node(state: AnalystState) -> AnalystState:
     - analysis plan
     """
 
+    evidence = state.get("analysis_evidence", {})
     business_question = state.get("business_question", "N/A")
     insights: List[str] = state.get("insights") or []
-    llm_insights: str = state.get("llm_insights") or "None"
-    clarification_questions: List[str] = state.get("clarification_questions") or []
-    analysis_plan = state.get("analysis_plan") or []
+    llm_insights: str = state.get("llm_insights") or evidence.get("llm_insights") or "None"
+    clarification_questions: List[str] = (
+        state.get("clarification_questions")
+        or evidence.get("clarification_questions")
+        or []
+    )
+    analysis_plan = state.get("analysis_plan") or evidence.get("analysis_plan") or []
 
     # Format insights as bullet points
     def format_list(items: List[str]) -> str:

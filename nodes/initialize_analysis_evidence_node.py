@@ -17,6 +17,7 @@ def initialize_analysis_evidence_node(state: AnalystState) -> AnalystState:
         state["analysis_evidence"] = {
             "analysis_plan": [],
             "tool_results": {},
+            "categorical_analysis": {},
             "visualizations": [],
             "story_candidates": [],
             "top_stories": [],
@@ -29,6 +30,7 @@ def initialize_analysis_evidence_node(state: AnalystState) -> AnalystState:
         defaults = {
             "analysis_plan": [],
             "tool_results": {},
+            "categorical_analysis": {},
             "visualizations": [],
             "story_candidates": [],
             "top_stories": [],

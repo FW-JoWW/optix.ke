@@ -185,6 +185,7 @@ def row_filter_node(state: AnalystState) -> AnalystState:
     intent = state.get("intent", {})
     ast = intent.get("ast")
     filters = intent.get("filters", [])
+    state["intent_confidence"] = 1.0 if not intent.get("low_confidence") else 0.6
     
     filters_applied = []
 
@@ -256,6 +257,7 @@ def row_filter_node(state: AnalystState) -> AnalystState:
 
     # ---- update state ----
     state["analysis_dataset"] = df
+    state["raw_analysis_dataset"] = df.copy()
    
     # -----------------------------
     # GROUPING + AGGREGATION
@@ -310,8 +312,8 @@ def row_filter_node(state: AnalystState) -> AnalystState:
                 print(grouped.head(10))
 
     print("\n[DEBUG] Unique values after filter:")
-    if "make" in df.columns:
-        print(df["make"].unique()[:10])
+    if intent.get("group_by") in df.columns:
+        print(df[intent["group_by"]].unique()[:10])
 
 
     # ------------------

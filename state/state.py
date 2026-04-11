@@ -14,16 +14,20 @@ class AnalystState(TypedDict):
     cleaning_plan: Optional[List[Dict[str, Any]]]
     cleaned_data: Optional[pd.DataFrame]
     active_dataset: Optional[str]
+    analysis_dataset: Optional[pd.DataFrame]
+    raw_analysis_dataset: Optional[pd.DataFrame]
 
     # dataset understanding
     dataset_profile: Optional[Dict[str, Any]]
     data_validation: Optional[Dict[str, Any]]
     column_registry: Optional[Dict[str, Any]]
     relevant_columns: Optional[List[str]]
+    selected_columns: Optional[List[str]]
         
     # intent
     intent: Optional[Dict[str, Any]]
     intent_confidence: Optional[float]
+    llm_reasoning: Optional[Dict[str, Any]]
     
     # analysis plan
     analysis_plan: Optional[List[str]]
@@ -42,9 +46,12 @@ class AnalystState(TypedDict):
 
     # modes
     mode: str
+    output_mode: Optional[str]
     awaiting_user: bool
     question_for_user: str
     user_response: str
+    enable_llm_reasoning: bool
+    disable_llm_reasoning: bool
 
     # analysis evidence container
     analysis_evidence: Optional[Dict[str, Any]]

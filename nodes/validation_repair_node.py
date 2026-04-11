@@ -89,7 +89,7 @@ def validation_repair_node(state: AnalystState) -> AnalystState:
     numeric_cols = dataset_profile.get("numeric_columns", [])
     categorical_cols = dataset_profile.get("categorical_columns", [])
 
-    df = state.get(state.get("activate_dataset", "dataframe"))
+    df = state.get(state.get("active_dataset", "dataframe"))
     
     #repaired_filters = []
     issues = []
@@ -97,6 +97,9 @@ def validation_repair_node(state: AnalystState) -> AnalystState:
     def get_column_stats(df, col):
         series = df[col].dropna()
         if len(series) == 0:
+            return None
+
+        if not np.issubdtype(series.dtype, np.number):
             return None
 
         return {
@@ -129,7 +132,7 @@ def validation_repair_node(state: AnalystState) -> AnalystState:
             # ------------------------
             # SEMANTIC VALUE RESOLUTION
             # ------------------------
-            if df is not None and col in df.columns:
+            if df is not None and col in numeric_cols and col in df.columns:
 
                 stats = get_column_stats(df, col)
 
@@ -142,21 +145,21 @@ def validation_repair_node(state: AnalystState) -> AnalystState:
                         node["operator"] = "<="
                         node["value"] = stats["q1"]
                         node["confidence"] = 0.85
-                        issues.append(f"Semantic: '{val}' → Q1 threshold for '{col}'")
+                        issues.append(f"Semantic: '{val}' -> Q1 threshold for '{col}'")
 
                     # HIGH RANGE (expensive, premium)
                     elif v in ["expensive", "premium", "high", "luxury"]:
                         node["operator"] = ">="
                         node["value"] = stats["q3"]
                         node["confidence"] = 0.85
-                        issues.append(f"Semantic: '{val}' → Q3 threshold for '{col}'")
+                        issues.append(f"Semantic: '{val}' -> Q3 threshold for '{col}'")
 
                     # MID RANGE
                     elif v in ["average", "mid", "normal"]:
                         node["operator"] = "between"
                         node["value"] = [stats["q1"], stats["q3"]]
                         node["confidence"] = 0.8
-                        issues.append(f"Semantic: '{val}' → IQR range for '{col}'")
+                        issues.append(f"Semantic: '{val}' -> IQR range for '{col}'")
                         
             # Map numeric synonyms
             if op in NUMERIC_SYNONYMS:
@@ -164,7 +167,7 @@ def validation_repair_node(state: AnalystState) -> AnalystState:
                 if op in [">", "<", ">=", "<=", "between"]:
                     new_node["confidence"] = 0.9
                 new_node["operator"] = NUMERIC_SYNONYMS[op]
-                issues.append(f"Mapped synonym '{op}' → '{node['operator']}'")
+                issues.append(f"Mapped synonym '{op}' -> '{node['operator']}'")
 
             # Resolve categorical values
             if col in categorical_cols and df is not None:
@@ -173,7 +176,7 @@ def validation_repair_node(state: AnalystState) -> AnalystState:
                 new_node["confidence"] = 0.8
 
                 if resolved != val:
-                    issues.append(f"Resolved '{val}' → '{resolved}' in '{col}'")
+                    issues.append(f"Resolved '{val}' -> '{resolved}' in '{col}'")
 
                 new_node["value"] = resolved
 

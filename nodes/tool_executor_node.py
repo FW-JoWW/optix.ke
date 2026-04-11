@@ -1,9 +1,10 @@
-from tools.correlation_tool import correlation_tool
-from tools.ttest_tool import ttest_tool
-from tools.outlier_tool import outlier_tool
-from tools.summary_statistics_tool import summary_statistics_tool
-from tools.regression_tool import regression_tool
 from tools.anova_tool import anova_tool
+from tools.categorical_analysis_tool import categorical_analysis_tool
+from tools.correlation_tool import correlation_tool
+from tools.outlier_tool import outlier_tool
+from tools.regression_tool import regression_tool
+from tools.summary_statistics_tool import summary_statistics_tool
+from tools.ttest_tool import ttest_tool
 from state.state import AnalystState
 
 TOOL_MAPPING = {
@@ -12,17 +13,19 @@ TOOL_MAPPING = {
     "detect_outliers": outlier_tool,
     "summary_statistics": summary_statistics_tool,
     "regression": regression_tool,
-    "anova": anova_tool
+    "anova": anova_tool,
+    "categorical_analysis": categorical_analysis_tool,
 }
+
 
 def tool_executor_node(state: AnalystState) -> AnalystState:
     """
-    Executes statistical tools decided by the tool planner.
+    Executes analysis tools decided by the planner.
     """
     print("STATE KEYS BEFORE TOOL EXECUTION:", list(state.keys()))
 
     evidence = state.setdefault("analysis_evidence", {})
-    
+
     df = None
     if state.get("analysis_dataset") is not None:
         df = state["analysis_dataset"]
@@ -33,32 +36,25 @@ def tool_executor_node(state: AnalystState) -> AnalystState:
 
     if df is None:
         print("WARNING: No dataset available for tools.")
-        #state["tool_results"] = {}
         return state
 
     tool_plan = evidence.get("analysis_plan", [])
-
-    # If nothing to execute, skip
     if not tool_plan:
         print("No statistical tools required for this analysis.")
         evidence["tool_results"] = {}
         return state
-    
+
     tool_results = {}
-    #if "tool_result" not in state:
-        #state["tool_results"] = {}
 
     for task in tool_plan:
         tool_name = task["tool"]
         columns = task.get("columns", [])
-
         tool_func = TOOL_MAPPING.get(tool_name)
 
         if not tool_func:
             print(f"Skipping unknown tool: {tool_name}")
             continue
-        
-        # Validate missing columns exist
+
         missing_cols = [c for c in columns if c not in df.columns]
         if missing_cols:
             print(f"Skipping {tool_name}, missing columns: {missing_cols}")
@@ -66,30 +62,29 @@ def tool_executor_node(state: AnalystState) -> AnalystState:
 
         try:
             print(f"\nRunning {tool_name} on {columns}")
-            
-            if tool_name in ["anova", "ttest", "correlation"]:
-                result = tool_func(df, columns[0], columns[1])
 
+            if tool_name == "anova":
+                result = tool_func(df, columns[0], columns[1])
+            elif tool_name in ["ttest", "correlation", "detect_outliers", "summary_statistics"]:
+                result = tool_func(df, columns)
             elif tool_name == "regression":
                 result = tool_func(df, x_col=columns[0], y_col=columns[1])
-
-            elif tool_name == "detect_outliers":
-                result = tool_func(df, columns[0])
-
-            elif tool_name == "summary_statistics":
-                result = tool_func(df, columns)
-
+            elif tool_name == "categorical_analysis":
+                result = tool_func(
+                    df,
+                    columns=columns,
+                    config=state.get("categorical_analysis_config"),
+                )
             else:
-                print(f"⚠️ Unsupported tool format: {tool_name}")
+                print(f"Unsupported tool format: {tool_name}")
                 continue
 
-            #result = tool_func(df, columns)
             if result is not None:
-               key = f"{tool_name}_{'_'.join(columns)}"
-               tool_results[key] = result
+                key = f"{tool_name}_{'_'.join(columns)}" if columns else tool_name
+                tool_results[key] = result
 
         except Exception as e:
-            tool_results[f"{tool_name}_error"] = str(e)    
+            tool_results[f"{tool_name}_error"] = str(e)
 
     evidence["tool_results"] = tool_results
 
@@ -97,4 +92,3 @@ def tool_executor_node(state: AnalystState) -> AnalystState:
     print(tool_results)
 
     return state
-

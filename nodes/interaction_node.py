@@ -5,6 +5,8 @@ def interaction_node(state: AnalystState) -> AnalystState:
 
     mode = state.get("mode", "autonomous")
     plan = state.get("analysis_plan")
+    if not plan:
+        plan = state.get("analysis_evidence", {}).get("analysis_plan", [])
 
     # AUTONOMOUS MODE
     if mode == "autonomous":
@@ -37,6 +39,7 @@ def interaction_node(state: AnalystState) -> AnalystState:
             ]
 
             state["analysis_plan"] = new_plan_list
+            state.setdefault("analysis_evidence", {})["analysis_plan"] = new_plan_list
 
             print("\n[Agent] Updated plan:")
             for step in new_plan_list:

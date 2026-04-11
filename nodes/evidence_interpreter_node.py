@@ -1,26 +1,185 @@
-from state.state import AnalystState
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
 import pandas as pd
 
-# ✅ IMPORT YOUR GUARDS
-from guards.validation_layer import (
-    run_full_validation,
-    compute_confidence
-)
-from engine.reasoning_orchestrator import reasoning_orchestrator
+from state.state import AnalystState
+
+
+def _mentioned_columns(question: str, columns: List[str]) -> List[str]:
+    question = question.lower()
+    return [col for col in columns if col.lower() in question]
+
+
+def _group_difference_story(result: Dict[str, Any], raw_df: pd.DataFrame) -> Dict[str, Any] | None:
+    p_value = result.get("p_value")
+    num_col = result.get("numeric_column")
+    cat_col = result.get("categorical_column")
+
+    if p_value is None or num_col not in raw_df.columns or cat_col not in raw_df.columns:
+        return None
+
+    safe_df = raw_df[[num_col, cat_col]].copy()
+    safe_df[num_col] = pd.to_numeric(safe_df[num_col], errors="coerce")
+    safe_df = safe_df.dropna(subset=[num_col, cat_col])
+
+    if safe_df.empty:
+        return None
+
+    group_means = safe_df.groupby(cat_col)[num_col].mean().sort_values(ascending=False)
+    if len(group_means) < 2 or p_value >= 0.05:
+        return None
+
+    top_group = str(group_means.index[0])
+    bottom_group = str(group_means.index[-1])
+    top_value = float(group_means.iloc[0])
+    bottom_value = float(group_means.iloc[-1])
+    diff = top_value - bottom_value
+
+    return {
+        "type": "group_difference",
+        "insight": f"{top_group} has higher {num_col} than {bottom_group} by {round(diff, 2)}",
+        "column": num_col,
+        "group_column": cat_col,
+        "top_group": top_group,
+        "bottom_group": bottom_group,
+        "top_value": top_value,
+        "bottom_value": bottom_value,
+        "effect_size": diff,
+        "direction": f"{top_group} > {bottom_group}",
+        "p_value": float(p_value),
+        "confidence": "high",
+    }
+
+
+def _correlation_story(result: Dict[str, Any]) -> Dict[str, Any] | None:
+    corr = result.get("correlation")
+    if corr is None or abs(corr) < 0.3:
+        return None
+
+    col1 = result.get("column_1")
+    col2 = result.get("column_2")
+    direction = "positive" if corr > 0 else "negative"
+    strength = "strong" if abs(corr) >= 0.7 else "moderate"
+
+    return {
+        "type": "correlation",
+        "insight": f"{col1} and {col2} have a {direction} relationship",
+        "columns": [col1, col2],
+        "value": float(corr),
+        "direction": direction,
+        "strength": strength,
+        "confidence": "high" if strength == "strong" else "medium",
+    }
+
+
+def _outlier_story(result: Dict[str, Any]) -> Dict[str, Any] | None:
+    count = result.get("outlier_count", 0)
+    if count <= 0:
+        return None
+
+    return {
+        "type": "outliers",
+        "insight": f"{count} outliers detected in {result.get('column')}",
+        "column": result.get("column"),
+        "count": int(count),
+        "confidence": "medium",
+    }
+
+
+def _categorical_stories(
+    result: Dict[str, Any],
+    question: str,
+) -> List[Dict[str, Any]]:
+    stories: List[Dict[str, Any]] = []
+    categorical_results = result.get("results", {})
+    mentioned = _mentioned_columns(question, list(categorical_results.keys()))
+
+    for col, details in categorical_results.items():
+        frequency = details.get("frequency", {})
+        percentages = details.get("percentages", {})
+        mode = details.get("mode")
+        rare_categories = details.get("rare_categories", {})
+        cross_analysis = details.get("cross_analysis", {})
+        numeric_interactions = details.get("numeric_interactions", {})
+
+        if mode is not None and frequency:
+            mode_share = percentages.get(str(mode), percentages.get(mode, 0.0))
+            stories.append({
+                "type": "category_frequency",
+                "insight": f"{mode} is the most common value in {col} ({round(mode_share, 2)}%)",
+                "column": col,
+                "category": str(mode),
+                "share": float(mode_share),
+                "confidence": "medium",
+            })
+
+        if rare_categories:
+            labels = list(rare_categories.keys())[:3]
+            stories.append({
+                "type": "rare_categories",
+                "insight": f"{col} contains rare categories: {', '.join(labels)}",
+                "column": col,
+                "categories": labels,
+                "count": len(rare_categories),
+                "confidence": "medium",
+            })
+
+        for other_col, cross in cross_analysis.items():
+            chi_square = cross.get("chi_square", {})
+            if chi_square.get("status") == "ok" and chi_square.get("p_value", 1.0) < 0.05:
+                stories.append({
+                    "type": "categorical_relationship",
+                    "insight": f"{col} and {other_col} show a statistically significant relationship",
+                    "columns": [col, other_col],
+                    "p_value": float(chi_square["p_value"]),
+                    "chi2": float(chi_square["chi2"]),
+                    "contingency_table": cross.get("contingency_table", {}),
+                    "confidence": "high",
+                })
+
+        preferred_numeric = _mentioned_columns(question, list(numeric_interactions.keys()))
+        numeric_targets = preferred_numeric or list(numeric_interactions.keys())[:1]
+        if mentioned and col not in mentioned:
+            numeric_targets = []
+
+        for num_col in numeric_targets:
+            grouped_stats = numeric_interactions.get(num_col, {})
+            if len(grouped_stats) < 2:
+                continue
+
+            ranked = sorted(
+                grouped_stats.items(),
+                key=lambda item: (item[1].get("mean") is not None, item[1].get("mean", float("-inf"))),
+                reverse=True,
+            )
+            if len(ranked) < 2 or ranked[0][1].get("mean") is None or ranked[-1][1].get("mean") is None:
+                continue
+
+            top_group, top_stats = ranked[0]
+            bottom_group, bottom_stats = ranked[-1]
+            diff = float(top_stats["mean"]) - float(bottom_stats["mean"])
+            stories.append({
+                "type": "grouped_numeric",
+                "insight": f"{top_group} has the highest average {num_col} and {bottom_group} the lowest",
+                "column": num_col,
+                "group_column": col,
+                "top_group": str(top_group),
+                "bottom_group": str(bottom_group),
+                "top_value": float(top_stats["mean"]),
+                "bottom_value": float(bottom_stats["mean"]),
+                "effect_size": diff,
+                "confidence": "medium",
+            })
+
+    return stories
+
 
 def evidence_interpreter_node(state: AnalystState) -> AnalystState:
     """
-    Interprets raw statistical tool outputs and converts them into
-    structured, validated story candidates.
+    Interprets raw tool outputs into structured story candidates.
     """
-    intent = state.get("intent", {})
-    
-    # SKIP FOR AGGREGATION QUERIES
-    if intent.get("aggregation"):
-        print("\n[SKIP] Aggregation query — no statistical interpretation needed")
-        state.setdefault("analysis_evidence", {})["story_candidates"] = []
-        return state
-
     evidence = state.setdefault("analysis_evidence", {})
     tool_results = evidence.get("tool_results", {})
 
@@ -30,427 +189,37 @@ def evidence_interpreter_node(state: AnalystState) -> AnalystState:
         return state
 
     print("\n=== INTERPRETING STATISTICAL EVIDENCE ===")
-
-    story_candidates = []
-    df = state.get("analysis_dataset")
 
     raw_df = state.get("raw_analysis_dataset")
+    question = state.get("business_question", "")
+    story_candidates: List[Dict[str, Any]] = []
 
     for key, result in tool_results.items():
-
-        # HARD GUARD
         if not isinstance(result, dict):
-            print(f"[SKIP INVALID TOOL RESULT] {key}: {result}")
             continue
-
-        if result.get("tool") != "anova":
-            continue
-
-        p = result.get("p_value")
-        f_stat = result.get("f_statistic")
-        num_col = result.get("numeric_column")
-        cat_col = result.get("categorical_column")
-
-        if raw_df is None or p is None:
-            continue
-
-        safe_df = raw_df.copy()
-        safe_df[num_col] = pd.to_numeric(safe_df[num_col], errors="coerce")
-        safe_df = safe_df.dropna(subset=[num_col, cat_col])
-
-        if safe_df.empty:
-            continue
-
-        group_means = (
-            safe_df.groupby(cat_col)[num_col]
-            .mean()
-            .sort_values(ascending=False)
-        )
-
-        if len(group_means) < 2:
-            continue
-
-        top_group = group_means.index[0]
-        bottom_group = group_means.index[-1]
-
-        top_value = float(group_means.iloc[0])
-        bottom_value = float(group_means.iloc[-1])
-
-        diff = top_value - bottom_value
-
-        mean_val = safe_df[num_col].mean()
-        relative_effect = abs(diff) / mean_val if mean_val != 0 else 0
-
-        # -----------------------------
-        # CORE FILTER (statistical truth)
-        # -----------------------------
-        if not (p < 0.05 and relative_effect > 0.1):
-            continue        
-
-        # -----------------------------
-        # COMPUTE CONFIDENCE (SYSTEM)
-        # -----------------------------
-        computed_conf = compute_confidence(p, relative_effect)
-
-        # -----------------------------
-        # CRITIC OUTPUT (placeholder for now)
-        # -----------------------------
-        critic_output = {
-            "issues": []
-        }
-
-        # -----------------------------
-        # VALIDATION PIPELINE
-        # -----------------------------
-        
-        def get_category_values(df, categorical_columns):
-            category_values = {}
-        
-            for col in categorical_columns:
-                if col not in df.columns:
-                            continue
-                
-                category_values[col] = df[col].dropna().unique().tolist()
-        
-            return category_values
-        
-        #print(f"[RESULT STATUS] {result['status']}")
-    
-        # -----------------------------
-        # MULTI-TEMPLATE INSIGHT ENGINE
-        # -----------------------------
-
-        def generate_templates(top_group, bottom_group, num_col, diff, cat_col):
-            diff = round(diff, 2)
-            return [
-                f"{top_group} has higher {num_col} than {bottom_group} by {diff}",
-                #f"{num_col} is higher for {top_group} compared to {bottom_group}",
-                #f"{top_group} leads in {num_col} among {cat_col}",
-                f"{bottom_group} has lower {num_col} than {top_group} by {diff}"
-            ]
-
-
-        def get_category_values(df, categorical_columns):
-            category_values = {}
-
-            for col in categorical_columns:
-                if col not in df.columns:
-                   continue
-                category_values[col] = df[col].dropna().unique().tolist()
-
-            return category_values
-        
-        # Generate candidate insights
-        templates = generate_templates(top_group, bottom_group, num_col, diff, cat_col)
-        
-        # Prepare category values ONCE
-        category_values = get_category_values(
-            raw_df,
-            safe_df.columns.tolist()
-        )    
-        
-        accepted_output = None
-        
-        for template_text in templates:
-
-            print(f"\n[TESTING TEMPLATE] {template_text}")
-        
-            llm_output = {
-                "insight": template_text,
-                "evidence_used": [key],
-                "assumptions": [],
-                "uncertainties": [],
-                "confidence": computed_conf
-            }
-        
-            computed_conf = compute_confidence(p, relative_effect)
-        
-            critic_output = {"issues": []}
-
-            # -------------
-            # RETRY LOOP
-            # -------------
-            result = reasoning_orchestrator(
-                candidate=llm_output,
-                validation_fn=lambda x: run_full_validation(
-                    output=x,
-                    tool_results=tool_results,
-                    dataset_columns=safe_df.columns.tolist(),
-                    category_values=category_values,
-                    computed_conf=computed_conf,
-                    critic_output=critic_output
-                )
-            )
-
-            print(f"[RESULT STATUS] {result['status']}")
-
-            if result["status"] == "accepted":
-                accepted_output = result["output"]
-                break # Stop at first valid insight
-            else:
-                print(f"[TEMPLATE FAILED] {template_text}")
-
-        #if nothing worked reject
-        if not accepted_output:
-            print(f"[REJECTED AFTER RETRIES] {top_group} vs {bottom_group}")
-            continue
-
-        # -----------------------------
-        # ACCEPTED STORY
-        # -----------------------------
-        story_candidates.append({
-            **accepted_output,
-            "type": "group_difference",
-            "column": num_col,
-            "group_column": cat_col,
-            "top_group": str(top_group),
-            "bottom_group": str(bottom_group),
-            "top_value": top_value,
-            "bottom_value": bottom_value,
-            "effect_size": diff,
-            "direction": f"{top_group} > {bottom_group}",
-            "p_value": p,
-            "f_statistic": f_stat
-        })
-
-    evidence["story_candidates"] = story_candidates
-
-    print("\n=== STORY CANDIDATES (VALIDATED) ===")
-    for s in story_candidates:
-        print("-", s["insight"])
-
-    return state
-
-'''from state.state import AnalystState
-import pandas as pd
-
-
-def evidence_interpreter_node(state: AnalystState) -> AnalystState:
-    """
-    Interprets raw statistical tool outputs and converts them into
-    structured, meaningful story candidates.
-    """
-
-    evidence = state.setdefault("analysis_evidence", {})
-    tool_results = evidence.get("tool_results", {})
-
-    if not tool_results:
-        print("No tool results found for interpretation.")
-        evidence["story_candidates"] = []
-        return state
-
-    print("\n=== INTERPRETING STATISTICAL EVIDENCE ===")
-
-    story_candidates = []
-
-    df = state.get("analysis_dataset")
-
-    for key, result in tool_results.items():
 
         tool_type = result.get("tool")
+        story = None
 
-        # =============================
-        # ANOVA 
-        # =============================
-        if tool_type == "anova":
-
-            p = result.get("p_value")
-            f_stat = result.get("f_statistic")
-            num_col = result.get("numeric_column")
-            cat_col = result.get("categorical_column")
-
-            raw_df = state.get("raw_analysis_dataset")
-            
-            if raw_df is not None and p is not None:
-
-                # ✅ FORCE NUMERIC SAFELY
-                safe_df = raw_df.copy()
-                safe_df[num_col] = pd.to_numeric(safe_df[num_col], errors="coerce")
-                
-                # Drop rows where conversion failed
-                safe_df = safe_df.dropna(subset=[num_col, cat_col])
-                
-                if safe_df.empty:
-                    continue
-                
-                group_means = (
-                    raw_df.groupby(cat_col)[num_col]
-                    .mean()
-                    .sort_values(ascending=False)
-                )
-
-                if len(group_means) < 2:
-                    continue
-
-                top_group = group_means.index[0]
-                bottom_group = group_means.index[-1]
-
-                top_value = float(group_means.iloc[0])
-                bottom_value = float(group_means.iloc[-1])
-
-                diff = top_value - bottom_value
-
-                # Calculate relative effect size (importance)
-                mean_val = safe_df[num_col].mean()
-                relative_effect = abs(diff) / mean_val if mean_val != 0 else 0
-
-                # STRICT relevance filter (THIS is the key fix)
-                if p < 0.05 and relative_effect > 0.1:
-                #if p < 0.05:
-
-                    story_candidates.append({
-                        "type": "group_difference",
-
-                        # CORE INSIGHT
-                        "insight": f"{top_group} has higher {num_col} than {bottom_group} by {round(diff,2)}",
-
-                        # STRUCTURED FIELDS
-                        "column": num_col,
-                        "group_column": cat_col,
-                        "top_group": str(top_group),
-                        "bottom_group": str(bottom_group),
-                        "top_value": top_value,
-                        "bottom_value": bottom_value,
-                        "effect_size": diff,
-                        "direction": f"{top_group} > {bottom_group}",
-
-                        # STATISTICAL CONTEXT
-                        "p_value": p,
-                        "f_statistic": f_stat,
-
-                        # INTERPRETATION LAYERS
-                        "confidence": "high",
-                        "impact": "high" if abs(diff) > 10 else "moderate",
-                        "business_relevance": "high"
-                    })
-
-        # =============================
-        # Correlation 
-        # =============================
+        if tool_type == "anova" and raw_df is not None:
+            story = _group_difference_story(result, raw_df)
+            if story:
+                story_candidates.append(story)
         elif tool_type == "correlation":
-
-            corr = result.get("correlation")
-
-            if corr is not None and abs(corr) >= 0.5:
-
-                direction = "positive" if corr > 0 else "negative"
-
-                story_candidates.append({
-                    "type": "correlation",
-
-                    "insight": f"{result.get('column_1')} and {result.get('column_2')} have a {direction} relationship",
-
-                    "columns": [
-                        result.get("column_1"),
-                        result.get("column_2")
-                    ],
-                    "value": corr,
-                    "direction": direction,
-                    "strength": "strong" if abs(corr) > 0.7 else "moderate",
-
-                    "confidence": "high" if abs(corr) > 0.7 else "medium",
-                    "business_relevance": "medium"
-                })
-
-        # =============================
-        # Regression 
-        # =============================
-        elif tool_type == "regression":
-
-            r2 = result.get("r_squared")
-
-            if r2 is not None and r2 >= 0.5:
-
-                story_candidates.append({
-                    "type": "regression",
-
-                    "insight": f"{result.get('x_column')} predicts {result.get('y_column')} with R² of {round(r2,2)}",
-
-                    "x_column": result.get("x_column"),
-                    "y_column": result.get("y_column"),
-                    "r_squared": r2,
-
-                    "strength": "strong" if r2 > 0.7 else "moderate",
-                    "confidence": "high" if r2 > 0.7 else "medium",
-                    "business_relevance": "medium"
-                })
-
-        # =============================
-        # T-test 
-        # =============================
-        elif tool_type == "ttest":
-
-            p = result.get("p_value")
-
-            if p is not None and p < 0.05:
-
-                story_candidates.append({
-                    "type": "t_test",
-
-                    "insight": f"{result.get('categorical_column')} significantly impacts {result.get('numeric_column')}",
-
-                    "column": result.get("numeric_column"),
-                    "group_column": result.get("categorical_column"),
-                    "p_value": p,
-
-                    "confidence": "high",
-                    "business_relevance": "high"
-                })
-
-        # =============================
-        # Outliers
-        # =============================
+            story = _correlation_story(result)
+            if story:
+                story_candidates.append(story)
         elif tool_type == "detect_outliers":
-
-            count = result.get("outlier_count", 0)
-
-            if count > 0:
-
-                story_candidates.append({
-                    "type": "outliers",
-
-                    "insight": f"{count} outliers detected in {result.get('column')}",
-
-                    "column": result.get("column"),
-                    "count": count,
-
-                    "confidence": "medium",
-                    "business_relevance": "low"
-                })
-
-        # =============================
-        # Summary statistics
-        # =============================
-        elif tool_type == "summary_statistics":
-
-            summary = result.get("summary", {})
-
-            for col, stats in summary.items():
-
-                mean = stats.get("mean")
-                std = stats.get("std")
-
-                if std and abs(mean) > 2 * std:
-
-                    story_candidates.append({
-                        "type": "numeric_anomaly",
-
-                        "insight": f"{col} shows abnormal distribution (mean deviates strongly)",
-
-                        "column": col,
-                        "mean": mean,
-                        "std_dev": std,
-
-                        "confidence": "medium",
-                        "business_relevance": "low"
-                    })
+            story = _outlier_story(result)
+            if story:
+                story_candidates.append(story)
+        elif tool_type == "categorical_analysis":
+            story_candidates.extend(_categorical_stories(result, question))
 
     evidence["story_candidates"] = story_candidates
 
     print("\n=== STORY CANDIDATES GENERATED ===")
-    for s in story_candidates:
-        print("-", s["insight"])
+    for story in story_candidates:
+        print("-", story["insight"])
 
     return state
-
-'''

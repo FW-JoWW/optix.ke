@@ -2,6 +2,7 @@
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pandas as pd
 from state.state import AnalystState
 
 # ------------------------------
@@ -90,6 +91,76 @@ def generate_histogram(df, story):
         "priority": "primary"
     }
 
+def generate_category_bar(df, story):
+    col = story.get("column")
+    if col not in df.columns:
+        return None
+
+    counts = df[col].fillna("__MISSING__").astype(str).value_counts().head(10)
+    plt.figure()
+    sns.barplot(x=counts.index, y=counts.values)
+    plt.xticks(rotation=45, ha="right")
+    filename = f"charts/bar_{col}.png"
+    plt.title(f"Category Distribution: {col}")
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    return {
+        "type": "bar",
+        "file_path": filename,
+        "based_on": story,
+        "priority": "primary"
+    }
+
+def generate_grouped_bar(df, story):
+    num_col = story.get("column")
+    cat_col = story.get("group_column")
+    if num_col not in df.columns or cat_col not in df.columns:
+        return None
+
+    grouped = (
+        df[[cat_col, num_col]]
+        .dropna()
+        .groupby(cat_col)[num_col]
+        .mean()
+        .sort_values(ascending=False)
+        .head(10)
+    )
+    plt.figure()
+    sns.barplot(x=grouped.index.astype(str), y=grouped.values)
+    plt.xticks(rotation=45, ha="right")
+    filename = f"charts/bar_{num_col}_by_{cat_col}.png"
+    plt.title(f"Average {num_col} by {cat_col}")
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    return {
+        "type": "grouped_bar",
+        "file_path": filename,
+        "based_on": story,
+        "priority": "primary"
+    }
+
+def generate_heatmap(df, story):
+    table = story.get("contingency_table")
+    if not table:
+        return None
+
+    heatmap_df = pd.DataFrame(table).fillna(0)
+    plt.figure()
+    sns.heatmap(heatmap_df, annot=True, fmt=".0f", cmap="Blues")
+    filename = f"charts/heatmap_{'_'.join(story.get('columns', ['categorical']))}.png"
+    plt.title("Categorical Relationship")
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    return {
+        "type": "heatmap",
+        "file_path": filename,
+        "based_on": story,
+        "priority": "primary"
+    }
+
 def generate_regression_plot(df, story):
     cols = story.get("column")
     if not cols or any(c not in df.columns for c in cols):
@@ -119,7 +190,11 @@ def map_story_to_chart(story, df):
         "outliers": generate_boxplot,
         "correlation": generate_scatter,
         "regression": generate_regression_plot,
-        "numeric_anomaly": generate_histogram
+        "numeric_anomaly": generate_histogram,
+        "category_frequency": generate_category_bar,
+        "rare_categories": generate_category_bar,
+        "grouped_numeric": generate_grouped_bar,
+        "categorical_relationship": generate_heatmap,
     }
     chart_func = mapping.get(story.get("type"))
     if chart_func:

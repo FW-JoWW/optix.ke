@@ -9,6 +9,7 @@ def output_mode_node(state: AnalystState) -> AnalystState:
     """
 
     evidence = state.setdefault("analysis_evidence", {})
+    intent = state.get("intent", {})
     grouped = evidence.get("grouped_summary")
     aggregation = evidence.get("aggregation")
 
@@ -50,6 +51,12 @@ def output_mode_node(state: AnalystState) -> AnalystState:
 
         evidence["final_output"] = formatted
         evidence["structured_output"] = grouped
+        evidence["intent_summary"] = {
+            "type": intent.get("type"),
+            "group_by": intent.get("group_by"),
+            "aggregation": intent.get("aggregation"),
+            "aggregate_column": intent.get("aggregate_column")
+        }
 
         print("\n=== FINAL OUTPUT ===")
         for line in formatted[:10]:
@@ -66,6 +73,12 @@ def output_mode_node(state: AnalystState) -> AnalystState:
         preview = df.head(10)
         evidence["final_output"] = preview.to_dict("records")
         evidence["structured_output"] = preview
+        evidence["intent_summary"] = {
+            "type": intent.get("type"),
+            "group_by": intent.get("group_by"),
+            "aggregation": intent.get("aggregation"),
+            "aggregate_column": intent.get("aggregate_column")
+        }
 
         print("\n=== FINAL OUTPUT (TABLE PREVIEW) ===")
         print(preview)
