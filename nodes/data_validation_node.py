@@ -14,11 +14,13 @@ def data_validation_node(state: AnalystState) -> AnalystState:
     - Outlier detection (numeric columns)
     """
 
-    if state.get("dataset") is None:
+    df: pd.DataFrame | None = state.get("cleaned_data")
+    if df is None:
+        df = state.get("dataframe")
+
+    if df is None:
         state["data_validation"] = {"error": "No dataset provided."}
         return state
-
-    df: pd.DataFrame = state["dataset"]
 
     validation: Dict[str, Any] = {}
 

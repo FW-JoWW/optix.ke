@@ -21,6 +21,16 @@ def extract_intent_columns(filters):
 
     return list(dict.fromkeys(columns))
 
+
+def dedupe_preserve_order(columns):
+    seen = set()
+    ordered = []
+    for col in columns:
+        if col and col not in seen:
+            ordered.append(col)
+            seen.add(col)
+    return ordered
+
 def column_selection_node(state: AnalystState) -> AnalystState:
 
     column_registry = state.get("column_registry")
@@ -34,6 +44,7 @@ def column_selection_node(state: AnalystState) -> AnalystState:
 
     question = state.get("business_question", "")
     intent = state.get("intent", {})
+    parser_selected_columns = intent.get("selected_columns", []) or state.get("selected_columns", [])
 
     candidate_columns = list(column_registry.keys())
 
@@ -59,10 +70,12 @@ def column_selection_node(state: AnalystState) -> AnalystState:
     if intent.get("aggregate_column"):
         intent_columns.append(intent["aggregate_column"])
 
-    if intent_columns:
-        selected_columns = list(set(intent_columns + matched_columns))
+    selected_columns = dedupe_preserve_order(parser_selected_columns + intent_columns + matched_columns)
+
+    if not selected_columns and intent_columns:
+        selected_columns = dedupe_preserve_order(intent_columns + matched_columns)
     else:
-        selected_columns = matched_columns
+        selected_columns = selected_columns or dedupe_preserve_order(matched_columns)
 
     if not selected_columns:
         selected_columns = df.columns.tolist()[:5]

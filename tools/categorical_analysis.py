@@ -253,6 +253,8 @@ def _numeric_interactions(
     interactions: Dict[str, Any] = {}
 
     for num_col in numeric_columns:
+        if num_col == categorical_col:
+            continue
         safe_df = df[[categorical_col, num_col]].copy()
         safe_df[num_col] = pd.to_numeric(
             safe_df[num_col].astype(str).str.replace(r"[^\d\.\-]", "", regex=True),

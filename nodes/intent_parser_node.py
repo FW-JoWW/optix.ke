@@ -660,13 +660,12 @@ def should_call_llm_for_intent(state: AnalystState, ast, filters):
     query = state.get("business_question", "").lower()
     numeric_columns = state.get("dataset_profile", {}).get("numeric_columns", [])
     ambiguous_terms = [
-        "bimmer",
-        "bimmers",
-        "bmws",
         "cheap",
         "expensive",
         "affordable",
-        "premium"
+        "premium",
+        "budget",
+        "luxury",
     ]
 
     if query_has_unresolved_numeric_phrase(query) and not has_numeric_constraint(filters, numeric_columns):
@@ -833,7 +832,8 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
         "operations_hint": [],
         "output_mode": None,
         "confidence": None,
-        "low_confidence": low_confidence
+        "low_confidence": low_confidence,
+        "selected_columns": selected_columns,
     }
     # ------------------------
     # AGGREGATION 

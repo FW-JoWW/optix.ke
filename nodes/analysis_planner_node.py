@@ -7,6 +7,33 @@ def _contains_any(text: str, words: List[str]) -> bool:
     return any(word in text for word in words)
 
 
+def _pairwise_numeric_plans(columns: List[str], tool: str) -> List[Dict]:
+    plans: List[Dict] = []
+    for idx, col1 in enumerate(columns):
+        for col2 in columns[idx + 1:]:
+            plans.append({"tool": tool, "columns": [col1, col2]})
+    return plans
+
+
+def _numeric_by_categorical_plans(
+    numeric_columns: List[str],
+    categorical_columns: List[str],
+    unique_counts: Dict[str, int],
+) -> List[Dict]:
+    plans: List[Dict] = []
+    for num in numeric_columns:
+        for cat in categorical_columns:
+            n_unique = unique_counts.get(cat, 0)
+            if n_unique == 2:
+                tool = "ttest"
+            elif n_unique > 2:
+                tool = "anova"
+            else:
+                continue
+            plans.append({"tool": tool, "columns": [num, cat]})
+    return plans
+
+
 def analysis_planner_node(state: AnalystState) -> AnalystState:
     """
     Determines:
@@ -93,33 +120,29 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
 
     if _contains_any(question, relationship_words):
         if len(mentioned_numeric) >= 2:
-            col1, col2 = mentioned_numeric[:2]
-            plan.append({"tool": "correlation", "columns": [col1, col2]})
+            plan.extend(_pairwise_numeric_plans(mentioned_numeric, "correlation"))
         elif len(mentioned_categorical) >= 2:
-            plan.append({"tool": "categorical_analysis", "columns": mentioned_categorical[:2]})
+            plan.append({"tool": "categorical_analysis", "columns": mentioned_categorical})
 
     if _contains_any(question, comparison_words):
         if mentioned_numeric and mentioned_categorical:
-            num = mentioned_numeric[0]
-            cat = mentioned_categorical[0]
-            n_unique = unique_counts.get(cat, 0)
-            if n_unique == 2:
-                plan.append({"tool": "ttest", "columns": [num, cat]})
-            elif n_unique > 2:
-                plan.append({"tool": "anova", "columns": [num, cat]})
+            plan.extend(
+                _numeric_by_categorical_plans(
+                    mentioned_numeric,
+                    mentioned_categorical,
+                    unique_counts,
+                )
+            )
         elif not mentioned_numeric and len(mentioned_categorical) >= 1:
             plan.append({"tool": "categorical_analysis", "columns": mentioned_categorical})
         else:
-            for num in numeric_cols:
-                for cat in categorical_cols:
-                    n_unique = unique_counts.get(cat, 0)
-                    if n_unique == 2:
-                        tool = "ttest"
-                    elif n_unique > 2:
-                        tool = "anova"
-                    else:
-                        continue
-                    plan.append({"tool": tool, "columns": [num, cat]})
+            plan.extend(
+                _numeric_by_categorical_plans(
+                    numeric_cols,
+                    categorical_cols,
+                    unique_counts,
+                )
+            )
 
     if _contains_any(question, ["outlier", "unusual", "anomaly"]):
         for num in numeric_cols:

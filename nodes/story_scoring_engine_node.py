@@ -98,8 +98,14 @@ def story_scoring_engine_node(state: AnalystState) -> AnalystState:
         elif mentioned_columns:
             relevance_multiplier -= 0.15
 
-        score = round(_base_score(story) * relevance_multiplier, 4)
+        base = _base_score(story)
+        score = round(base * relevance_multiplier, 4)
         story["score"] = max(score, 0.0)
+        story["score_components"] = {
+            "base_score": round(base, 4),
+            "relevance_multiplier": round(relevance_multiplier, 4),
+            "matched_columns": matches,
+        }
         scored_stories.append(story)
 
     ranked = sorted(scored_stories, key=lambda x: x["score"], reverse=True)
@@ -108,6 +114,9 @@ def story_scoring_engine_node(state: AnalystState) -> AnalystState:
 
     print("\nTop Stories Selected:")
     for story in top_stories:
-        print(f"{story['type']} | score={story['score']}")
+        print(
+            f"{story['type']} | score={story['score']} | "
+            f"matched={story['score_components']['matched_columns']}"
+        )
 
     return state

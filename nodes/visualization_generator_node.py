@@ -56,7 +56,7 @@ def generate_boxplot(df, story):
     }
 
 def generate_scatter(df, story):
-    cols = story.get("column")
+    cols = story.get("columns") or []
     if not cols or any(c not in df.columns for c in cols):
         return None
     x, y = cols[:2]
@@ -162,7 +162,7 @@ def generate_heatmap(df, story):
     }
 
 def generate_regression_plot(df, story):
-    cols = story.get("column")
+    cols = story.get("columns") or []
     if not cols or any(c not in df.columns for c in cols):
         return None
     x, y = cols[:2]
@@ -187,7 +187,7 @@ def generate_regression_plot(df, story):
 def map_story_to_chart(story, df):
     mapping = {
         "group_difference": generate_boxplot,
-        "outliers": generate_boxplot,
+        "outliers": generate_histogram,
         "correlation": generate_scatter,
         "regression": generate_regression_plot,
         "numeric_anomaly": generate_histogram,
@@ -231,9 +231,18 @@ def align_llm_insights(charts, llm_insights):
         chart["llm_headline"] = None
         chart["llm_action"] = None
         for insight in llm_insights:
-            if insight.get("related_story_id") == id(chart["based_on"]):
+            if insight.get("related_story_signature") == (
+                f"{chart['based_on'].get('type', 'story')}|"
+                + "|".join(
+                    [
+                        *([str(chart["based_on"].get("column"))] if chart["based_on"].get("column") else []),
+                        *[str(col) for col in chart["based_on"].get("columns", []) if col],
+                        *([str(chart["based_on"].get("group_column"))] if chart["based_on"].get("group_column") else []),
+                    ]
+                )
+            ):
                 chart["llm_headline"] = insight.get("headline")
-                chart["llm_action"] = insight.get("action")
+                chart["llm_action"] = insight.get("recommended_action")
                 break
     return charts
 # ------------------------------
@@ -251,7 +260,7 @@ def visualization_generator_node(state: AnalystState) -> AnalystState:
         return state
 
     top_stories = state.get("analysis_evidence", {}).get("top_stories", [])
-    llm_insights = state.get("analysis_evidence", {}).get("llm_insights", [])
+    llm_insights = state.get("analysis_evidence", {}).get("llm_insight_details", [])
     if not top_stories:
         print("No top stories available for visualization.")
         return state
@@ -268,6 +277,7 @@ def visualization_generator_node(state: AnalystState) -> AnalystState:
             continue
         chart = map_story_to_chart(story, df)
         if chart:
+            chart["caption"] = story.get("insight")
             charts.append(chart)
 
     # 3️⃣ Validate visualizations

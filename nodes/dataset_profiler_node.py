@@ -33,7 +33,9 @@ def is_date_like(series):
 
 def dataset_profiler_node(state: AnalystState) -> AnalystState:
 
-    df = state.get("dataframe")
+    df = state.get("cleaned_data")
+    if df is None:
+        df = state.get("dataframe")
 
     if df is None:
         raise ValueError("No dataframe found in state.")

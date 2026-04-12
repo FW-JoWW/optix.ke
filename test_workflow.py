@@ -28,6 +28,7 @@ state: AnalystState = {
     "mode": mode,
     "enable_llm_reasoning": False,
     "disable_llm_reasoning": True,
+    "disable_semantic_matcher": True,
     "analysis_evidence": {},
 }
 

@@ -38,17 +38,26 @@ def categorical_analysis_node(state: AnalystState) -> AnalystState:
     })
 
     dataset_profile = state.get("dataset_profile", {}) or {}
+    selected_columns = state.get("selected_columns", []) or list(df.columns)
     numeric_columns = [
         col for col in dataset_profile.get("numeric_columns", [])
-        if col in df.columns
+        if col in df.columns and col in selected_columns
     ]
     categorical_columns = [
         col for col in dataset_profile.get("categorical_columns", [])
-        if col in df.columns
+        if col in df.columns and col in selected_columns
     ]
 
     if not categorical_columns:
-        categorical_columns = detect_categorical_columns(df, config)
+        evidence["categorical_analysis"] = {}
+        evidence["categorical_analysis_meta"] = {
+            "config": categorical_analysis_config_to_dict(config),
+            "categorical_columns": [],
+            "numeric_columns": numeric_columns,
+        }
+        print("\n=== CATEGORICAL ANALYSIS COMPLETE ===")
+        print("Categorical columns analyzed: []")
+        return state
 
     results = analyze_categorical_columns(
         df,

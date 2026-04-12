@@ -31,12 +31,8 @@ def cleaning_audit_node(state: AnalystState) -> AnalystState:
         # NUMERIC CLEANING VALIDATION
         # -----------------------------
         if action == "numeric_cleaning":
-            numeric_col = df.select_dtypes(include=[np.number]).columns.tolist
-            non_numeric_col = [
-                c for c in df.columns
-                if c not in numeric_col
-            ]
-            status = f"{len(numeric_col)} numeric columns validated"
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            status = f"{len(numeric_cols)} numeric columns validated"
 
         # -----------------------------
         # Check duplicates removal
