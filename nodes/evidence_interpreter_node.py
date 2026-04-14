@@ -14,8 +14,8 @@ def _mentioned_columns(question: str, columns: List[str]) -> List[str]:
 
 def _group_difference_story(result: Dict[str, Any], raw_df: pd.DataFrame) -> Dict[str, Any] | None:
     p_value = result.get("p_value")
-    num_col = result.get("numeric_column")
-    cat_col = result.get("categorical_column")
+    num_col = result.get("numeric_column") or result.get("column")
+    cat_col = result.get("categorical_column") or result.get("group_column")
 
     if p_value is None or num_col not in raw_df.columns or cat_col not in raw_df.columns:
         return None
@@ -55,22 +55,31 @@ def _group_difference_story(result: Dict[str, Any], raw_df: pd.DataFrame) -> Dic
 
 def _correlation_story(result: Dict[str, Any]) -> Dict[str, Any] | None:
     corr = result.get("correlation")
-    if corr is None or abs(corr) < 0.3:
+    if corr is None:
         return None
 
     col1 = result.get("column_1")
     col2 = result.get("column_2")
     direction = "positive" if corr > 0 else "negative"
-    strength = "strong" if abs(corr) >= 0.7 else "moderate"
+    abs_corr = abs(float(corr))
+    if abs_corr >= 0.7:
+        strength = "strong"
+        confidence = "high"
+    elif abs_corr >= 0.3:
+        strength = "moderate"
+        confidence = "medium"
+    else:
+        strength = "weak"
+        confidence = "low"
 
     return {
         "type": "correlation",
-        "insight": f"{col1} and {col2} have a {direction} relationship",
+        "insight": f"{col1} and {col2} show a {strength} {direction} pattern",
         "columns": [col1, col2],
         "value": float(corr),
         "direction": direction,
         "strength": strength,
-        "confidence": "high" if strength == "strong" else "medium",
+        "confidence": confidence,
     }
 
 
@@ -201,7 +210,7 @@ def evidence_interpreter_node(state: AnalystState) -> AnalystState:
         tool_type = result.get("tool")
         story = None
 
-        if tool_type == "anova" and raw_df is not None:
+        if tool_type in {"anova", "ttest"} and raw_df is not None:
             story = _group_difference_story(result, raw_df)
             if story:
                 story_candidates.append(story)

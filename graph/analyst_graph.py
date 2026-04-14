@@ -80,16 +80,19 @@ builder.add_edge("column_selection", "initialize_analysis_evidence")
 def route_after_intent(state: AnalystState):
     intent = state.get("intent", {})
     intent_type = intent.get("type")
-    
-    # Exploration / missing intent -> full analysis
-    if not intent or intent_type in [None, "unknown", "exploration"]:
+
+    if not intent:
         return "analysis_planner"
-    
-    # Filter-only -> skip heavy analysis
+
+    if intent.get("wants_analysis"):
+        return "analysis_planner"
+
     if intent_type == "filter" and not intent.get("aggregation"):
         return "output_mode"
-    
-    # Aggregation and analysis-oriented flows continue downstream
+
+    if intent_type in [None, "unknown", "exploration"]:
+        return "analysis_planner"
+
     return "analysis_planner"
 
 builder.add_edge("initialize_analysis_evidence", "categorical_analysis")

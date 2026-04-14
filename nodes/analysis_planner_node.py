@@ -48,7 +48,7 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     if evidence.get("grouped_summary") is not None:
         state["output_mode"] = "grouped_summary"
 
-    if intent.get("type") == "filter":
+    if intent.get("type") == "filter" and not intent.get("wants_analysis"):
         if not intent.get("group_by"):
             state["output_mode"] = "raw_filter"
 
@@ -98,6 +98,8 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     mentioned_columns = [col for col in selected_columns if col.lower() in question]
     mentioned_numeric = [c for c in mentioned_columns if c in numeric_cols]
     mentioned_categorical = [c for c in mentioned_columns if c in categorical_cols]
+    target_numeric = mentioned_numeric or numeric_cols
+    target_categorical = mentioned_categorical or categorical_cols
 
     relationship_words = ["relationship", "correlation", "affect", "impact"]
     comparison_words = ["compare", "difference", "better"]
@@ -119,22 +121,30 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     grouped_numeric_query = bool(mentioned_numeric and mentioned_categorical and _contains_any(question, grouped_numeric_words))
 
     if _contains_any(question, relationship_words):
-        if len(mentioned_numeric) >= 2:
-            plan.extend(_pairwise_numeric_plans(mentioned_numeric, "correlation"))
-        elif len(mentioned_categorical) >= 2:
-            plan.append({"tool": "categorical_analysis", "columns": mentioned_categorical})
-
-    if _contains_any(question, comparison_words):
-        if mentioned_numeric and mentioned_categorical:
+        if len(target_numeric) >= 2 and not target_categorical:
+            plan.extend(_pairwise_numeric_plans(target_numeric, "correlation"))
+        elif target_numeric and target_categorical:
             plan.extend(
                 _numeric_by_categorical_plans(
-                    mentioned_numeric,
-                    mentioned_categorical,
+                    target_numeric,
+                    target_categorical,
                     unique_counts,
                 )
             )
-        elif not mentioned_numeric and len(mentioned_categorical) >= 1:
-            plan.append({"tool": "categorical_analysis", "columns": mentioned_categorical})
+        elif len(target_categorical) >= 2:
+            plan.append({"tool": "categorical_analysis", "columns": target_categorical})
+
+    if _contains_any(question, comparison_words):
+        if target_numeric and target_categorical:
+            plan.extend(
+                _numeric_by_categorical_plans(
+                    target_numeric,
+                    target_categorical,
+                    unique_counts,
+                )
+            )
+        elif not target_numeric and len(target_categorical) >= 1:
+            plan.append({"tool": "categorical_analysis", "columns": target_categorical})
         else:
             plan.extend(
                 _numeric_by_categorical_plans(
@@ -151,20 +161,28 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     if _contains_any(question, grouped_numeric_words):
         if numeric_cols:
             if grouped_numeric_query:
-                plan.append({"tool": "categorical_analysis", "columns": mentioned_categorical})
+                plan.append({"tool": "categorical_analysis", "columns": target_categorical})
             else:
                 plan.append({"tool": "summary_statistics", "columns": numeric_cols})
-        if mentioned_categorical and not grouped_numeric_query:
-            plan.append({"tool": "categorical_analysis", "columns": mentioned_categorical})
-
-    if _contains_any(question, categorical_words):
-        target_categorical = mentioned_categorical or categorical_cols[:2]
-        if target_categorical:
+        if target_categorical and not grouped_numeric_query:
             plan.append({"tool": "categorical_analysis", "columns": target_categorical})
 
+    if _contains_any(question, categorical_words):
+        categorical_targets = target_categorical or categorical_cols[:2]
+        if categorical_targets:
+            plan.append({"tool": "categorical_analysis", "columns": categorical_targets})
+
     if not plan:
-        if len(mentioned_categorical) >= 1:
-            plan.append({"tool": "categorical_analysis", "columns": mentioned_categorical})
+        if len(target_categorical) >= 1 and not target_numeric:
+            plan.append({"tool": "categorical_analysis", "columns": target_categorical})
+        elif target_numeric and target_categorical:
+            plan.extend(
+                _numeric_by_categorical_plans(
+                    target_numeric,
+                    target_categorical,
+                    unique_counts,
+                )
+            )
         elif len(numeric_cols) >= 2:
             plan.append({"tool": "correlation", "columns": numeric_cols[:2]})
 
