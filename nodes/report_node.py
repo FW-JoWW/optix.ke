@@ -5,6 +5,13 @@ from typing import Any, Dict, List
 from state.state import AnalystState
 
 
+def _normalize_questions(questions: List[str]) -> List[str]:
+    return [
+        q for q in questions
+        if isinstance(q, str) and q.strip().lower() not in {"", "none", "n/a", "no", "no questions"}
+    ]
+
+
 def _format_analysis_plan(analysis_plan: List[Any]) -> str:
     if not analysis_plan:
         return "None"
@@ -28,6 +35,10 @@ def _format_tool_results(tool_results: Dict[str, Any]) -> str:
         if tool == "correlation":
             lines.append(
                 f"- {result.get('column_1')} vs {result.get('column_2')}: correlation={round(float(result.get('correlation', 0)), 4)}"
+            )
+        elif tool == "ttest":
+            lines.append(
+                f"- {result.get('column')} by {result.get('group_column')}: p-value={result.get('p_value')}"
             )
         elif tool == "anova":
             lines.append(
@@ -78,6 +89,7 @@ def report_node(state: AnalystState) -> AnalystState:
         or evidence.get("clarification_questions")
         or []
     )
+    clarification_questions = _normalize_questions(clarification_questions)
     analysis_plan = state.get("analysis_plan") or evidence.get("analysis_plan") or []
     tool_results = evidence.get("tool_results", {})
     top_stories = evidence.get("top_stories", [])

@@ -80,6 +80,8 @@ def tool_executor_node(state: AnalystState) -> AnalystState:
                 continue
 
             if result is not None:
+                if isinstance(result, dict) and "tool" not in result:
+                    result["tool"] = tool_name
                 key = f"{tool_name}_{'_'.join(columns)}" if columns else tool_name
                 tool_results[key] = result
 

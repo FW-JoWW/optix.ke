@@ -4,12 +4,11 @@ import os
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
-from openai import OpenAI
 
 from state.state import AnalystState
+from utils.openai_runtime import get_openai_client
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 def _story_signature(story: Dict[str, Any]) -> str:
@@ -118,6 +117,7 @@ def _fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
         "plain_english": explanation,
         "business_implication": implication,
         "recommended_action": action,
+        "limitations": "This finding should be interpreted alongside other relevant variables and broader business context.",
     }
 
 
@@ -127,14 +127,21 @@ def _format_details(details: List[Dict[str, Any]]) -> str:
         sections.append(
             "\n".join(
                 [
-                    f"- {detail['headline']}",
-                    f"  Meaning: {detail['plain_english']}",
-                    f"  Why it matters: {detail['business_implication']}",
-                    f"  Recommended action: {detail['recommended_action']}",
+                    "INSIGHT:",
+                    f"- {detail['plain_english']}",
+                    "",
+                    "BUSINESS IMPLICATION:",
+                    f"- {detail['business_implication']}",
+                    "",
+                    "RECOMMENDATIONS:",
+                    f"- {detail['recommended_action']}",
+                    "",
+                    "LIMITATIONS:",
+                    f"- {detail['limitations']}",
                 ]
             )
         )
-    return "\n".join(sections) if sections else "No patterns detected to generate insights."
+    return "\n\n".join(sections) if sections else "No patterns detected to generate insights."
 
 
 def _parse_llm_output(raw_text: str, stories: List[Dict[str, Any]]) -> tuple[str, List[str], List[Dict[str, Any]]]:
@@ -149,6 +156,11 @@ def _parse_llm_output(raw_text: str, stories: List[Dict[str, Any]]) -> tuple[str
             for q in parts[1].strip().splitlines()
             if q.strip()
         ]
+
+    questions = [
+        q for q in questions
+        if q and q.strip().lower() not in {"none", "n/a", "no", "no questions"}
+    ]
 
     details = [_fallback_detail(story) for story in stories]
     return insights_text, questions, details
@@ -171,6 +183,7 @@ def llm_insight_synthesizer_node(state: AnalystState) -> AnalystState:
         evidence["llm_insights"] = "No patterns detected to generate insights."
         evidence["llm_insight_details"] = []
         evidence["clarification_questions"] = []
+        evidence["llm_synthesis_status"] = "no_stories"
         state["llm_insights"] = evidence["llm_insights"]
         state["clarification_questions"] = evidence["clarification_questions"]
         return state
@@ -180,6 +193,7 @@ def llm_insight_synthesizer_node(state: AnalystState) -> AnalystState:
         evidence["llm_insight_details"] = details
         evidence["llm_insights"] = _format_details(details)
         evidence["clarification_questions"] = []
+        evidence["llm_synthesis_status"] = "disabled"
         state["llm_insights"] = evidence["llm_insights"]
         state["clarification_questions"] = evidence["clarification_questions"]
         print("\n=== LLM SYNTHESIZED INSIGHTS ===")
@@ -241,18 +255,30 @@ CLARIFICATION QUESTIONS:
 - bullet points only if needed, otherwise write "- None"
 """
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        llm_result = response.choices[0].message.content or ""
-        insights_text, questions, details = _parse_llm_output(llm_result, top_stories)
-    except Exception:
+    client = get_openai_client()
+    if client is None:
         details = [_fallback_detail(story) for story in top_stories]
         insights_text = _format_details(details)
         questions = []
+        evidence["llm_synthesis_status"] = "fallback_used: OPENAI_API_KEY not set"
+        print("\n[INFO] LLM insight synthesis unavailable - using fallback: OPENAI_API_KEY not set")
+    else:
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            llm_result = response.choices[0].message.content or ""
+            insights_text, questions, details = _parse_llm_output(llm_result, top_stories)
+        except Exception as exc:
+            details = [_fallback_detail(story) for story in top_stories]
+            insights_text = _format_details(details)
+            questions = []
+            evidence["llm_synthesis_status"] = f"fallback_used: {exc}"
+            print(f"\n[INFO] LLM insight synthesis unavailable - using fallback: {exc}")
+        else:
+            evidence["llm_synthesis_status"] = "live_llm"
 
     evidence["llm_insight_details"] = details
     evidence["llm_insights"] = insights_text

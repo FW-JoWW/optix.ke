@@ -28,6 +28,7 @@ class AnalystState(TypedDict):
     intent: Optional[Dict[str, Any]]
     intent_confidence: Optional[float]
     llm_reasoning: Optional[Dict[str, Any]]
+    llm_reasoning_status: Optional[str]
     
     # analysis plan
     analysis_plan: Optional[List[str]]
@@ -52,6 +53,7 @@ class AnalystState(TypedDict):
     user_response: str
     enable_llm_reasoning: bool
     disable_llm_reasoning: bool
+    disable_semantic_matcher: bool
 
     # analysis evidence container
     analysis_evidence: Optional[Dict[str, Any]]

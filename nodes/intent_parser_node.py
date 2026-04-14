@@ -402,6 +402,9 @@ def convert_reasoning_to_ast(reasoning, df):
         }
         nodes.append(node)
 
+    if not nodes:
+        return None
+
     if len(nodes) == 1:
         return nodes[0]
 
@@ -425,30 +428,6 @@ def build_ast(query: str, df):
         query,
         flags=re.IGNORECASE
     )
-
-    # ---- HANDLE AND / WITH ----  
-    and_parts = re.split(r'\s+(and|with)\s+', query)
-    
-    # remove the actual words "and"/"with"
-    and_parts = [p for p in and_parts if p not in ("and", "with")]
-    
-    if len(and_parts) > 1:
-        nodes = [build_ast(p, df) for p in and_parts if p.strip()]
-        nodes = [n for n in nodes if n]
-
-        if not nodes:
-            return None
-
-        if len(nodes) == 1:
-            return nodes[0]
-    
-        ast_node = {
-            "type": "logic",
-            "operator": "and",
-            "conditions": nodes
-        }
-
-        return ast_node
 
     # ---- HANDLES OR ----
     or_parts = re.split(r'\s+or\s+', query)
@@ -756,6 +735,42 @@ def map_intents_to_operations(intents):
 
     return final_ops
 
+
+def _has_analysis_request(analytic_intent: str, query: str) -> bool:
+    analysis_intents = {
+        "comparison",
+        "relationship",
+        "temporal",
+        "composition",
+        "extremes",
+        "profiling",
+        "outliers",
+        "investigative",
+        "predictive",
+    }
+    if analytic_intent in analysis_intents:
+        return True
+
+    query = query.lower()
+    analysis_keywords = [
+        "relationship",
+        "correlation",
+        "impact",
+        "effect",
+        "affect",
+        "compare",
+        "difference",
+        "distribution",
+        "summary",
+        "statistics",
+        "average",
+        "mean",
+        "median",
+        "outlier",
+        "trend",
+    ]
+    return any(keyword in query for keyword in analysis_keywords)
+
 # ------------------------
 # MAIN NODE
 # ------------------------
@@ -824,6 +839,8 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
         "analytic_intent": analytic_intent,
         "ast": ast,
         "filters": filters,
+        "has_filters": bool(filters),
+        "wants_analysis": _has_analysis_request(analytic_intent, query),
         "group_by": None,
         "aggregation": None,
         "aggregate_column": None,
@@ -949,6 +966,7 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
         state["intent"]["filters"] = extract_filters(state["intent"]["ast"])
     else:
         state["intent"]["filters"] = []
+    state["intent"]["has_filters"] = bool(state["intent"]["filters"])
 
     state["intent"]["low_confidence"] = any(
         estimate_filter_confidence(f) < 0.75 for f in state["intent"]["filters"]
@@ -958,8 +976,10 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     # TYPE
     # ------------------------
     
-    if intent["aggregation"]:
+    if intent["aggregation"] and intent["wants_analysis"]:
         intent["type"] = "aggregation"
+    elif intent["wants_analysis"]:
+        intent["type"] = "analysis"
     elif state["intent"].get("ast"):
         intent["type"] = "filter"
     else:

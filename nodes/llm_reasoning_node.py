@@ -4,14 +4,12 @@ import re
 
 import pandas as pd
 from dotenv import load_dotenv
-from openai import OpenAI
 
 from state.state import AnalystState
+from utils.openai_runtime import get_openai_client
 from utils.value_resolver import resolve_value
 
 load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=api_key) if api_key else None
 
 VALID_OPERATORS = {
     "equals", ">", "<", ">=", "<=", "between", "!=", "contains"
@@ -185,11 +183,14 @@ def llm_reasoning_node(state: AnalystState) -> AnalystState:
     """
     if state.get("disable_llm_reasoning"):
         state["llm_reasoning"] = None
+        state["llm_reasoning_status"] = "disabled"
         print("\n[INFO] LLM reasoning disabled by state flag")
         return state
 
+    client = get_openai_client()
     if client is None:
         state["llm_reasoning"] = None
+        state["llm_reasoning_status"] = "unavailable: OPENAI_API_KEY not set"
         print("\n[INFO] OPENAI_API_KEY not set - skipping LLM reasoning")
         return state
 
@@ -263,6 +264,7 @@ Return exactly one JSON object in this shape:
         )
     except Exception as e:
         state["llm_reasoning"] = None
+        state["llm_reasoning_status"] = f"unavailable: {e}"
         print(f"\n[INFO] LLM reasoning unavailable - skipping: {e}")
         return state
 
@@ -279,9 +281,11 @@ Return exactly one JSON object in this shape:
 
     if not normalized:
         state["llm_reasoning"] = None
+        state["llm_reasoning_status"] = "invalid_output"
         print("[WARNING] Invalid LLM reasoning output")
         return state
 
     state["llm_reasoning"] = normalized
+    state["llm_reasoning_status"] = "live_llm"
     print("\n[INFO] Validated LLM reasoning:", normalized)
     return state
