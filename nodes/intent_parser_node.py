@@ -30,6 +30,16 @@ def map_numeric_synonyms(query: str):
 def normalize(text: str):
     return text.lower().replace("_", "").replace(" ", "")
 
+
+def _dedupe_preserve_order(values):
+    seen = set()
+    ordered = []
+    for value in values:
+        if value and value not in seen:
+            ordered.append(value)
+            seen.add(value)
+    return ordered
+
 def extract_mentioned_columns(query: str, columns: list[str]):
     normalized_query = normalize(query)
     mentioned = []
@@ -959,6 +969,33 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
         llm_ast = convert_reasoning_to_ast(reasoning, df)
         if llm_ast:
             state["intent"]["ast"] = merge_ast_nodes(state["intent"].get("ast"), llm_ast)
+        if reasoning:
+            llm_group_by = reasoning.get("group_by", []) or []
+            if llm_group_by and not state["intent"].get("group_by"):
+                state["intent"]["group_by"] = llm_group_by[0]
+
+            llm_aggregation = reasoning.get("aggregation", {}) or {}
+            llm_agg_type = llm_aggregation.get("type")
+            llm_agg_target = llm_aggregation.get("target")
+            if llm_agg_type and llm_agg_type != "none" and not state["intent"].get("aggregation"):
+                state["intent"]["aggregation"] = llm_agg_type
+            if llm_agg_target and not state["intent"].get("aggregate_column"):
+                state["intent"]["aggregate_column"] = llm_agg_target
+
+            llm_columns = [
+                c.get("field")
+                for c in reasoning.get("constraints", [])
+                if isinstance(c, dict)
+            ]
+            llm_columns.extend(llm_group_by)
+            if llm_agg_target:
+                llm_columns.append(llm_agg_target)
+            final_selected = _dedupe_preserve_order(
+                (state["intent"].get("selected_columns") or []) + llm_columns
+            )
+            state["intent"]["selected_columns"] = final_selected
+            if final_selected:
+                state["selected_columns"] = final_selected
     else:
         print("\n[INFO] Skipping LLM - symbolic parsing sufficient")
 
@@ -971,6 +1008,15 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     state["intent"]["low_confidence"] = any(
         estimate_filter_confidence(f) < 0.75 for f in state["intent"]["filters"]
     )
+
+    final_selected_columns = state["intent"].get("selected_columns") or selected_columns
+    if state["intent"].get("group_by"):
+        final_selected_columns = _dedupe_preserve_order(final_selected_columns + [state["intent"]["group_by"]])
+    if state["intent"].get("aggregate_column"):
+        final_selected_columns = _dedupe_preserve_order(final_selected_columns + [state["intent"]["aggregate_column"]])
+    if final_selected_columns:
+        state["intent"]["selected_columns"] = final_selected_columns
+        state["selected_columns"] = final_selected_columns
 
     # ------------------------
     # TYPE

@@ -188,6 +188,7 @@ def map_story_to_chart(story, df):
     mapping = {
         "group_difference": generate_boxplot,
         "outliers": generate_histogram,
+        "summary_numeric": generate_histogram,
         "correlation": generate_scatter,
         "regression": generate_regression_plot,
         "numeric_anomaly": generate_histogram,

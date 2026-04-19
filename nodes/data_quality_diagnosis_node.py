@@ -1,54 +1,13 @@
 # nodes/data_quality_diagnosis_node.py
-from state.state import AnalystState
-from utils.issue_detector import detect_issues
 import json
 
-# Placeholder for your LLM API
-def llm_reasoning(detected_issues: dict, dataset_summary: dict) -> dict:
-    """
-    Runs LLM reasoning to assign explanations and confirm cleaning actions.
-    Here we simulate with deterministic explanations for now.
-    Replace this with your actual LLM call.
-    """
-    enriched_issues = []
-
-    for issue in detected_issues["detected_issues"]:
-        col = issue.get("column")
-        issue_type = issue.get("issue_type")
-        severity = issue.get("severity")
-
-        explanation = ""
-        recommended_action = ""
-
-        # Example deterministic explanations (can be replaced with LLM)
-        if issue_type == "missing_values":
-            explanation = f"{issue['missing_count']} missing values in column {col}"
-            recommended_action = "impute"
-        elif issue_type == "duplicate_rows":
-            explanation = f"{issue['duplicate_count']} duplicate rows in dataset"
-            recommended_action = "remove_duplicates"
-        elif issue_type == "outliers":
-            explanation = f"{issue['outlier_count']} outliers detected in column {col}"
-            recommended_action = "investigate_or_cap"
-        elif issue_type == "constant_column":
-            explanation = f"Column {col} contains a single unique value"
-            recommended_action = "drop_column"
-        elif issue_type == "high_cardinality":
-            explanation = f"Column {col} has high cardinality (>80% unique)"
-            recommended_action = "consider_encoding_or_drop"
-        elif issue_type == "numeric_as_object":
-            explanation = f"Column {col} is numeric but stored as object"
-            recommended_action = "convert_to_numeric"
-
-        enriched_issues.append({
-            "column": col,
-            "issue_type": issue_type,
-            "severity": severity,
-            "explanation": explanation,
-            "recommended_action": recommended_action
-        })
-
-    return {"issues": enriched_issues}
+from ambiguity_detector import detect_ambiguity
+from context_inference import infer_context
+from data_profiling import profile_dataset
+from structural_signal_extraction import extract_structural_signals
+from state.state import AnalystState
+from utils.cleaning_recommender import recommend_cleaning_issues
+from utils.issue_detector import detect_issues
 
 def data_quality_diagnosis_node(state: AnalystState) -> AnalystState:
     """
@@ -64,22 +23,44 @@ def data_quality_diagnosis_node(state: AnalystState) -> AnalystState:
 
     print("\n=== DATA QUALITY DIAGNOSIS NODE ===")
 
+    profile = profile_dataset(df)
+    ambiguity = detect_ambiguity(profile)
+    structural_signals = extract_structural_signals(profile)
+
     # Step 1: Rule-based detection
     detected_issues = detect_issues(df)
 
-    # Step 2: Dataset summary for LLM context
-    dataset_summary = {
-        "rows": df.shape[0],
-        "columns": df.shape[1],
-        "column_names": df.columns.tolist()
-    }
+    # Step 2: constrained reasoning over column context
+    structured_issues = recommend_cleaning_issues(detected_issues, df)
+    context = infer_context(
+        dataset_profile=profile,
+        ambiguity_report=ambiguity,
+        sample_rows=profile.get("sample_rows", []),
+        structural_signals=structural_signals,
+        llm_enabled=bool(state.get("enable_llm_reasoning", True) and not state.get("disable_llm_reasoning")),
+    )
 
-    # Step 3: LLM reasoning
-    structured_issues = llm_reasoning(detected_issues, dataset_summary)
-
-    # Step 4: Save to state
+    # Step 3: Save to state
     state["data_quality_issues"] = structured_issues
+    state["profile_ambiguity"] = ambiguity
+    state["structural_signals"] = structural_signals
+    state["context_inference"] = context
+    state.setdefault("analysis_evidence", {})
+    state["analysis_evidence"]["cleaning_reasoning_status"] = structured_issues.get("cleaning_reasoning_status")
+    state["analysis_evidence"]["cleaning_column_profiles"] = structured_issues.get("column_profiles", {})
+    state["analysis_evidence"]["preclean_profile_json"] = profile
+    state["analysis_evidence"]["profile_ambiguity"] = ambiguity
+    state["analysis_evidence"]["structural_signals"] = structural_signals
+    state["analysis_evidence"]["context_inference"] = context
 
-    print(json.dumps(structured_issues, indent=2))
+    print(json.dumps(
+        {
+            "issues": structured_issues,
+            "ambiguity": ambiguity,
+            "structural_signals": structural_signals,
+            "context_inference": context,
+        },
+        indent=2,
+    ))
 
     return state

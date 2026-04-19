@@ -1,5 +1,7 @@
 from typing import Dict, List
 
+from decision_engine import run_decision_engine
+from intent_alignment import validate_analysis_plan_against_intent
 from state.state import AnalystState
 
 
@@ -32,6 +34,16 @@ def _numeric_by_categorical_plans(
                 continue
             plans.append({"tool": tool, "columns": [num, cat]})
     return plans
+
+
+def _dedupe_preserve_order(columns: List[str]) -> List[str]:
+    seen = set()
+    ordered: List[str] = []
+    for col in columns:
+        if col and col not in seen:
+            ordered.append(col)
+            seen.add(col)
+    return ordered
 
 
 def analysis_planner_node(state: AnalystState) -> AnalystState:
@@ -194,10 +206,65 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
             unique_plan.append(item)
             seen.add(key)
 
+    unique_plan = validate_analysis_plan_against_intent(
+        question=question,
+        intent=intent,
+        plan=unique_plan,
+        selected_columns=selected_columns,
+    )
+
+    decision_output = run_decision_engine(
+        dataset_profile=dataset_profile,
+        structural_signals=state.get("structural_signals", {}),
+        inferred_context=state.get("context_inference", {}),
+        relationship_signals=state.get("relationship_signals", {}),
+        user_intent={**intent, "query": question},
+        constraint_rules=state.get("cleaning_constraints", {}),
+        candidate_plan=unique_plan,
+        selected_columns=selected_columns,
+    )
+    state["decision_output"] = decision_output.model_dump()
+    evidence["computation_plan"] = decision_output.computation_plan.model_dump()
+    unique_plan = [
+        {
+            "tool": item.tool,
+            "columns": item.columns,
+            "parameters": item.parameters,
+            "computation_refs": item.computation_refs,
+        }
+        for item in decision_output.analysis_plan.operations
+        if item.valid
+    ]
+
     evidence["analysis_plan"] = unique_plan
+    evidence["analysis_decisions"] = decision_output.analysis_plan.model_dump()
+    evidence["decision_notes"] = decision_output.decision_notes
+
+    required_columns: List[str] = []
+    for step in decision_output.computation_plan.steps:
+        if step.column:
+            required_columns.append(step.column)
+        required_columns.extend(step.columns)
+        group_by = (step.parameters or {}).get("group_by")
+        within = (step.parameters or {}).get("within")
+        if group_by:
+            required_columns.append(group_by)
+        if within:
+            required_columns.append(within)
+    for item in unique_plan:
+        required_columns.extend(item.get("columns", []))
+
+    required_columns = _dedupe_preserve_order(selected_columns + required_columns)
+    available_columns = [col for col in required_columns if col in df.columns]
+    if available_columns:
+        state["selected_columns"] = available_columns
+        state["analysis_dataset"] = df[available_columns].copy()
 
     print("\n=== ANALYSIS PLAN ===")
     print("Dataset shape:", df.shape)
+    print("Strategy:", decision_output.analysis_plan.analytical_strategy)
+    print("Confidence:", decision_output.analysis_plan.confidence_score)
+    print("Computation plan:", decision_output.computation_plan.model_dump())
     for p in unique_plan:
         print("-", p)
 

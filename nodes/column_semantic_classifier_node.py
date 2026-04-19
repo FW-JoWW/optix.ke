@@ -19,6 +19,7 @@ def column_semantic_classifier_node(state: AnalystState) -> AnalystState:
     if profile is None:
         raise ValueError("Dataset profile missing in state.")
 
+    inferred_roles = (state.get("context_inference") or {}).get("column_roles", {})
     column_registry = {}
 
     for col in df.columns:
@@ -33,34 +34,33 @@ def column_semantic_classifier_node(state: AnalystState) -> AnalystState:
         else:
             col_info["type"] = "unknown"
 
-        col_lower = col.lower()
-        semantic_role = "irrelevant"
-
-        if "id" in col_lower:
-            semantic_role = "identifier"
-        elif "name" in col_lower or "first" in col_lower or "last" in col_lower:
-            semantic_role = "personal_attribute"
-        elif "date" in col_lower or col_info["type"] == "datetime":
-            semantic_role = "datetime"
-        elif col in profile.get("identifier_columns", []):
-            semantic_role = "identifier"
-        elif col_info["type"] == "numeric":
-            semantic_role = "numeric_measure"
-        elif col_info["type"] == "categorical":
-            semantic_role = "categorical_feature"
+        semantic_role = inferred_roles.get(col)
+        if not semantic_role:
+            if col in profile.get("identifier_columns", []):
+                semantic_role = "identifier"
+            elif col_info["type"] == "datetime":
+                semantic_role = "timestamp"
+            elif col_info["type"] == "numeric":
+                semantic_role = "numeric_measure"
+            elif col_info["type"] == "categorical":
+                semantic_role = "categorical_feature"
+            else:
+                semantic_role = "unknown"
 
         col_info["semantic_role"] = semantic_role
 
         if semantic_role == "identifier":
             rules = ["must_be_unique", "never_impute"]
+        elif semantic_role == "grouping_key":
+            rules = ["preserve_group_integrity"]
+        elif semantic_role == "derived_metric":
+            rules = ["recompute_if_possible", "avoid_direct_edit"]
         elif semantic_role == "numeric_measure":
             rules = ["detect_outliers", "impute_missing"]
         elif semantic_role == "categorical_feature":
             rules = ["standardize_categories", "fix_capitalization", "remove_whitespace"]
-        elif semantic_role == "datetime":
+        elif semantic_role == "timestamp":
             rules = ["standardize_format", "check_chronology"]
-        elif semantic_role == "personal_attribute":
-            rules = ["trim_whitespace", "handle_privacy"]
         else:
             rules = ["ignore"]
 

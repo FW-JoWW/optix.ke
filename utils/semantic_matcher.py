@@ -8,6 +8,14 @@ import io
 
 _model = None
 
+QUERY_ALIASES = {
+    "sales": ["sale", "sales", "revenue", "amount", "total", "totals", "value"],
+    "quantity": ["quantity", "qty", "units", "count", "volume"],
+    "price": ["price", "cost", "amount", "value", "rate"],
+    "profit": ["profit", "margin", "gain"],
+    "date": ["date", "day", "time", "month", "year"],
+}
+
 
 def _model_cached_locally():
     cache_roots = []
@@ -46,33 +54,38 @@ def get_model():
             _model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
     return _model
 
-def semantic_column_match(question, columns, threshold=0.5, fallback_k=3):
+def semantic_column_match(question, columns, threshold=0.5, fallback_k=3, lexical_only=False):
     """
     Returns columns that semantically match the question.
     """
     if not columns:
         return[]
 
+    normalized_question = question.lower()
+    lexical_matches = [
+        col for col in columns
+        if col.lower() in normalized_question
+        or col.lower().replace("_", " ") in normalized_question
+    ]
+    alias_hits = []
+    for term, aliases in QUERY_ALIASES.items():
+        if term in normalized_question:
+            for col in columns:
+                normalized_col = col.lower().replace("_", " ")
+                if any(alias in normalized_col for alias in aliases):
+                    alias_hits.append(col)
+    lexical_matches = list(dict.fromkeys(lexical_matches + alias_hits))
+    if lexical_matches:
+        return lexical_matches
+    if lexical_only:
+        return []
+
     if not _model_cached_locally():
-        normalized_question = question.lower()
-        lexical_matches = [
-            col for col in columns
-            if col.lower() in normalized_question or col.lower().replace("_", " ") in normalized_question
-        ]
-        if lexical_matches:
-            return lexical_matches
         return columns[:fallback_k]
 
     try:
         model = get_model()
     except Exception:
-        normalized_question = question.lower()
-        lexical_matches = [
-            col for col in columns
-            if col.lower() in normalized_question or col.lower().replace("_", " ") in normalized_question
-        ]
-        if lexical_matches:
-            return lexical_matches
         return columns[:fallback_k]
 
     # embed question

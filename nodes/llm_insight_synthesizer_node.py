@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
+from insight_generation import generate_insights
 from state.state import AnalystState
 from utils.openai_runtime import get_openai_client
 
@@ -110,6 +111,19 @@ def _fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
         explanation = f"There are {count} unusual values in {column}, meaning a small set of records sits far from the typical range."
         implication = f"These records can distort averages, correlations, and business summaries for {column}."
         action = f"Inspect the outliers in {column} before using it for high-stakes decisions."
+
+    elif story_type == "summary_numeric":
+        column = story.get("column", "metric")
+        mean = story.get("mean")
+        min_value = story.get("min")
+        max_value = story.get("max")
+        explanation = (
+            f"{column} is centered around {round(float(mean), 2) if mean is not None else 'its typical level'}, "
+            f"with observed values spanning from {round(float(min_value), 2) if min_value is not None else 'the low end'} "
+            f"to {round(float(max_value), 2) if max_value is not None else 'the high end'}."
+        )
+        implication = f"This gives a baseline operating range for {column} that can anchor planning and anomaly checks."
+        action = f"Use the typical range of {column} to set benchmarks, thresholds, or target bands."
 
     return {
         "related_story_signature": _story_signature(story),
@@ -254,31 +268,14 @@ LIMITATIONS:
 CLARIFICATION QUESTIONS:
 - bullet points only if needed, otherwise write "- None"
 """
-
-    client = get_openai_client()
-    if client is None:
-        details = [_fallback_detail(story) for story in top_stories]
-        insights_text = _format_details(details)
-        questions = []
-        evidence["llm_synthesis_status"] = "fallback_used: OPENAI_API_KEY not set"
-        print("\n[INFO] LLM insight synthesis unavailable - using fallback: OPENAI_API_KEY not set")
-    else:
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-            llm_result = response.choices[0].message.content or ""
-            insights_text, questions, details = _parse_llm_output(llm_result, top_stories)
-        except Exception as exc:
-            details = [_fallback_detail(story) for story in top_stories]
-            insights_text = _format_details(details)
-            questions = []
-            evidence["llm_synthesis_status"] = f"fallback_used: {exc}"
-            print(f"\n[INFO] LLM insight synthesis unavailable - using fallback: {exc}")
-        else:
-            evidence["llm_synthesis_status"] = "live_llm"
+    insights_text, questions, details, status = generate_insights(
+        state=state,
+        top_stories=top_stories,
+        prompt=prompt,
+    )
+    evidence["llm_synthesis_status"] = status
+    if status.startswith("fallback_used:"):
+        print(f"\n[INFO] LLM insight synthesis unavailable - using fallback: {status.split(':', 1)[1].strip()}")
 
     evidence["llm_insight_details"] = details
     evidence["llm_insights"] = insights_text

@@ -20,6 +20,13 @@ class AnalystState(TypedDict):
     # dataset understanding
     dataset_profile: Optional[Dict[str, Any]]
     data_validation: Optional[Dict[str, Any]]
+    profile_ambiguity: Optional[Dict[str, Any]]
+    structural_signals: Optional[Dict[str, Any]]
+    context_inference: Optional[Dict[str, Any]]
+    cleaning_constraints: Optional[Dict[str, Any]]
+    decision_output: Optional[Dict[str, Any]]
+    cleaning_validation: Optional[Dict[str, Any]]
+    relationship_signals: Optional[Dict[str, Any]]
     column_registry: Optional[Dict[str, Any]]
     relevant_columns: Optional[List[str]]
     selected_columns: Optional[List[str]]
@@ -57,6 +64,14 @@ class AnalystState(TypedDict):
 
     # analysis evidence container
     analysis_evidence: Optional[Dict[str, Any]]
+    human_in_loop: Optional[Dict[str, Any]]
+
+    # dataset normalization pipeline
+    normalization_schema: Optional[Any]
+    normalization_schema_name: Optional[str]
+    normalization_source_type: Optional[str]
+    normalization_synonyms: Optional[Dict[str, List[str]]]
+    normalization_output: Optional[Dict[str, Any]]
 
     # agent messages
     clarification_questions: Optional[list]

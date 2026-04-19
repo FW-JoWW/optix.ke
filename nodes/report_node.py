@@ -57,6 +57,26 @@ def _format_tool_results(tool_results: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_computation_plan(computation_plan: Dict[str, Any]) -> str:
+    if not computation_plan:
+        return "None"
+    steps = computation_plan.get("steps", [])
+    if not steps:
+        return "None"
+    lines = []
+    for step in steps:
+        op = step.get("operation")
+        col = step.get("column")
+        cols = step.get("columns", [])
+        params = step.get("parameters", {})
+        target = col or ", ".join(cols)
+        if params:
+            lines.append(f"- {op} on {target}: {params}")
+        else:
+            lines.append(f"- {op} on {target}")
+    return "\n".join(lines)
+
+
 def _format_top_stories(top_stories: List[Dict[str, Any]]) -> str:
     if not top_stories:
         return "None"
@@ -91,10 +111,17 @@ def report_node(state: AnalystState) -> AnalystState:
     )
     clarification_questions = _normalize_questions(clarification_questions)
     analysis_plan = state.get("analysis_plan") or evidence.get("analysis_plan") or []
+    computation_plan = evidence.get("computation_plan") or {}
     tool_results = evidence.get("tool_results", {})
     top_stories = evidence.get("top_stories", [])
     visualizations = evidence.get("visualizations", [])
     decision_context = state.get("decision_context", "No strong decision can be made")
+    human_in_loop = evidence.get("human_in_loop")
+    decision_notes = evidence.get("decision_notes", [])
+
+    hitl_summary = "None"
+    if human_in_loop:
+        hitl_summary = f"{human_in_loop.get('mode')}: {human_in_loop.get('action')}"
 
     report = f"""
 ================ EXECUTIVE REPORT ================
@@ -104,6 +131,9 @@ BUSINESS QUESTION:
 
 ANALYSIS PLAN:
 {_format_analysis_plan(analysis_plan)}
+
+COMPUTATION PLAN:
+{_format_computation_plan(computation_plan)}
 
 STATISTICAL OUTPUT SUMMARY:
 {_format_tool_results(tool_results)}
@@ -119,6 +149,12 @@ VISUALIZATIONS:
 
 DECISION CONTEXT:
 {decision_context}
+
+DECISION ENGINE NOTES:
+{chr(10).join(f"- {note}" for note in decision_notes) if decision_notes else "None"}
+
+HUMAN IN LOOP:
+{hitl_summary}
 
 CLARIFICATION QUESTIONS:
 {chr(10).join(f"- {q}" for q in clarification_questions) if clarification_questions else "None"}

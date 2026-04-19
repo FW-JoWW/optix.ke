@@ -49,8 +49,18 @@ def column_selection_node(state: AnalystState) -> AnalystState:
     candidate_columns = list(column_registry.keys())
 
     if parser_selected_columns:
-        matched_columns = []
-        print("\n[INFO] Semantic column matcher skipped - explicit columns already identified")
+        try:
+            from utils.semantic_matcher import semantic_column_match
+            matched_columns = semantic_column_match(
+                question,
+                candidate_columns,
+                threshold=0.4,
+                fallback_k=0,
+                lexical_only=True,
+            )
+        except Exception:
+            matched_columns = []
+        print("\n[INFO] Using explicit columns first, with lexical semantic supplementation")
     elif state.get("disable_semantic_matcher"):
         matched_columns = []
         print("\n[INFO] Semantic column matcher disabled - using intent columns only")
@@ -81,7 +91,14 @@ def column_selection_node(state: AnalystState) -> AnalystState:
         selected_columns = selected_columns or dedupe_preserve_order(matched_columns)
 
     if not selected_columns:
-        selected_columns = df.columns.tolist()[:5]
+        profile = state.get("dataset_profile", {})
+        identifier_columns = set(profile.get("identifier_columns", []))
+        preferred_columns = [
+            col for col in df.columns
+            if col not in identifier_columns
+            and df[col].notna().mean() >= 0.2
+        ]
+        selected_columns = preferred_columns[:5] or df.columns.tolist()[:5]
 
     selected_columns = [c for c in selected_columns if c in df.columns]
 

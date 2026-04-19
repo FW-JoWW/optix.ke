@@ -11,6 +11,7 @@ from nodes.cleaning_audit_node import cleaning_audit_node
 from nodes.data_validation_node import data_validation_node
 from nodes.dataset_profiler_node import dataset_profiler_node
 from nodes.column_semantic_classifier_node import column_semantic_classifier_node
+from nodes.relationship_detector_node import relationship_detector_node
 from nodes.intent_parser_node import intent_parser_node
 from nodes.row_filter_node import row_filter_node
 from nodes.column_selection_node import column_selection_node
@@ -40,6 +41,7 @@ builder.add_node("data_validation", data_validation_node)
 
 builder.add_node("dataset_profiler", dataset_profiler_node)
 builder.add_node("column_semantic_classifier", column_semantic_classifier_node)
+builder.add_node("relationship_detector", relationship_detector_node)
 
 builder.add_node("intent_parser", intent_parser_node)
 builder.add_node("row_filter", row_filter_node)
@@ -71,7 +73,8 @@ builder.add_edge("cleaning_audit", "data_validation")
 
 builder.add_edge("data_validation", "dataset_profiler")
 builder.add_edge("dataset_profiler", "column_semantic_classifier")
-builder.add_edge("column_semantic_classifier", "intent_parser")
+builder.add_edge("column_semantic_classifier", "relationship_detector")
+builder.add_edge("relationship_detector", "intent_parser")
 
 builder.add_edge("intent_parser", "row_filter")
 builder.add_edge("row_filter", "column_selection")
@@ -111,7 +114,23 @@ builder.add_edge("output_mode", END)
 #builder.add_edge("initialize_analysis_evidence", "analysis_planner")
 
 builder.add_edge("analysis_planner", "interaction")
-builder.add_edge("interaction", "tool_executor")
+
+
+def route_after_interaction(state: AnalystState):
+    if state.get("awaiting_user"):
+        return "end"
+    return "tool_executor"
+
+
+builder.add_conditional_edges(
+    "interaction",
+    route_after_interaction,
+    {
+        "tool_executor": "tool_executor",
+        "end": END,
+    }
+)
+
 builder.add_edge("tool_executor", "evidence_interpreter")
 builder.add_edge("evidence_interpreter", "story_scoring")
 builder.add_edge("story_scoring", "visualization")

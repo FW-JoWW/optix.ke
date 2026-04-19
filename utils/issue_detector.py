@@ -1,6 +1,15 @@
 # utils/issue_detector.py
 import pandas as pd
 import numpy as np
+import warnings
+from utils.numeric_parsing import normalize_numeric_token
+
+
+def _parse_ratio_on_non_null(parsed: pd.Series, original: pd.Series) -> float:
+    non_null = int(original.notna().sum())
+    if non_null == 0:
+        return 0.0
+    return float(parsed.notna().sum() / non_null)
 
 def detect_issues(df: pd.DataFrame) -> dict:
     """
@@ -18,16 +27,10 @@ def detect_issues(df: pd.DataFrame) -> dict:
     numeric_cache = {}
     
     for col in df.columns:
-        cleaned = (
-            df[col]
-            .astype(str)
-            .str.replace(r"[^\d\.\-]", "", regex=True)
-        )
-
-        coerced = pd.to_numeric(cleaned, errors="coerce")
+        coerced = pd.to_numeric(df[col].map(normalize_numeric_token), errors="coerce")
 
         # If ≥80% values are numeric → treat as numeric column
-        if coerced.notna().mean() >= 0.8:
+        if _parse_ratio_on_non_null(coerced, df[col]) >= 0.8:
             numeric_cache[col] = coerced
 
     # -----------------------------
@@ -131,7 +134,36 @@ def detect_issues(df: pd.DataFrame) -> dict:
                 "issue_type": "numeric_as_object",
                 "severity": "medium"
             })
-            '''except:
-                pass'''
+    # -----------------------------
+    # Datetime-like stored as object
+    # -----------------------------
+    for col in df.columns:
+        if df[col].dtype != "object":
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            parsed = pd.to_datetime(df[col], errors="coerce")
+        if _parse_ratio_on_non_null(parsed, df[col]) >= 0.8:
+            issues.append({
+                "column": col,
+                "issue_type": "datetime_as_object",
+                "severity": "medium"
+            })
+
+    # -----------------------------
+    # Inconsistent categorical labels
+    # -----------------------------
+    for col in categorical_cols:
+        non_null = df[col].dropna().astype(str)
+        if non_null.empty:
+            continue
+        stripped = non_null.str.strip()
+        normalized = stripped.str.lower()
+        if bool((non_null != stripped).any()) or normalized.nunique() < stripped.nunique():
+            issues.append({
+                "column": col,
+                "issue_type": "inconsistent_labels",
+                "severity": "low"
+            })
 
     return {"detected_issues": issues}

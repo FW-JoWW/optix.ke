@@ -1,76 +1,34 @@
+from __future__ import annotations
+
 from state.state import AnalystState
-import pandas as pd
-import numpy as np
-from typing import Dict, Any
+from validation import validate_cleaning
+
 
 def data_validation_node(state: AnalystState) -> AnalystState:
-    """
-    Validates the dataset and updates the AnalystState with findings.
-    Performs:
-    - Missing value check
-    - Duplicate row check
-    - Column type detection
-    - Basic summary statistics
-    - Outlier detection (numeric columns)
-    """
+    before_df = state.get("dataframe")
+    after_df = state.get("cleaned_data")
 
-    df: pd.DataFrame | None = state.get("cleaned_data")
-    if df is None:
-        df = state.get("dataframe")
-
-    if df is None:
+    if before_df is None and after_df is None:
         state["data_validation"] = {"error": "No dataset provided."}
         return state
 
-    validation: Dict[str, Any] = {}
+    if before_df is None:
+        before_df = after_df
+    if after_df is None:
+        after_df = before_df
 
-    # Column types
-    validation["column_types"] = df.dtypes.apply(lambda x: str(x)).to_dict()
-
-    # Missing values
-    validation["missing_values"] = df.isnull().sum().to_dict()
-
-    # Duplicate rows
-    validation["duplicates"] = int(df.duplicated().sum())
-
-    # Basic descriptive stats for numeric columns
-    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    validation["summary_statistics"] = df[numeric_cols].describe().to_dict() if numeric_cols else {}
-
-    # Outlier detection using IQR for numeric columns
-    outliers = {}
-    for col in numeric_cols:
-        Q1 = df[col].quantile(0.25)
-        Q3 = df[col].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        outliers[col] = df[(df[col] < lower_bound) | (df[col] > upper_bound)][col].tolist()
-    validation["outliers"] = outliers
-
-    # Optional warnings
-    warnings = []
-    if any(v > 0 for v in validation["missing_values"].values()):
-        warnings.append("Dataset contains missing values.")
-    if validation["duplicates"] > 0:
-        warnings.append(f"{validation['duplicates']} duplicate rows detected.")
-    if len(numeric_cols) == 0:
-        warnings.append("No numeric columns detected; some analysis may be limited.")
-    validation["warnings"] = warnings
-
-    # Update state
-    state["data_validation"] = validation
-
-    # Optional: ask for clarification if major issues exist
+    validation_result = validate_cleaning(before_df, after_df)
+    state["data_validation"] = validation_result
+    state["cleaning_validation"] = validation_result
     state["clarification_questions"] = []
-    if any(v > 0 for v in validation["missing_values"].values()):
-        state["clarification_questions"].append(
-            "Some columns have missing values. Should we drop rows, fill missing, or leave as is?"
-        )
 
-    if validation["duplicates"] > 0:
+    if validation_result.get("row_loss_ratio", 0.0) > 0.1:
         state["clarification_questions"].append(
-            "Duplicate rows detected. Should we remove them?"
+            "Cleaning changed the row count materially. Should we keep this cleaned version?"
+        )
+    if validation_result.get("anomalies"):
+        state["clarification_questions"].append(
+            "Validation detected anomalies after cleaning. Should the workflow continue with the cleaned dataset?"
         )
 
     return state

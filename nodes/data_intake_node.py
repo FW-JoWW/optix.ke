@@ -1,5 +1,7 @@
 from state.state import AnalystState
 from tools.load_data import load_csv, load_excel, load_sql_table
+from utils.structure_normalizer import choose_best_dataframe
+import pandas as pd
 
 def data_intake_node(state: AnalystState) -> AnalystState:
     """
@@ -8,7 +10,33 @@ def data_intake_node(state: AnalystState) -> AnalystState:
     """
     # If dataset is already loaded, skip file/sql loading
     if state.get("dataframe") is not None:
-        print("Dataset already in state, skipping intake load.")
+        dataset_path = state.get("dataset_path")
+        existing_df = state["dataframe"]
+        normalized = None
+        try:
+            if dataset_path and dataset_path.lower().endswith(".csv"):
+                raw_df = pd.read_csv(dataset_path, header=None)
+                normalized = choose_best_dataframe(existing_df, raw_df)
+            elif dataset_path and dataset_path.lower().endswith((".xls", ".xlsx")):
+                raw_df = pd.read_excel(dataset_path, header=None)
+                normalized = choose_best_dataframe(existing_df, raw_df)
+        except Exception:
+            normalized = None
+
+        if normalized is not None:
+            state["dataframe"] = normalized.dataframe
+            state.setdefault("analysis_evidence", {})
+            state["analysis_evidence"]["structure_normalization"] = {
+                "applied": normalized.applied,
+                "strategy": normalized.strategy,
+                "details": normalized.details,
+            }
+            if normalized.applied:
+                print(f"Dataset normalized using {normalized.strategy}: {normalized.details}")
+            else:
+                print("Dataset already in state, no structural normalization applied.")
+        else:
+            print("Dataset already in state, skipping intake load.")
         return state
     # load dataset from file
     dataset_path = state.get("dataset_path")

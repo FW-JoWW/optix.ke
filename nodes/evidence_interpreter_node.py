@@ -97,6 +97,71 @@ def _outlier_story(result: Dict[str, Any]) -> Dict[str, Any] | None:
     }
 
 
+def _summary_stat_stories(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    stories: List[Dict[str, Any]] = []
+    for item in result.get("results", []) or []:
+        column = item.get("column")
+        mean = item.get("mean")
+        median = item.get("median")
+        min_value = item.get("min")
+        max_value = item.get("max")
+        if column is None or mean is None:
+            continue
+        stories.append({
+            "type": "summary_numeric",
+            "insight": f"{column} typically centers around {round(float(mean), 2)}",
+            "column": column,
+            "mean": float(mean),
+            "median": float(median) if median is not None else None,
+            "min": float(min_value) if min_value is not None else None,
+            "max": float(max_value) if max_value is not None else None,
+            "confidence": "medium",
+        })
+    return stories
+
+
+def _direct_computation_stories(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    payload = result.get("results", {})
+    rows = payload.get("rows", []) or []
+    value = payload.get("value")
+    strategy = payload.get("strategy")
+    stories: List[Dict[str, Any]] = []
+
+    if rows:
+        first = rows[0]
+        keys = list(first.keys())
+        if len(keys) >= 2:
+            group_key, value_key = keys[0], keys[1]
+            ranked = sorted(rows, key=lambda row: row.get(value_key, float("-inf")), reverse=True)
+            top = ranked[0]
+            bottom = ranked[-1]
+            stories.append({
+                "type": "grouped_numeric",
+                "insight": f"{top[group_key]} has the highest {value_key} and {bottom[group_key]} the lowest",
+                "column": value_key,
+                "group_column": group_key,
+                "top_group": str(top[group_key]),
+                "bottom_group": str(bottom[group_key]),
+                "top_value": float(top[value_key]),
+                "bottom_value": float(bottom[value_key]),
+                "effect_size": float(top[value_key]) - float(bottom[value_key]),
+                "confidence": "medium",
+            })
+    elif value is not None:
+        stories.append({
+            "type": "summary_numeric",
+            "insight": f"The computed {strategy or 'aggregation'} result is {round(float(value), 2)}",
+            "column": strategy or "value",
+            "mean": float(value),
+            "median": float(value),
+            "min": float(value),
+            "max": float(value),
+            "confidence": "medium",
+        })
+
+    return stories
+
+
 def _categorical_stories(
     result: Dict[str, Any],
     question: str,
@@ -222,6 +287,10 @@ def evidence_interpreter_node(state: AnalystState) -> AnalystState:
             story = _outlier_story(result)
             if story:
                 story_candidates.append(story)
+        elif tool_type == "summary_statistics":
+            story_candidates.extend(_summary_stat_stories(result))
+        elif tool_type == "direct_computation":
+            story_candidates.extend(_direct_computation_stories(result))
         elif tool_type == "categorical_analysis":
             story_candidates.extend(_categorical_stories(result, question))
 

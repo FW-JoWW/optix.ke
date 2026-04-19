@@ -48,6 +48,10 @@ def cleaning_audit_node(state: AnalystState) -> AnalystState:
             remaining_missing = df[col].isnull().sum()
             status = f"{remaining_missing} missing values remaining" if remaining_missing > 0 else "OK"
 
+        elif action in {"impute_median", "impute_mode", "forward_fill", "backward_fill"} and col in df.columns:
+            remaining_missing = df[col].isnull().sum()
+            status = f"{remaining_missing} missing values remaining" if remaining_missing > 0 else "OK"
+
         
         # -----------------------------
         # Check column drop
@@ -61,6 +65,17 @@ def cleaning_audit_node(state: AnalystState) -> AnalystState:
         elif action == "convert_to_numeric" and col in df.columns:
             non_numeric = df[col].apply(lambda x: not pd.api.types.is_number(x) if x is not None else False).sum()
             status = f"{non_numeric} non-numeric values remaining" if non_numeric > 0 else "OK"
+
+        elif action == "convert_to_datetime" and col in df.columns:
+            non_datetime = pd.to_datetime(df[col], errors="coerce").isna().sum()
+            status = f"{non_datetime} non-datetime values remaining" if non_datetime > 0 else "OK"
+
+        elif action == "standardize_categories" and col in df.columns:
+            non_null = df[col].dropna().astype(str)
+            stripped = non_null.str.strip()
+            normalized = stripped.str.lower()
+            inconsistent = bool((non_null != stripped).any()) or normalized.nunique() < stripped.nunique()
+            status = "OK" if not inconsistent else "Label inconsistencies remain"
 
         # -----------------------------
         # Check outliers capping

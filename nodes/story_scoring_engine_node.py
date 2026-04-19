@@ -58,6 +58,9 @@ def _base_score(story):
             return 0.6
         return 0.4
 
+    if story_type == "summary_numeric":
+        return 0.6
+
     return 0.3
 
 

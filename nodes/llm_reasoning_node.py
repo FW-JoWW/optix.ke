@@ -167,13 +167,31 @@ def normalize_reasoning(reasoning, df, numeric_columns, categorical_columns):
     if not isinstance(intent_type, str):
         intent_type = "unknown"
 
+    group_by = reasoning.get("group_by", [])
+    if not isinstance(group_by, list):
+        group_by = [group_by] if group_by else []
+    normalized_group_by = [
+        col for col in group_by
+        if col in allowed_columns
+    ]
+
+    aggregation = reasoning.get("aggregation", {"type": "none", "target": None})
+    if not isinstance(aggregation, dict):
+        aggregation = {"type": "none", "target": None}
+    agg_type = aggregation.get("type", "none")
+    if agg_type not in {"mean", "sum", "max", "min", "median", "none"}:
+        agg_type = "none"
+    agg_target = aggregation.get("target")
+    if agg_target not in allowed_columns:
+        agg_target = None
+
     return {
         "entities": reasoning.get("entities", []),
         "intent_type": intent_type,
         "constraints": normalized_constraints,
         "logic": logic,
-        "group_by": reasoning.get("group_by", []),
-        "aggregation": reasoning.get("aggregation", {"type": "none", "target": None})
+        "group_by": normalized_group_by,
+        "aggregation": {"type": agg_type, "target": agg_target}
     }
 
 

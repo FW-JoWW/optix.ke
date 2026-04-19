@@ -52,7 +52,10 @@ print("\n[Agent] Starting analysis...\n")
 final_state = graph.invoke(state)
 evidence = final_state.get("analysis_evidence", {})
 
-if evidence.get("final_output") is not None and not evidence.get("analysis_plan"):
+print("\n===== HUMAN IN LOOP =====")
+pprint.pprint(evidence.get("human_in_loop"))
+
+if final_state.get("awaiting_user") or evidence.get("final_output") is not None:
     print("\n===== FINAL OUTPUT =====")
     pprint.pprint(evidence.get("final_output"))
     raise SystemExit(0)
@@ -63,6 +66,12 @@ print(f"Synthesis: {evidence.get('llm_synthesis_status', 'unknown')}")
 
 print("\n===== ANALYSIS PLAN =====")
 pprint.pprint(evidence.get("analysis_plan"))
+
+print("\n===== DECISION ENGINE =====")
+pprint.pprint(evidence.get("analysis_decisions") or final_state.get("decision_output"))
+
+print("\n===== COMPUTATION PLAN =====")
+pprint.pprint(evidence.get("computation_plan"))
 
 print("\n===== TOOL RESULTS =====")
 pprint.pprint(evidence.get("tool_results"))
