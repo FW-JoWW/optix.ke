@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+from llm.output_filter import filter_llm_output
+from llm.guarded_reasoning import validate_explanation_text
 from state.state import AnalystState
 from utils.openai_runtime import get_openai_client
 
@@ -22,6 +24,18 @@ def fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
     explanation = insight
     implication = "This result is directionally useful, but should be considered alongside business context."
     action = "Review this pattern with the business team and confirm whether it matches operational expectations."
+    relationship_type = story.get("relationship_type", "unknown")
+    validity = story.get("insight_validity") or {}
+    guarded_recommendation = story.get("guarded_recommendation")
+
+    if relationship_type == "unit_conversion":
+        explanation = "This pattern is expected because the two fields are mathematically linked by unit conversion."
+        implication = "It is useful for data consistency validation, not for business decision-making."
+        action = "No action required."
+    elif validity and not validity.get("valid", True):
+        explanation = "Detected relationship is not meaningful for decision-making."
+        implication = validity.get("reason", "The current evidence is not reliable enough for action.")
+        action = guarded_recommendation or "No actionable recommendation due to insufficient or non-meaningful relationship."
 
     if story_type == "summary_numeric":
         column = story.get("column", "metric")
@@ -35,6 +49,40 @@ def fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
         )
         implication = f"This gives a baseline operating range for {column}."
         action = f"Use the observed range of {column} as a baseline for target-setting and anomaly monitoring."
+    elif story_type == "inferential_relationship":
+        columns = story.get("columns", ["metric_1", "metric_2"])
+        p_value = story.get("p_value")
+        effect = (story.get("effect_size") or {}).get("interpretation", "unknown")
+        if relationship_type not in {"unit_conversion", "duplicate_feature"} and validity.get("valid", True):
+            explanation = (
+                f"The relationship between {columns[0]} and {columns[1]} holds up under formal testing"
+                f"{'' if p_value is None else f' with p={round(float(p_value), 4)}'}."
+            )
+            implication = f"This makes the linkage between {columns[0]} and {columns[1]} credible enough to inform decision-making, although the practical impact is {effect}."
+            action = guarded_recommendation or f"Treat {columns[0]} as a meaningful signal when monitoring or forecasting {columns[1]}."
+    elif story_type == "inferential_group_difference":
+        column = story.get("column", "metric")
+        group_column = story.get("group_column", "group")
+        top_group = story.get("top_group", "one group")
+        bottom_group = story.get("bottom_group", "another group")
+        p_value = story.get("p_value")
+        effect = (story.get("effect_size") or {}).get("interpretation", "unknown")
+        explanation = (
+            f"{column} is not behaving the same way across {group_column}; {top_group} is meaningfully separated from {bottom_group}"
+            f"{'' if p_value is None else f' with p={round(float(p_value), 4)}'}."
+        )
+        implication = f"A single shared policy for all {group_column} segments may hide real operational differences, and the practical impact appears {effect}."
+        action = f"Set separate targets, pricing, or monitoring rules for the main {group_column} groups."
+    elif story_type == "inferential_categorical_association":
+        columns = story.get("columns", ["category_a", "category_b"])
+        p_value = story.get("p_value")
+        effect = (story.get("effect_size") or {}).get("interpretation", "unknown")
+        explanation = (
+            f"{columns[0]} and {columns[1]} are associated strongly enough to survive formal testing"
+            f"{'' if p_value is None else f' with p={round(float(p_value), 4)}'}."
+        )
+        implication = f"These categories should be analyzed jointly because treating them as independent could distort conclusions, and the practical association looks {effect}."
+        action = f"Report and monitor {columns[0]} together with {columns[1]} instead of summarizing them separately."
 
     return {
         "related_story_signature": _story_signature(story),
@@ -115,8 +163,31 @@ def generate_insights(
             temperature=0.2,
         )
         raw = response.choices[0].message.content or ""
-        insights_text, questions, details = parse_llm_output(raw, top_stories)
-        return insights_text, questions, details, "live_llm"
+        primary_story = top_stories[0] if top_stories else {}
+        semantic = primary_story.get("semantic_reasoning") or {}
+        validity_payload = primary_story.get("insight_validity") or {"valid": True, "severity": "low"}
+        recommendation_payload = {
+            "recommendation_restrictions": primary_story.get("recommendation_restrictions", []),
+            "allowed_actions": primary_story.get("guardrail_allowed_actions", []),
+            "blocked_actions": primary_story.get("guardrail_blocked_actions", []),
+            "final_recommendation": primary_story.get("guarded_recommendation"),
+            "guardrail_triggered": primary_story.get("guardrail_triggered", False),
+        }
+        filtered = filter_llm_output(
+            raw_text=raw,
+            payload={"top_stories": top_stories, "causal_evidence": primary_story.get("causal_evidence", {})},
+            semantic_output=semantic,
+            validation_output=validity_payload,
+            recommendation_output=recommendation_payload,
+        )
+        cleaned_raw = filtered["text"]
+        causal_grade = ((primary_story.get("causal_evidence") or {}).get("grade")) or "LOW"
+        numeric_validation = validate_explanation_text(cleaned_raw, {"top_stories": top_stories}, causal_grade)
+        cleaned_raw = numeric_validation["text"]
+        insights_text, questions, details = parse_llm_output(cleaned_raw, top_stories)
+        combined_issues = filtered["issues"] + numeric_validation["issues"]
+        status = "live_llm" if not combined_issues else f"live_llm_with_guardrail_warnings:{'; '.join(combined_issues)}"
+        return insights_text, questions, details, status
     except Exception as exc:
         details = [fallback_detail(story) for story in top_stories]
         return format_details(details), [], details, f"fallback_used: {exc}"

@@ -17,7 +17,7 @@ def validate_analysis_plan_against_intent(
         allowed_tools.add("summary_statistics")
     if any(word in question for word in ["outlier", "anomaly", "unusual"]):
         allowed_tools.add("detect_outliers")
-    if any(word in question for word in ["relationship", "correlation"]):
+    if any(word in question for word in ["relationship", "correlation", "cause", "causal", "drive"]):
         allowed_tools.add("correlation")
     if any(word in question for word in ["compare", "difference", "affect", "impact", "effect"]):
         allowed_tools.update({"ttest", "anova"})

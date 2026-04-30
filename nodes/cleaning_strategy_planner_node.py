@@ -47,9 +47,12 @@ def cleaning_strategy_planner_node(state: AnalystState) -> AnalystState:
     print("\n=== CLEANING PLAN GENERATED ===")
     print(json.dumps(
         {
-            "cleaning_decisions": [item.model_dump() for item in decision_output.cleaning_decisions],
+            "decision_count": len(decision_output.cleaning_decisions),
+            "approved_action_count": len(final_plan),
+            "approved_actions_preview": final_plan[:10],
             "approved_actions": final_plan,
-            "blocked_actions": constraints.get("blocked_actions", []),
+            "blocked_action_count": len(constraints.get("blocked_actions", [])),
+            "blocked_actions_preview": constraints.get("blocked_actions", [])[:10],
         },
         indent=2,
     ))

@@ -49,18 +49,8 @@ def column_selection_node(state: AnalystState) -> AnalystState:
     candidate_columns = list(column_registry.keys())
 
     if parser_selected_columns:
-        try:
-            from utils.semantic_matcher import semantic_column_match
-            matched_columns = semantic_column_match(
-                question,
-                candidate_columns,
-                threshold=0.4,
-                fallback_k=0,
-                lexical_only=True,
-            )
-        except Exception:
-            matched_columns = []
-        print("\n[INFO] Using explicit columns first, with lexical semantic supplementation")
+        matched_columns = []
+        print("\n[INFO] Semantic column matcher skipped - explicit columns already identified")
     elif state.get("disable_semantic_matcher"):
         matched_columns = []
         print("\n[INFO] Semantic column matcher disabled - using intent columns only")

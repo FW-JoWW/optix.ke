@@ -79,3 +79,4 @@ class AnalystState(TypedDict):
 
     # final report
     final_report: Optional[str]
+    decision_context: Optional[Any]

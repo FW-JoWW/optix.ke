@@ -10,8 +10,9 @@ from data_profiling import profile_dataset
 def validate_cleaning(
     before_df: pd.DataFrame,
     after_df: pd.DataFrame,
+    before_profile: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    before_profile = profile_dataset(before_df)
+    before_profile = before_profile or profile_dataset(before_df)
     after_profile = profile_dataset(after_df)
 
     row_change = len(after_df) - len(before_df)

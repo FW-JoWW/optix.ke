@@ -33,6 +33,38 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
         return {}
 
 
+def _summarize_profile_for_llm(dataset_profile: Dict[str, Any]) -> Dict[str, Any]:
+    columns = dataset_profile.get("columns", {}) or {}
+    summarized_columns = {}
+    for col, info in list(columns.items())[:40]:
+        summarized_columns[col] = {
+            "inferred_type": info.get("inferred_type"),
+            "missing_ratio": info.get("missing_ratio"),
+            "unique_count": info.get("unique_count"),
+            "numeric_like_ratio": info.get("numeric_like_ratio"),
+            "datetime_like_ratio": info.get("datetime_like_ratio"),
+            "top_values": (info.get("value_patterns") or [])[:3],
+        }
+
+    return {
+        "row_count": dataset_profile.get("row_count"),
+        "column_count": dataset_profile.get("column_count"),
+        "column_names": dataset_profile.get("column_names", [])[:40],
+        "columns": summarized_columns,
+    }
+
+
+def _summarize_structural_signals(structural_signals: Dict[str, Any] | None) -> Dict[str, Any]:
+    structural_signals = structural_signals or {}
+    return {
+        "signals": (structural_signals.get("signals") or [])[:20],
+        "high_missing_columns": (structural_signals.get("high_missing_columns") or [])[:20],
+        "mixed_type_columns": (structural_signals.get("mixed_type_columns") or [])[:20],
+        "duplicate_or_similar_columns": (structural_signals.get("duplicate_or_similar_columns") or [])[:20],
+        "primary_structure_confidence": structural_signals.get("primary_structure_confidence"),
+    }
+
+
 def _fallback_context(dataset_profile: Dict[str, Any]) -> Dict[str, Any]:
     roles: Dict[str, str] = {}
     actions: List[Dict[str, str]] = []
@@ -140,6 +172,9 @@ def infer_context(
         fallback["reasoning_status"] = "unavailable"
         return fallback
 
+    llm_profile = _summarize_profile_for_llm(dataset_profile)
+    llm_structural_signals = _summarize_structural_signals(structural_signals)
+
     prompt = f"""
 You are a dataset-agnostic schema reasoning engine.
 You must infer structure only from the provided dataset profile and sample rows.
@@ -147,13 +182,13 @@ Do not assume industry, domain, or column meaning from names alone.
 Only use evidence from patterns, values, and structure.
 
 Dataset profile:
-{json.dumps(dataset_profile, ensure_ascii=True)}
+{json.dumps(llm_profile, ensure_ascii=True)}
 
 Ambiguity report:
 {json.dumps(ambiguity_report, ensure_ascii=True)}
 
 Structural signals:
-{json.dumps(structural_signals or {}, ensure_ascii=True)}
+{json.dumps(llm_structural_signals, ensure_ascii=True)}
 
 Sample rows:
 {json.dumps(sample_rows, ensure_ascii=True)}

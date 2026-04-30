@@ -15,7 +15,7 @@ def data_intake_node(state: AnalystState) -> AnalystState:
         normalized = None
         try:
             if dataset_path and dataset_path.lower().endswith(".csv"):
-                raw_df = pd.read_csv(dataset_path, header=None)
+                raw_df = pd.read_csv(dataset_path, header=None, low_memory=False)
                 normalized = choose_best_dataframe(existing_df, raw_df)
             elif dataset_path and dataset_path.lower().endswith((".xls", ".xlsx")):
                 raw_df = pd.read_excel(dataset_path, header=None)

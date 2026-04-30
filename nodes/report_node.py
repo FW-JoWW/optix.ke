@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from state.state import AnalystState
+from nodes.visualization_generator_node import derive_decision_from_top_stories
 
 
 def _normalize_questions(questions: List[str]) -> List[str]:
@@ -48,6 +49,19 @@ def _format_tool_results(tool_results: Dict[str, Any]) -> str:
             lines.append(
                 f"- {result.get('column')}: {result.get('outlier_count', 0)} outliers detected"
             )
+        elif tool == "inferential_analysis":
+            hypothesis = result.get("hypothesis_test", {}) or {}
+            effect = result.get("effect_size", {}) or {}
+            causal = result.get("causal_evidence", {}) or {}
+            next_step = result.get("recommended_next_step")
+            lines.append(
+                "- "
+                + f"{result.get('method_selected')} on {', '.join(result.get('columns', []))}: "
+                + f"p-value={hypothesis.get('p_value')}, decision={hypothesis.get('decision')}, "
+                + f"effect={effect.get('metric')}={effect.get('value')}"
+                + (f", causal_evidence={causal.get('grade')}({causal.get('score')})" if causal else "")
+                + (f", next_step={next_step}" if next_step else "")
+            )
         elif tool == "categorical_analysis":
             result_keys = list((result.get("results") or {}).keys())
             lines.append(f"- categorical analysis on: {', '.join(result_keys) if result_keys else 'no columns'}")
@@ -82,7 +96,10 @@ def _format_top_stories(top_stories: List[Dict[str, Any]]) -> str:
         return "None"
 
     return "\n".join(
-        f"- {story.get('insight')} (score={story.get('score')}, confidence={story.get('confidence', 'unknown')})"
+        f"- {story.get('insight')} "
+        f"(score={story.get('score')}, confidence={story.get('confidence', 'unknown')}, "
+        f"relationship_type={story.get('relationship_type', 'n/a')}, "
+        f"valid={((story.get('insight_validity') or {}).get('valid'))})"
         for story in top_stories
     )
 
@@ -94,6 +111,28 @@ def _format_visualizations(visualizations: List[Dict[str, Any]]) -> str:
     return "\n".join(
         f"- {viz.get('type')} -> {viz.get('file_path')} | {viz.get('caption') or 'No caption'}"
         for viz in visualizations
+    )
+
+
+def _format_decisions(decisions: List[Dict[str, Any]]) -> str:
+    if not decisions:
+        return "None"
+    return "\n".join(
+        f"- {item.get('recommended_action')} "
+        f"(type={item.get('action_type')}, priority={((item.get('priority') or {}).get('priority_score'))}, "
+        f"impact={((item.get('impact_assessment') or {}).get('impact_level'))}, "
+        f"confidence={item.get('confidence_in_action')})"
+        for item in decisions
+    )
+
+
+def _format_all_decision_records(decisions: List[Dict[str, Any]]) -> str:
+    if not decisions:
+        return "None"
+    return "\n".join(
+        f"- {item.get('action_type')}: {item.get('recommended_action')} "
+        f"(validity={item.get('validity')}, summary={item.get('decision_summary')})"
+        for item in decisions
     )
 
 
@@ -115,7 +154,12 @@ def report_node(state: AnalystState) -> AnalystState:
     tool_results = evidence.get("tool_results", {})
     top_stories = evidence.get("top_stories", [])
     visualizations = evidence.get("visualizations", [])
-    decision_context = state.get("decision_context", "No strong decision can be made")
+    decision_recommendations = evidence.get("decision_recommendations", []) or []
+    decision_ranking = evidence.get("decision_priority_ranking", []) or []
+    recommended_first = evidence.get("decision_recommended_first")
+    decision_context = state.get("decision_context")
+    if not decision_context:
+        decision_context = derive_decision_from_top_stories(top_stories)
     human_in_loop = evidence.get("human_in_loop")
     decision_notes = evidence.get("decision_notes", [])
 
@@ -149,6 +193,15 @@ VISUALIZATIONS:
 
 DECISION CONTEXT:
 {decision_context}
+
+ALL DECISION RECORDS:
+{_format_all_decision_records(decision_recommendations)}
+
+PRIORITIZED DECISIONS:
+{_format_decisions(decision_ranking)}
+
+RECOMMENDED FIRST ACTION:
+{recommended_first if recommended_first else "None"}
 
 DECISION ENGINE NOTES:
 {chr(10).join(f"- {note}" for note in decision_notes) if decision_notes else "None"}

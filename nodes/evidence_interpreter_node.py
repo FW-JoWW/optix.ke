@@ -4,12 +4,87 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
+from core.insight_validator import validate_insight
+from core.recommendation_guard import guard_recommendations
+from core.semantic_classifier import classify_relationship
 from state.state import AnalystState
 
 
 def _mentioned_columns(question: str, columns: List[str]) -> List[str]:
     question = question.lower()
     return [col for col in columns if col.lower() in question]
+
+
+def _relationship_missing_ratio(df: pd.DataFrame | None, columns: List[str]) -> float:
+    if df is None or not columns or any(col not in df.columns for col in columns):
+        return 0.0
+    subset = df[columns].copy()
+    if len(subset) == 0:
+        return 0.0
+    return float(subset.isna().any(axis=1).mean())
+
+
+def _first_dataframe(*values: Any) -> pd.DataFrame | None:
+    for value in values:
+        if isinstance(value, pd.DataFrame):
+            return value
+    return None
+
+
+def _apply_semantic_guardrails(
+    story: Dict[str, Any],
+    result: Dict[str, Any],
+    state: AnalystState,
+) -> Dict[str, Any] | None:
+    columns = story.get("columns") or []
+    if story.get("column") and story["column"] not in columns:
+        columns = [story["column"], *columns]
+    if len(columns) < 2:
+        return story
+
+    x_column, y_column = columns[:2]
+    reference_df = _first_dataframe(
+        state.get("cleaned_data"),
+        state.get("raw_analysis_dataset"),
+        state.get("analysis_dataset"),
+        state.get("dataframe"),
+    )
+    relationship_evidence = result.get("relationship_evidence", {}) or {}
+    payload = relationship_evidence or result
+    semantic = classify_relationship(
+        x_column=x_column,
+        y_column=y_column,
+        stats_output=payload,
+        metadata={
+            "dataframe": reference_df,
+            "dataset_profile": state.get("dataset_profile", {}) or {},
+            "column_registry": state.get("column_registry", {}) or {},
+            "business_question": state.get("business_question", ""),
+        },
+    )
+    validity = validate_insight(
+        stats_output=payload,
+        semantic_output=semantic,
+        metadata={"missing_ratio": _relationship_missing_ratio(reference_df, [x_column, y_column])},
+    )
+    recommendations = guard_recommendations(
+        stats_output=payload,
+        semantic_output=semantic,
+        validation_output=validity,
+    )
+
+    if semantic.get("relationship_type") == "duplicate_feature":
+        return None
+
+    story["relationship_type"] = semantic.get("relationship_type")
+    story["semantic_reasoning"] = semantic
+    story["insight_validity"] = validity
+    story["recommendation_restrictions"] = recommendations.get("recommendation_restrictions", [])
+    story["guarded_recommendation"] = recommendations.get("final_recommendation")
+    story["guardrail_allowed_actions"] = recommendations.get("allowed_actions", [])
+    story["guardrail_blocked_actions"] = recommendations.get("blocked_actions", [])
+    story["guardrail_triggered"] = bool(recommendations.get("guardrail_triggered"))
+    return story
 
 
 def _group_difference_story(result: Dict[str, Any], raw_df: pd.DataFrame) -> Dict[str, Any] | None:
@@ -250,6 +325,109 @@ def _categorical_stories(
     return stories
 
 
+def _inferential_story(result: Dict[str, Any], raw_df: pd.DataFrame | None) -> Dict[str, Any] | None:
+    analysis_category = result.get("analysis_category")
+    hypothesis = result.get("hypothesis_test", {}) or {}
+    effect = result.get("effect_size", {}) or {}
+    interpretation = result.get("interpretation", {}) or {}
+    assumptions = result.get("assumptions", {}) or {}
+    decision = hypothesis.get("decision")
+    p_value = hypothesis.get("p_value")
+    method = result.get("method_selected")
+    columns = result.get("columns", [])
+    relationship_evidence = result.get("relationship_evidence", {}) or {}
+    causal_evidence = result.get("causal_evidence", {}) or relationship_evidence.get("causal_evidence", {}) or {}
+    recommended_next_step = result.get("recommended_next_step") or relationship_evidence.get("recommended_next_step")
+    bias_risks = result.get("bias_risks", []) or relationship_evidence.get("bias_risks", [])
+    confounders = result.get("confounders", []) or relationship_evidence.get("confounders", [])
+
+    if analysis_category == "numeric_relationship" and len(columns) >= 2:
+        r_value = effect.get("value")
+        if r_value is None:
+            r_value = hypothesis.get("test_statistic")
+        if r_value is None:
+            return None
+        direction = "positive" if float(r_value) >= 0 else "negative"
+        practical = effect.get("interpretation", "unknown")
+        significance = "significant" if decision == "reject_h0" else "not statistically significant"
+        return {
+            "type": "inferential_relationship",
+            "insight": f"{columns[0]} and {columns[1]} show a {practical} {direction} relationship that is {significance}",
+            "columns": columns[:2],
+            "value": float(r_value),
+            "p_value": float(p_value) if p_value is not None else None,
+            "method": method,
+            "effect_size": effect,
+            "assumption_warnings": assumptions.get("warnings", []),
+            "confidence": "high" if decision == "reject_h0" else "medium",
+            "causal_evidence": causal_evidence,
+            "bias_risks": bias_risks,
+            "confounders": confounders,
+            "recommended_next_step": recommended_next_step,
+            "human_summary": result.get("human_summary") or relationship_evidence.get("human_summary"),
+        }
+
+    if analysis_category in {"two_group_comparison", "multi_group_comparison"}:
+        estimation = result.get("estimation", {}) or {}
+        group_stats = estimation.get("group_statistics", {}) or {}
+        if len(group_stats) < 2:
+            return None
+        ranked = sorted(
+            group_stats.items(),
+            key=lambda item: (item[1].get("mean") is not None, item[1].get("mean", float("-inf"))),
+            reverse=True,
+        )
+        top_group, top_stats = ranked[0]
+        bottom_group, bottom_stats = ranked[-1]
+        if top_stats.get("mean") is None or bottom_stats.get("mean") is None:
+            return None
+        practical = effect.get("interpretation", "unknown")
+        significance = "significant" if decision == "reject_h0" else "not statistically significant"
+        return {
+            "type": "inferential_group_difference",
+            "insight": f"{top_group} differs most from {bottom_group}; the result is {significance} with a {practical} effect",
+            "column": columns[0] if columns else None,
+            "group_column": columns[1] if len(columns) > 1 else None,
+            "top_group": str(top_group),
+            "bottom_group": str(bottom_group),
+            "top_value": float(top_stats["mean"]),
+            "bottom_value": float(bottom_stats["mean"]),
+            "effect_size": effect,
+            "p_value": float(p_value) if p_value is not None else None,
+            "method": method,
+            "assumption_warnings": assumptions.get("warnings", []),
+            "confidence": "high" if decision == "reject_h0" else "medium",
+            "causal_evidence": causal_evidence,
+            "bias_risks": bias_risks,
+            "confounders": confounders,
+            "recommended_next_step": recommended_next_step,
+            "human_summary": result.get("human_summary") or relationship_evidence.get("human_summary"),
+        }
+
+    if analysis_category == "categorical_association" and len(columns) >= 2:
+        practical = effect.get("interpretation", "unknown")
+        significance = "significant" if decision == "reject_h0" else "not statistically significant"
+        counts = ((result.get("estimation", {}) or {}).get("counts", {}) or {})
+        return {
+            "type": "inferential_categorical_association",
+            "insight": f"{columns[0]} and {columns[1]} are {significance} with a {practical} association",
+            "columns": columns[:2],
+            "effect_size": effect,
+            "p_value": float(p_value) if p_value is not None else None,
+            "method": method,
+            "assumption_warnings": assumptions.get("warnings", []),
+            "confidence": "high" if decision == "reject_h0" else "medium",
+            "contingency_table": counts,
+            "causal_evidence": causal_evidence,
+            "bias_risks": bias_risks,
+            "confounders": confounders,
+            "recommended_next_step": recommended_next_step,
+            "human_summary": result.get("human_summary") or relationship_evidence.get("human_summary"),
+        }
+
+    return None
+
+
 def evidence_interpreter_node(state: AnalystState) -> AnalystState:
     """
     Interprets raw tool outputs into structured story candidates.
@@ -293,6 +471,12 @@ def evidence_interpreter_node(state: AnalystState) -> AnalystState:
             story_candidates.extend(_direct_computation_stories(result))
         elif tool_type == "categorical_analysis":
             story_candidates.extend(_categorical_stories(result, question))
+        elif tool_type == "inferential_analysis":
+            story = _inferential_story(result, raw_df)
+            if story:
+                guarded_story = _apply_semantic_guardrails(story, result, state)
+                if guarded_story:
+                    story_candidates.append(guarded_story)
 
     evidence["story_candidates"] = story_candidates
 

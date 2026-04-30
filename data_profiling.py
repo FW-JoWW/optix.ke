@@ -10,6 +10,17 @@ import pandas as pd
 from utils.numeric_parsing import normalize_numeric_token
 
 
+PROFILE_SAMPLE_SIZE = 1000
+PATTERN_SCAN_ROWS = 1000
+
+
+def _sample_series(series: pd.Series, max_non_null: int = PROFILE_SAMPLE_SIZE) -> pd.Series:
+    non_null = series.dropna()
+    if len(non_null) <= max_non_null:
+        return non_null
+    return non_null.sample(max_non_null, random_state=42)
+
+
 def _non_null_ratio(mask: pd.Series) -> float:
     total = len(mask)
     if total == 0:
@@ -18,15 +29,21 @@ def _non_null_ratio(mask: pd.Series) -> float:
 
 
 def _numeric_ratio(series: pd.Series) -> float:
-    parsed = pd.to_numeric(series.map(normalize_numeric_token), errors="coerce")
-    return _non_null_ratio(parsed.notna())
+    sample = _sample_series(series)
+    if sample.empty:
+        return 0.0
+    parsed = pd.to_numeric(sample.map(normalize_numeric_token), errors="coerce")
+    return float(parsed.notna().mean())
 
 
 def _datetime_ratio(series: pd.Series) -> float:
+    sample = _sample_series(series)
+    if sample.empty:
+        return 0.0
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        parsed = pd.to_datetime(series, errors="coerce")
-    return _non_null_ratio(parsed.notna())
+        parsed = pd.to_datetime(sample, errors="coerce")
+    return float(parsed.notna().mean())
 
 
 def _base_name(column: str) -> str:
@@ -44,11 +61,20 @@ def _infer_type(series: pd.Series) -> str:
 
     numeric_ratio = _numeric_ratio(series)
     datetime_ratio = _datetime_ratio(series)
-    unique_ratio = float(series.nunique(dropna=True) / max(len(series), 1))
+    non_null_count = int(series.notna().sum())
+    unique_count = int(series.nunique(dropna=True))
+    unique_ratio = float(unique_count / max(len(series), 1))
 
     if numeric_ratio >= 0.8:
         return "numeric"
-    if datetime_ratio >= 0.8:
+    # Treat a column as datetime only when parsed values also behave like a
+    # real time axis, not just date-like labels such as "5-May".
+    minimum_unique_for_datetime = 3 if non_null_count <= 20 else 10
+    if (
+        datetime_ratio >= 0.8
+        and unique_count >= minimum_unique_for_datetime
+        and (unique_ratio >= 0.01 or unique_count >= 20)
+    ):
         return "datetime"
     if unique_ratio >= 0.95:
         return "identifier_like"
@@ -107,9 +133,18 @@ def _detect_similar_columns(df: pd.DataFrame, threshold: float = 0.82) -> List[D
     return groups
 
 
+def _pattern_scan_frame(df: pd.DataFrame, max_rows: int = PATTERN_SCAN_ROWS) -> pd.DataFrame:
+    if len(df) <= max_rows:
+        return df
+
+    head_count = max_rows // 2
+    tail_count = max_rows - head_count
+    return pd.concat([df.head(head_count), df.tail(tail_count)], axis=0)
+
+
 def _detect_sparsity_patterns(df: pd.DataFrame, limit: int = 10) -> Dict[str, Any]:
-    row_patterns = df.isna().astype(int).astype(str).agg("".join, axis=1)
-    top_patterns = row_patterns.value_counts().head(limit)
+    scan_df = _pattern_scan_frame(df)
+    top_patterns = scan_df.isna().astype(int).astype(str).agg("".join, axis=1).value_counts().head(limit)
     return {
         "column_missing_ratios": {
             col: round(float(df[col].isna().mean()), 4) for col in df.columns
@@ -118,11 +153,13 @@ def _detect_sparsity_patterns(df: pd.DataFrame, limit: int = 10) -> Dict[str, An
             {"pattern": pattern, "count": int(count)}
             for pattern, count in top_patterns.items()
         ],
+        "scanned_rows": int(len(scan_df)),
     }
 
 
 def _detect_repeated_row_blocks(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    patterns = df.isna().astype(int).astype(str).agg("".join, axis=1)
+    scan_df = _pattern_scan_frame(df)
+    patterns = scan_df.isna().astype(int).astype(str).agg("".join, axis=1)
     blocks: List[Dict[str, Any]] = []
 
     start = 0

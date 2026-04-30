@@ -7,6 +7,17 @@ import numpy as np
 import pandas as pd
 
 
+def _rank_numeric_columns(dataset_profile: Dict[str, Any], numeric_columns: List[str]) -> List[str]:
+    def score(column: str) -> tuple[float, int]:
+        info = (dataset_profile.get("columns", {}) or {}).get(column, {})
+        return (
+            float(1.0 - info.get("missing_ratio", 0.0)),
+            int(info.get("unique_count", 0)),
+        )
+
+    return sorted(numeric_columns, key=score, reverse=True)
+
+
 def _pairwise_correlation(df: pd.DataFrame, numeric_columns: List[str]) -> List[Dict[str, Any]]:
     relationships: List[Dict[str, Any]] = []
 
@@ -62,12 +73,16 @@ def detect_relationships(df: pd.DataFrame, dataset_profile: Dict[str, Any]) -> D
         col for col, info in dataset_profile.get("columns", {}).items()
         if info.get("inferred_type") == "numeric"
     ]
+    ranked_numeric_columns = _rank_numeric_columns(dataset_profile, numeric_columns)
+    pairwise_columns = ranked_numeric_columns[:15]
+    derived_columns = ranked_numeric_columns[:8]
+
     numeric_df = df.copy()
-    for col in numeric_columns:
+    for col in pairwise_columns:
         numeric_df[col] = pd.to_numeric(numeric_df[col], errors="coerce")
 
-    correlations = _pairwise_correlation(numeric_df, numeric_columns)
-    derived = _derived_relationships(numeric_df, numeric_columns)
+    correlations = _pairwise_correlation(numeric_df, pairwise_columns)
+    derived = _derived_relationships(numeric_df, derived_columns)
 
     return {
         "relationships": correlations + derived,

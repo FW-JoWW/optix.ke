@@ -12,7 +12,12 @@ def dataset_profiler_node(state: AnalystState) -> AnalystState:
     if df is None:
         raise ValueError("No dataframe found in state.")
 
-    profile = profile_dataset(df)
+    profile = (
+        state.get("data_validation", {}).get("after_profile")
+        or state.get("cleaning_validation", {}).get("after_profile")
+    )
+    if not profile:
+        profile = profile_dataset(df)
     columns = profile.get("columns", {})
 
     dataset_profile = {
@@ -41,6 +46,14 @@ def dataset_profiler_node(state: AnalystState) -> AnalystState:
     state["analysis_evidence"]["dataset_profile_json"] = profile
 
     print("\n=== DATASET PROFILE ===")
-    print(dataset_profile)
+    print(
+        {
+            "row_count": dataset_profile["row_count"],
+            "column_count": dataset_profile["column_count"],
+            "numeric_columns": dataset_profile["numeric_columns"][:15],
+            "categorical_columns": dataset_profile["categorical_columns"][:15],
+            "datetime_columns": dataset_profile["datetime_columns"][:15],
+        }
+    )
 
     return state

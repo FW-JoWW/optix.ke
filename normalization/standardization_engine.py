@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -42,7 +43,9 @@ def _standardize_series(series: pd.Series, field: SchemaField) -> tuple[pd.Serie
         standardized = series.map(_normalize_string)
         actions.extend(["strip_whitespace", "lowercase", "collapse_spaces"])
     elif field.field_type == "datetime":
-        standardized = pd.to_datetime(series, errors="coerce", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            standardized = pd.to_datetime(series, errors="coerce", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         standardized = standardized.where(pd.notna(standardized), pd.NA)
         actions.extend(["parse_datetime", "normalize_iso_utc"])
     elif field.field_type == "float":

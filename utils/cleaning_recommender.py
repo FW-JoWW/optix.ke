@@ -24,22 +24,33 @@ ALLOWED_ACTIONS = {
 }
 
 
+PROFILE_SAMPLE_SIZE = 1000
+ROW_PATTERN_SAMPLE_SIZE = 1000
+
+
+def _sample_non_null(series: pd.Series, max_non_null: int = PROFILE_SAMPLE_SIZE) -> pd.Series:
+    non_null = series.dropna()
+    if len(non_null) <= max_non_null:
+        return non_null
+    return non_null.sample(max_non_null, random_state=42)
+
+
 def _numeric_like_ratio(series: pd.Series) -> float:
-    parsed = pd.to_numeric(series.map(normalize_numeric_token), errors="coerce")
-    non_null = int(series.notna().sum())
-    if non_null == 0:
+    sample = _sample_non_null(series)
+    if sample.empty:
         return 0.0
-    return float(parsed.notna().sum() / non_null)
+    parsed = pd.to_numeric(sample.map(normalize_numeric_token), errors="coerce")
+    return float(parsed.notna().mean())
 
 
 def _datetime_like_ratio(series: pd.Series) -> float:
+    sample = _sample_non_null(series)
+    if sample.empty:
+        return 0.0
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        parsed = pd.to_datetime(series, errors="coerce")
-    non_null = int(series.notna().sum())
-    if non_null == 0:
-        return 0.0
-    return float(parsed.notna().sum() / non_null)
+        parsed = pd.to_datetime(sample, errors="coerce")
+    return float(parsed.notna().mean())
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -56,8 +67,16 @@ def _to_jsonable(value: Any) -> Any:
 
 
 def _missing_pattern_profile(series: pd.Series) -> Dict[str, Any]:
-    missing_idx = series[series.isna()].index.tolist()
-    if not missing_idx:
+    if len(series) > ROW_PATTERN_SAMPLE_SIZE:
+        head_count = ROW_PATTERN_SAMPLE_SIZE // 2
+        tail_count = ROW_PATTERN_SAMPLE_SIZE - head_count
+        scan_series = pd.concat([series.head(head_count), series.tail(tail_count)], axis=0)
+    else:
+        scan_series = series
+
+    values = scan_series.tolist()
+    missing_positions = [idx for idx, value in enumerate(values) if pd.isna(value)]
+    if not missing_positions:
         return {
             "missing_count": 0,
             "leading_missing": 0,
@@ -65,11 +84,10 @@ def _missing_pattern_profile(series: pd.Series) -> Dict[str, Any]:
             "prev_next_same_ratio": 0.0,
         }
 
-    values = series.tolist()
     prev_next_same = 0
     comparable = 0
 
-    for idx in missing_idx:
+    for idx in missing_positions:
         prev_val = values[idx - 1] if idx > 0 else pd.NA
         next_val = values[idx + 1] if idx < len(values) - 1 else pd.NA
         if pd.notna(prev_val) and pd.notna(next_val):
@@ -92,15 +110,16 @@ def _missing_pattern_profile(series: pd.Series) -> Dict[str, Any]:
             break
 
     return {
-        "missing_count": len(missing_idx),
+        "missing_count": len(missing_positions),
         "leading_missing": leading_missing,
         "trailing_missing": trailing_missing,
         "prev_next_same_ratio": round(prev_next_same / comparable, 4) if comparable else 0.0,
+        "scanned_rows": int(len(scan_series)),
     }
 
 
 def _label_quality_profile(series: pd.Series) -> Dict[str, Any]:
-    non_null = series.dropna().astype(str)
+    non_null = _sample_non_null(series).astype(str)
     if non_null.empty:
         return {
             "whitespace_issues": False,
@@ -115,7 +134,10 @@ def _label_quality_profile(series: pd.Series) -> Dict[str, Any]:
     }
 
 
-def build_column_profiles(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+def build_column_profiles(
+    df: pd.DataFrame,
+    base_profiles: Dict[str, Dict[str, Any]] | None = None,
+) -> Dict[str, Dict[str, Any]]:
     profiles: Dict[str, Dict[str, Any]] = {}
     total_rows = max(len(df), 1)
 
@@ -124,14 +146,15 @@ def build_column_profiles(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
         non_null = series.dropna()
         unique_count = int(non_null.nunique()) if not non_null.empty else 0
         label_profile = _label_quality_profile(series)
+        existing = (base_profiles or {}).get(col, {})
         profiles[col] = {
-            "dtype": str(series.dtype),
-            "missing_count": int(series.isna().sum()),
-            "missing_ratio": round(float(series.isna().mean()), 4),
-            "unique_count": unique_count,
-            "unique_ratio": round(unique_count / total_rows, 4),
-            "numeric_like_ratio": round(_numeric_like_ratio(series), 4),
-            "datetime_like_ratio": round(_datetime_like_ratio(series), 4),
+            "dtype": existing.get("dtype", str(series.dtype)),
+            "missing_count": existing.get("missing_count", int(series.isna().sum())),
+            "missing_ratio": existing.get("missing_ratio", round(float(series.isna().mean()), 4)),
+            "unique_count": existing.get("unique_count", unique_count),
+            "unique_ratio": existing.get("unique_ratio", round(unique_count / total_rows, 4)),
+            "numeric_like_ratio": existing.get("numeric_like_ratio", round(_numeric_like_ratio(series), 4)),
+            "datetime_like_ratio": existing.get("datetime_like_ratio", round(_datetime_like_ratio(series), 4)),
             "sample_values": non_null.astype(str).head(5).tolist(),
             "missing_pattern": _missing_pattern_profile(series),
             "label_quality": label_profile,
@@ -266,10 +289,17 @@ Return exactly:
 def recommend_cleaning_issues(
     detected_issues: Dict[str, Any],
     df: pd.DataFrame,
+    base_profiles: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
-    column_profiles = build_column_profiles(df)
+    column_profiles = build_column_profiles(df, base_profiles=base_profiles)
     recommendations: List[Dict[str, Any]] = []
     llm_used = False
+    issue_count = len(detected_issues.get("detected_issues", []))
+    if df.shape[1] > 40 or issue_count > 25:
+        max_llm_recommendations = 0
+    else:
+        max_llm_recommendations = 5
+    llm_candidates_used = 0
 
     for issue in detected_issues.get("detected_issues", []):
         col = issue.get("column")
@@ -277,8 +307,13 @@ def recommend_cleaning_issues(
         action, explanation = _deterministic_action(issue, profile)
         source = "rules"
 
-        if col is not None and _needs_llm(issue, profile):
+        if (
+            col is not None
+            and llm_candidates_used < max_llm_recommendations
+            and _needs_llm(issue, profile)
+        ):
             llm_result = _llm_recommendation(issue, profile)
+            llm_candidates_used += 1
             if llm_result is not None:
                 action = llm_result["recommended_action"]
                 explanation = llm_result["explanation"]

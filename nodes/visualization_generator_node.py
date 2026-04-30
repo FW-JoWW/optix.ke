@@ -187,15 +187,18 @@ def generate_regression_plot(df, story):
 def map_story_to_chart(story, df):
     mapping = {
         "group_difference": generate_boxplot,
+        "inferential_group_difference": generate_boxplot,
         "outliers": generate_histogram,
         "summary_numeric": generate_histogram,
         "correlation": generate_scatter,
+        "inferential_relationship": generate_scatter,
         "regression": generate_regression_plot,
         "numeric_anomaly": generate_histogram,
         "category_frequency": generate_category_bar,
         "rare_categories": generate_category_bar,
         "grouped_numeric": generate_grouped_bar,
         "categorical_relationship": generate_heatmap,
+        "inferential_categorical_association": generate_heatmap,
     }
     chart_func = mapping.get(story.get("type"))
     if chart_func:

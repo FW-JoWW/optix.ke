@@ -39,6 +39,17 @@ def _build_dataset_context(state: AnalystState) -> str:
     return "\n".join(context_lines)
 
 
+def _build_profile_summary(state: AnalystState) -> Dict[str, Any]:
+    dataset_profile = state.get("dataset_profile", {}) or {}
+    return {
+        "row_count": dataset_profile.get("row_count"),
+        "column_count": dataset_profile.get("column_count"),
+        "selected_columns": (state.get("selected_columns", []) or [])[:15],
+        "numeric_columns": (dataset_profile.get("numeric_columns", []) or [])[:15],
+        "categorical_columns": (dataset_profile.get("categorical_columns", []) or [])[:15],
+    }
+
+
 def _fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
     story_type = story.get("type")
     insight = story.get("insight", "Pattern detected in the data.")
@@ -46,28 +57,65 @@ def _fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
     implication = "This result is directionally useful, but should be considered alongside business context."
     action = "Review this pattern with the business team and confirm whether it matches operational expectations."
     headline = insight
+    relationship_type = story.get("relationship_type", "unknown")
+    validity = story.get("insight_validity") or {}
+    guarded_recommendation = story.get("guarded_recommendation")
 
-    if story_type == "correlation":
+    if relationship_type == "unit_conversion":
+        explanation = "This relationship is expected because the two fields are mathematically linked by unit conversion."
+        implication = "It is a data consistency signal rather than an independent business insight."
+        action = "No action required."
+    elif validity and not validity.get("valid", True):
+        explanation = "Detected relationship is not meaningful for decision-making."
+        implication = validity.get("reason", "The current evidence is not reliable enough for action.")
+        action = guarded_recommendation or "No actionable recommendation due to insufficient or non-meaningful relationship."
+
+    if story_type in {"correlation", "inferential_relationship"}:
         columns = story.get("columns", ["metric_1", "metric_2"])
         direction = story.get("direction", "directional")
         strength = story.get("strength", "moderate")
         value = story.get("value")
-        explanation = (
-            f"In simple terms, when {columns[0]} changes, {columns[1]} tends to move in a "
-            f"{direction} way. The relationship looks {strength}"
-            f"{'' if value is None else f' with a correlation around {round(float(value), 3)}'}."
-        )
-        implication = (
-            f"This suggests {columns[0]} and {columns[1]} are connected strongly enough to matter in analysis, "
-            "though correlation alone does not prove causation."
-        )
-        action = f"Use {columns[0]} and {columns[1]} together when discussing drivers of performance."
+        p_value = story.get("p_value")
+        warnings = story.get("assumption_warnings", [])
+        causal = story.get("causal_evidence", {}) or {}
+        confounders = story.get("confounders", []) or []
+        next_step = story.get("recommended_next_step")
+        if relationship_type not in {"unit_conversion", "duplicate_feature"} and validity.get("valid", True):
+            explanation = (
+                f"In simple terms, when {columns[0]} changes, {columns[1]} tends to move in a "
+                f"{direction} way. The relationship looks {strength}"
+                f"{'' if value is None else f' with a correlation around {round(float(value), 3)}'}."
+            )
+            implication = (
+                f"This suggests {columns[0]} and {columns[1]} are connected strongly enough to matter in analysis, "
+                "though correlation alone does not prove causation."
+            )
+            action = guarded_recommendation or f"Use {columns[0]} and {columns[1]} together when discussing drivers of performance."
+        if story_type == "inferential_relationship":
+            if relationship_type not in {"unit_conversion", "duplicate_feature"} and validity.get("valid", True):
+                explanation = (
+                    f"Changes in {columns[0]} are associated with meaningful movement in {columns[1]}, "
+                    f"and the relationship was tested formally{'' if p_value is None else f' with p={round(float(p_value), 4)}'}."
+                )
+                implication = (
+                    f"This pattern is strong enough to treat {columns[0]} as a meaningful analytical signal for {columns[1]}, "
+                    "but it still should not be interpreted as proof of causation."
+                )
+                action = guarded_recommendation or next_step or f"Prioritize {columns[0]} when monitoring or explaining movement in {columns[1]}."
+                if warnings:
+                    implication += " Reliability is somewhat reduced by assumption or sample warnings."
+                if causal:
+                    implication += f" Current causal evidence is {causal.get('grade', 'LOW')}."
+                if confounders:
+                    implication += " Likely confounders remain in the current observational evidence."
 
-    elif story_type in {"group_difference", "grouped_numeric"}:
+    elif story_type in {"group_difference", "grouped_numeric", "inferential_group_difference"}:
         column = story.get("column", "metric")
         group_column = story.get("group_column", "group")
         top_group = story.get("top_group", "one group")
         bottom_group = story.get("bottom_group", "another group")
+        p_value = story.get("p_value")
+        effect = (story.get("effect_size") or {}).get("interpretation") if isinstance(story.get("effect_size"), dict) else None
         explanation = (
             f"The average {column} is not evenly distributed across {group_column}. "
             f"{top_group} is leading while {bottom_group} is trailing."
@@ -76,8 +124,20 @@ def _fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
             f"This means the category split in {group_column} is useful for explaining differences in {column}."
         )
         action = f"Compare business practices or conditions behind {top_group} versus {bottom_group}."
+        if story_type == "inferential_group_difference":
+            explanation = (
+                f"{column} differs materially across {group_column}, with {top_group} at the high end and {bottom_group} at the low end"
+                f"{'' if p_value is None else f' and a tested p-value of {round(float(p_value), 4)}'}."
+            )
+            implication = (
+                f"How records are grouped by {group_column} likely changes the expected level of {column}, "
+                "so a single pooled benchmark may be misleading."
+            )
+            action = f"Use separate benchmarks or operating decisions for the {group_column} segments instead of treating them as interchangeable."
+            if effect:
+                implication += f" The measured practical impact is {effect}."
 
-    elif story_type == "categorical_relationship":
+    elif story_type in {"categorical_relationship", "inferential_categorical_association"}:
         columns = story.get("columns", ["category_a", "category_b"])
         p_value = story.get("p_value")
         explanation = (
@@ -189,8 +249,8 @@ def llm_insight_synthesizer_node(state: AnalystState) -> AnalystState:
     evidence = state.setdefault("analysis_evidence", {})
     top_stories = evidence.get("top_stories", [])
     business_question = state.get("business_question", "")
-    dataset_profile = state.get("dataset_profile", {})
     dataset_context = _build_dataset_context(state)
+    dataset_profile_summary = _build_profile_summary(state)
     llm_disabled = state.get("disable_llm_reasoning") or not state.get("enable_llm_reasoning", True)
 
     if not top_stories:
@@ -224,6 +284,7 @@ Your job is to convert statistical findings into business-level insight that hel
 You MUST follow these rules:
 - Use only the evidence provided below.
 - Do not invent numbers, causes, segments, business models, or industry context.
+- Treat deterministic outputs as the only source of truth.
 - Translate findings into real-world business meaning.
 - Explain what is happening operationally or commercially, not just statistically.
 - State why the pattern matters for revenue, pricing, operations, strategy, risk, customer behavior, or resource allocation, whichever is actually supported.
@@ -234,6 +295,8 @@ STRICTLY DO NOT:
 - Repeat or lightly paraphrase the raw statistical output.
 - Say generic phrases like "X has a relationship with Y".
 - Give vague recommendations such as "consider", "explore", or "use this in decision making".
+- Claim causality unless the provided evidence explicitly supports it.
+- Invent any number that is not present in the provided evidence.
 
 Your tone must be:
 - Direct
@@ -246,10 +309,25 @@ Business Question:
 {business_question}
 
 Dataset Profile:
-{dataset_profile}
+{dataset_profile_summary}
 
 Top Stories:
 {top_stories}
+
+For each story, respect these deterministic control fields when present:
+- relationship_type
+- insight_validity
+- recommendation_restrictions
+- guardrail_allowed_actions
+- guardrail_blocked_actions
+- guarded_recommendation
+- guardrail_triggered
+
+Mandatory semantic rules:
+- If relationship_type is unit_conversion or duplicate_feature, explain that it is a derived or structural dependency and do not turn it into a business strategy recommendation.
+- If insight_validity.valid is false, do not present the finding as decision-ready.
+- If recommendation_restrictions are present, recommendations must stay within the allowed actions and must not include blocked actions.
+- If causal evidence is LOW or not strong, never claim that one variable causes the other.
 
 Return exactly in this format:
 

@@ -26,6 +26,7 @@ from nodes.evidence_interpreter_node import evidence_interpreter_node
 from nodes.story_scoring_engine_node import story_scoring_engine_node
 from nodes.visualization_generator_node import visualization_generator_node
 from nodes.llm_insight_synthesizer_node import llm_insight_synthesizer_node
+from nodes.decision_engine_node import decision_engine_node
 from nodes.report_node import report_node
 
 # Build graph
@@ -59,6 +60,7 @@ builder.add_node("evidence_interpreter", evidence_interpreter_node)
 builder.add_node("story_scoring", story_scoring_engine_node)
 builder.add_node("visualization", visualization_generator_node)
 builder.add_node("llm_insight_synthesizer", llm_insight_synthesizer_node)
+builder.add_node("decision_engine", decision_engine_node)
 builder.add_node("report", report_node)
 
 # Set entry point
@@ -135,7 +137,8 @@ builder.add_edge("tool_executor", "evidence_interpreter")
 builder.add_edge("evidence_interpreter", "story_scoring")
 builder.add_edge("story_scoring", "visualization")
 builder.add_edge("visualization", "llm_insight_synthesizer")
-builder.add_edge("llm_insight_synthesizer", "report")
+builder.add_edge("llm_insight_synthesizer", "decision_engine")
+builder.add_edge("decision_engine", "report")
 builder.add_edge("report", END)
 
 # Compile graph

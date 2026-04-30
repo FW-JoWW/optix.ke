@@ -1,5 +1,9 @@
 import os
 import pprint
+import io
+import warnings
+from contextlib import redirect_stdout
+from time import perf_counter
 
 import pandas as pd
 
@@ -11,7 +15,7 @@ from utils.openai_runtime import get_openai_runtime_info
 def load_default_dataframe(dataset_path: str) -> pd.DataFrame:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
-    return pd.read_csv(dataset_path)
+    return pd.read_csv(dataset_path, low_memory=False)
 
 
 print("\n===== DATA ANALYST AGENT =====\n")
@@ -19,7 +23,7 @@ print("\n===== DATA ANALYST AGENT =====\n")
 question = input("Enter your business question:\n> ").strip()
 mode = input("\nChoose mode (autonomous / guided / collaborative):\n> ").strip().lower() or "autonomous"
 
-dataset_path = "data/Elizabeth _DAILY SALES_report - Copy.csv"
+dataset_path = "data/Car Dataset 1945-2020.csv"#"data/olist_merged_dataset.csv"
 df = load_default_dataframe(dataset_path)
 
 runtime_info = get_openai_runtime_info()
@@ -49,11 +53,35 @@ print(f"- OpenAI client ignores proxy env: {runtime_info['trust_env_for_openai']
 
 print("\n[Agent] Starting analysis...\n")
 
-final_state = graph.invoke(state)
+show_trace = os.getenv("SHOW_WORKFLOW_TRACE", "").strip().lower() in {"1", "true", "yes"}
+trace_buffer = io.StringIO()
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    started_at = perf_counter()
+    if show_trace:
+        final_state = graph.invoke(state)
+    else:
+        with redirect_stdout(trace_buffer):
+            final_state = graph.invoke(state)
+    elapsed_seconds = round(perf_counter() - started_at, 2)
+
 evidence = final_state.get("analysis_evidence", {})
+
+if show_trace:
+    print("\n===== INTERNAL TRACE =====")
+else:
+    trace_output = trace_buffer.getvalue()
+    if trace_output.strip():
+        trace_lines = [line for line in trace_output.splitlines() if line.strip()]
+        tail = trace_lines[-20:]
+        if tail:
+            print("\n===== INTERNAL TRACE TAIL =====")
+            print("\n".join(tail))
 
 print("\n===== HUMAN IN LOOP =====")
 pprint.pprint(evidence.get("human_in_loop"))
+print(f"\n===== ELAPSED SECONDS =====\n{elapsed_seconds}")
 
 if final_state.get("awaiting_user") or evidence.get("final_output") is not None:
     print("\n===== FINAL OUTPUT =====")
@@ -81,6 +109,15 @@ pprint.pprint(evidence.get("story_candidates"))
 
 print("\n===== TOP STORIES =====")
 pprint.pprint(evidence.get("top_stories"))
+
+print("\n===== DECISION PRIORITIES =====")
+pprint.pprint(evidence.get("decision_priority_ranking"))
+
+print("\n===== ALL DECISION RECORDS =====")
+pprint.pprint(evidence.get("decision_recommendations"))
+
+print("\n===== RECOMMENDED FIRST ACTION =====")
+pprint.pprint(evidence.get("decision_recommended_first"))
 
 print("\n===== CLARIFICATION QUESTIONS =====")
 pprint.pprint(final_state.get("clarification_questions") or evidence.get("clarification_questions"))

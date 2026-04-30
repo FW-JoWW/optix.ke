@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 import math
 import pandas as pd
 
+from inferential_engine import run_inferential_analysis
 from tools.anova_tool import anova_tool
 from tools.categorical_analysis_tool import categorical_analysis_tool
 from tools.correlation_tool import correlation_tool
@@ -17,6 +18,7 @@ from utils.numeric_parsing import normalize_numeric_token
 TOOL_MAPPING = {
     "direct_computation": None,
     "correlation": correlation_tool,
+    "chi_square": None,
     "ttest": ttest_tool,
     "detect_outliers": outlier_tool,
     "summary_statistics": summary_statistics_tool,
@@ -187,15 +189,17 @@ def execute_analysis_plan(
     df: pd.DataFrame,
     plan: List[Dict[str, Any]],
     config: Dict[str, Any] | None = None,
+    state_context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     config = config or {}
+    state_context = state_context or {}
 
     for task in plan:
         tool_name = task["tool"]
         columns = task.get("columns", [])
         tool_func = TOOL_MAPPING.get(tool_name)
-        if tool_name != "direct_computation" and tool_func is None:
+        if tool_name not in {"direct_computation", "chi_square"} and tool_func is None:
             continue
         if any(col not in df.columns for col in columns):
             continue
@@ -204,9 +208,9 @@ def execute_analysis_plan(
         try:
             if tool_name == "direct_computation":
                 result = _run_direct_computation(prepared_df, task)
-            elif tool_name == "anova":
-                result = tool_func(prepared_df, columns[0], columns[1])
-            elif tool_name in {"ttest", "correlation", "detect_outliers", "summary_statistics"}:
+            elif tool_name in {"ttest", "anova", "correlation", "chi_square"}:
+                result = run_inferential_analysis(prepared_df, task, state_context=state_context)
+            elif tool_name in {"detect_outliers", "summary_statistics"}:
                 result = tool_func(prepared_df, columns)
             elif tool_name == "regression":
                 result = tool_func(prepared_df, x_col=columns[0], y_col=columns[1])

@@ -113,7 +113,7 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     target_numeric = mentioned_numeric or numeric_cols
     target_categorical = mentioned_categorical or categorical_cols
 
-    relationship_words = ["relationship", "correlation", "affect", "impact"]
+    relationship_words = ["relationship", "correlation", "affect", "impact", "cause", "causal", "drive"]
     comparison_words = ["compare", "difference", "better"]
     categorical_words = [
         "distribution",

@@ -17,7 +17,11 @@ def data_validation_node(state: AnalystState) -> AnalystState:
     if after_df is None:
         after_df = before_df
 
-    validation_result = validate_cleaning(before_df, after_df)
+    validation_result = validate_cleaning(
+        before_df,
+        after_df,
+        before_profile=state.get("analysis_evidence", {}).get("preclean_profile_json"),
+    )
     state["data_validation"] = validation_result
     state["cleaning_validation"] = validation_result
     state["clarification_questions"] = []

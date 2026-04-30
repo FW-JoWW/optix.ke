@@ -28,6 +28,14 @@ def tool_executor_node(state: AnalystState) -> AnalystState:
         df=df,
         plan=tool_plan,
         config=state.get("categorical_analysis_config"),
+        state_context={
+            "intent": state.get("intent", {}),
+            "dataset_profile": state.get("dataset_profile", {}),
+            "column_registry": state.get("column_registry", {}),
+            "business_question": state.get("business_question", ""),
+            "analysis_evidence": evidence,
+            "reference_dataset": state.get("cleaned_data") if state.get("cleaned_data") is not None else state.get("dataframe"),
+            },
     )
     evidence["tool_results"] = tool_results
 

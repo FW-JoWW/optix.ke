@@ -112,7 +112,7 @@ def _family_candidates(
 def _determine_strategy(question: str, intent: Dict[str, Any]) -> str:
     query = (question or "").lower()
     analytic = str(intent.get("analytic_intent") or intent.get("type") or "").lower()
-    if analytic == "relationship" or _contains_any(query, ["relationship", "correlation", "regression"]):
+    if analytic == "relationship" or _contains_any(query, ["relationship", "correlation", "regression", "cause", "causal", "drive"]):
         return "relationship"
     if analytic == "comparison" or _contains_any(query, ["compare", "difference", "affect", "impact", "effect"]):
         return "comparison"
@@ -144,6 +144,7 @@ def _select_group_columns(
     selected_columns: List[str],
     profile: Dict[str, Any],
     context: Dict[str, Any],
+    strategy: str,
 ) -> List[str]:
     group_by = intent.get("group_by")
     if group_by in (profile.get("column_names") or []) and _categorical_capable(profile, context, group_by):
@@ -157,6 +158,13 @@ def _select_group_columns(
         ]
     if not candidates:
         return []
+
+    if strategy == "relationship":
+        explicit = [col for col in selected_columns if col in candidates]
+        if len(explicit) >= 2:
+            return explicit
+        if len(candidates) >= 2:
+            return candidates
 
     if _contains_any(question, ["per day", "per date", "daily", "by day", "over time", "trend"]):
         ts = [col for col in candidates if _timestamp_like(profile, context, col)]
@@ -181,6 +189,7 @@ def _select_metric_columns(
     profile: Dict[str, Any],
     context: Dict[str, Any],
     relationships: Dict[str, Any],
+    strategy: str,
 ) -> List[str]:
     aggregate_column = intent.get("aggregate_column")
     if aggregate_column in (profile.get("column_names") or []):
@@ -217,6 +226,16 @@ def _select_metric_columns(
         scored.append((col, _metric_score(profile, context, relationships, col) + 0.2 * lexical))
 
     scored.sort(key=lambda item: item[1], reverse=True)
+
+    if strategy == "relationship":
+        return [item[0] for item in scored]
+
+    if strategy == "comparison":
+        explicit_numeric = [col for col in selected_columns if col in [item[0] for item in scored]]
+        if explicit_numeric:
+            return explicit_numeric
+        return [item[0] for item in scored[:2]]
+
     return [scored[0][0]] if scored else []
 
 
@@ -361,8 +380,23 @@ def build_computation_plan(
     # 3. leave tool selection to the later analysis-plan stage
     question = user_intent.get("query", "")
     strategy = _determine_strategy(question, user_intent)
-    group_columns = _select_group_columns(question, user_intent, selected_columns, dataset_profile, inferred_context)
-    metric_columns = _select_metric_columns(question, user_intent, selected_columns, dataset_profile, inferred_context, relationship_signals)
+    group_columns = _select_group_columns(
+        question,
+        user_intent,
+        selected_columns,
+        dataset_profile,
+        inferred_context,
+        strategy,
+    )
+    metric_columns = _select_metric_columns(
+        question,
+        user_intent,
+        selected_columns,
+        dataset_profile,
+        inferred_context,
+        relationship_signals,
+        strategy,
+    )
     steps: List[ComputationStep] = []
     confidence = 0.75
     notes: List[str] = []
@@ -449,26 +483,42 @@ def build_computation_plan(
 
     elif strategy == "relationship":
         if len(metric_columns) >= 2:
-            reason = "Evaluate the relationship between the resolved metric columns."
-            steps.append(
-                ComputationStep(
-                    operation="pairwise_relationship",
-                    columns=metric_columns[:2],
-                    justification=reason,
-                    trace=_trace(reason, 0.78, ["relationship_intent"]),
-                )
-            )
+            for idx, left in enumerate(metric_columns):
+                for right in metric_columns[idx + 1:]:
+                    reason = f"Evaluate the relationship between {left} and {right} because both are valid metric columns for the requested relationship analysis."
+                    steps.append(
+                        ComputationStep(
+                            operation="pairwise_relationship",
+                            columns=[left, right],
+                            justification=reason,
+                            trace=_trace(reason, 0.78, ["relationship_intent"]),
+                        )
+                    )
         elif metric_columns and group_columns:
-            reason = "The resolved structure indicates a metric-to-group relationship, so grouped comparison is the minimal valid computation."
-            steps.append(
-                ComputationStep(
-                    operation="group_compare",
-                    columns=[metric_columns[0], group_columns[0]],
-                    parameters={"group_by": group_columns[0], "aggregate": "mean"},
-                    justification=reason,
-                    trace=_trace(reason, 0.68, ["relationship_intent", "mixed_input_types"]),
-                )
-            )
+            for metric in metric_columns:
+                for group_col in group_columns:
+                    reason = f"The resolved structure indicates a metric-to-group relationship between {metric} and {group_col}, so grouped comparison is the minimal valid computation."
+                    steps.append(
+                        ComputationStep(
+                            operation="group_compare",
+                            columns=[metric, group_col],
+                            parameters={"group_by": group_col, "aggregate": "mean"},
+                            justification=reason,
+                            trace=_trace(reason, 0.68, ["relationship_intent", "mixed_input_types"]),
+                        )
+                    )
+        elif len(group_columns) >= 2:
+            for idx, left in enumerate(group_columns):
+                for right in group_columns[idx + 1:]:
+                    reason = f"The resolved structure indicates a categorical association question between {left} and {right}, so association testing is the minimal valid computation."
+                    steps.append(
+                        ComputationStep(
+                            operation="categorical_association",
+                            columns=[left, right],
+                            justification=reason,
+                            trace=_trace(reason, 0.72, ["relationship_intent", "categorical_inputs"]),
+                        )
+                    )
         else:
             confidence = 0.3
             notes.append("Relationship analysis requested but the engine could not resolve structurally valid variables.")
@@ -597,34 +647,47 @@ def build_analysis_plan(
                 confidence = _bounded_confidence(confidence - 0.25)
 
     elif strategy == "relationship":
-        step = next((item for item in computation_plan.steps if item.operation in {"pairwise_relationship", "group_compare"}), None)
-        if step is not None and step.operation == "pairwise_relationship":
-            reason = "The resolved computation requires measuring the relationship between numeric-capable variables."
-            operations.append(
-                AnalysisOperation(
-                    tool="correlation",
-                    columns=step.columns[:2],
-                    computation_refs=[step.operation],
-                    parameters={"computation_plan": [item.model_dump() for item in computation_plan.steps], "strategy": strategy},
-                    justification=reason,
-                    trace=_trace(reason, confidence, ["relationship_intent"]),
-                )
-            )
-        elif step is not None:
-            metric = step.columns[0] if step.columns else None
-            group_col = step.parameters.get("group_by") or (step.columns[-1] if step.columns else None)
-            if metric and group_col:
-                unique_count = _info(dataset_profile, group_col).get("unique_count", 0)
-                tool = "ttest" if unique_count == 2 else "anova"
-                reason = "The resolved structure is a metric-to-group relationship, so grouped comparison testing is the valid final step."
+        computation_dump = [item.model_dump() for item in computation_plan.steps]
+        for step in computation_plan.steps:
+            if step.operation == "pairwise_relationship":
+                reason = "The resolved computation requires measuring the relationship between numeric-capable variables."
                 operations.append(
                     AnalysisOperation(
-                        tool=tool,
-                        columns=[metric, group_col],
+                        tool="correlation",
+                        columns=step.columns[:2],
                         computation_refs=[step.operation],
-                        parameters={"computation_plan": [item.model_dump() for item in computation_plan.steps], "strategy": strategy},
+                        parameters={"computation_plan": computation_dump, "strategy": strategy},
                         justification=reason,
-                        trace=_trace(reason, confidence, ["relationship_intent", "mixed_input_types"]),
+                        trace=_trace(reason, confidence, ["relationship_intent"]),
+                    )
+                )
+            elif step.operation == "group_compare":
+                metric = step.columns[0] if step.columns else None
+                group_col = step.parameters.get("group_by") or (step.columns[-1] if step.columns else None)
+                if metric and group_col:
+                    unique_count = _info(dataset_profile, group_col).get("unique_count", 0)
+                    tool = "ttest" if unique_count == 2 else "anova"
+                    reason = "The resolved structure is a metric-to-group relationship, so grouped comparison testing is the valid final step."
+                    operations.append(
+                        AnalysisOperation(
+                            tool=tool,
+                            columns=[metric, group_col],
+                            computation_refs=[step.operation],
+                            parameters={"computation_plan": computation_dump, "strategy": strategy},
+                            justification=reason,
+                            trace=_trace(reason, confidence, ["relationship_intent", "mixed_input_types"]),
+                        )
+                    )
+            elif step.operation == "categorical_association":
+                reason = "The resolved structure is categorical-versus-categorical, so a chi-square test of independence is the valid final step."
+                operations.append(
+                    AnalysisOperation(
+                        tool="chi_square",
+                        columns=step.columns[:2],
+                        computation_refs=[step.operation],
+                        parameters={"computation_plan": computation_dump, "strategy": strategy},
+                        justification=reason,
+                        trace=_trace(reason, confidence, ["relationship_intent", "categorical_inputs"]),
                     )
                 )
 

@@ -84,7 +84,7 @@ def classify_analytic_intent(query: str):
         "comparison": ["compare", "vs", "versus", "difference", "against"],
         "temporal": ["trend", "over time", "per day", "per month", "growth", "decline"],
         "composition": ["breakdown", "distribution", "percentage", "share", "portion"],
-        "relationship": ["correlation", "relationship", "impact", "effect", "influence", "affect"],
+        "relationship": ["correlation", "relationship", "impact", "effect", "influence", "affect", "cause", "causal", "drive"],
         "extremes": ["top", "bottom", "highest", "lowest", "max", "min"],
         "profiling": ["average", "mean", "median", "summary", "stats", "statistics"],
         "outliers": ["outlier", "outliers", "unusual", "anomaly", "anomalies"],
@@ -266,11 +266,40 @@ def build_categorical_conditions(query: str, df):
 
     categorical_columns = df.select_dtypes(include=["object", "string"]).columns
     query_lower = query.lower()
+    query_tokens = set(re.findall(r"[a-zA-Z0-9_]+", query_lower))
+    stopwords = {
+        "a", "an", "and", "are", "as", "at", "be", "between", "by", "for",
+        "from", "how", "in", "is", "it", "of", "on", "or", "the", "to",
+        "what", "when", "where", "which", "who", "why", "with",
+    }
 
     for col in categorical_columns:
         values = df[col].dropna().unique()
-        tokens = query_lower.split()
-        matched_vals = [v for v in values if str(v).lower() in tokens]
+        matched_vals = []
+        for value in values:
+            value_str = str(value).strip().lower()
+            if not value_str:
+                continue
+            if len(value_str) < 3:
+                continue
+            if value_str in stopwords:
+                continue
+
+            value_tokens = re.findall(r"[a-zA-Z0-9_]+", value_str)
+            if not value_tokens:
+                continue
+
+            if len(value_tokens) == 1:
+                token = value_tokens[0]
+                if token in stopwords or len(token) < 3:
+                    continue
+                if token in query_tokens:
+                    matched_vals.append(value)
+            else:
+                pattern = rf"(?<!\w){re.escape(value_str)}(?!\w)"
+                if re.search(pattern, query_lower):
+                    matched_vals.append(value)
+
         if matched_vals:
             if len(matched_vals) == 1:
                 conditions.append({
@@ -640,13 +669,16 @@ def should_call_llm_for_intent(state: AnalystState, ast, filters):
     if not state.get("enable_llm_reasoning", True):
         return False
 
-    if ast is None or not filters:
-        return True
-
-    if state.get("intent", {}).get("low_confidence"):
-        return True
-
+    intent = state.get("intent", {}) or {}
     query = state.get("business_question", "").lower()
+    selected_columns = intent.get("selected_columns") or state.get("selected_columns") or []
+    group_by = intent.get("group_by")
+    aggregate_column = intent.get("aggregate_column")
+    analytic_intent = intent.get("analytic_intent")
+
+    if intent.get("low_confidence"):
+        return True
+
     numeric_columns = state.get("dataset_profile", {}).get("numeric_columns", [])
     ambiguous_terms = [
         "cheap",
@@ -663,7 +695,22 @@ def should_call_llm_for_intent(state: AnalystState, ast, filters):
     if query_has_semantic_magnitude(query) and not filters:
         return True
 
-    return any(term in query for term in ambiguous_terms)
+    # If the parser already resolved a clear analysis request with explicit columns,
+    # defer to deterministic planning instead of paying for an unnecessary LLM pass.
+    if analytic_intent in {"relationship", "comparison", "profiling", "outliers", "temporal", "composition"}:
+        if len(selected_columns) >= 2:
+            return False
+        if analytic_intent in {"profiling", "outliers"} and selected_columns:
+            return False
+        if group_by and aggregate_column:
+            return False
+
+    # Filter-only queries with a confident symbolic parse do not need LLM repair.
+    if ast is not None and filters:
+        return any(term in query for term in ambiguous_terms)
+
+    # If nothing was parsed and no columns were resolved, ask the LLM as a last resort.
+    return not selected_columns or any(term in query for term in ambiguous_terms)
 '''def build_final_ast(processed_node):
     # If there's nothing there, return None
     if not processed_node:
@@ -768,6 +815,9 @@ def _has_analysis_request(analytic_intent: str, query: str) -> bool:
         "impact",
         "effect",
         "affect",
+        "cause",
+        "causal",
+        "drive",
         "compare",
         "difference",
         "distribution",
@@ -997,6 +1047,7 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
             if final_selected:
                 state["selected_columns"] = final_selected
     else:
+        state["llm_reasoning_status"] = "skipped_symbolic_sufficient"
         print("\n[INFO] Skipping LLM - symbolic parsing sufficient")
 
     if state["intent"].get("ast"):

@@ -60,6 +60,8 @@ def run_pre_analysis_gate(clean_df: pd.DataFrame, schema: DatasetSchema) -> PreA
         if diffs.empty:
             continue
         expected_step = diffs.mode().iloc[0]
+        if pd.isna(expected_step) or expected_step <= pd.Timedelta(0):
+            continue
         full_range = pd.date_range(series.min(), series.max(), freq=expected_step)
         if len(full_range) > len(series):
             missing_ratio = float((len(full_range) - len(series)) / max(len(full_range), 1))
