@@ -33,6 +33,7 @@ def tool_executor_node(state: AnalystState) -> AnalystState:
             "dataset_profile": state.get("dataset_profile", {}),
             "column_registry": state.get("column_registry", {}),
             "business_question": state.get("business_question", ""),
+            "selected_columns": state.get("selected_columns", []),
             "analysis_evidence": evidence,
             "reference_dataset": state.get("cleaned_data") if state.get("cleaned_data") is not None else state.get("dataframe"),
             },

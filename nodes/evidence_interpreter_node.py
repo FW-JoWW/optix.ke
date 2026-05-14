@@ -428,6 +428,69 @@ def _inferential_story(result: Dict[str, Any], raw_df: pd.DataFrame | None) -> D
     return None
 
 
+def _predictive_story(result: Dict[str, Any]) -> Dict[str, Any] | None:
+    if result.get("error"):
+        return None
+    metrics = ((result.get("metrics") or {}).get("values")) or {}
+    target = result.get("target_column")
+    problem_type = result.get("problem_type")
+    confidence = result.get("confidence_level", "low")
+    confidence_detail = result.get("confidence", {}) or {}
+    if not target or not problem_type:
+        return None
+
+    if problem_type == "classification":
+        score = metrics.get("f1")
+        insight = f"Predictive model for {target} is ready with {result.get('chosen_model')} and F1 around {round(float(score), 3) if score is not None else 'n/a'}"
+    elif problem_type == "forecasting":
+        score = metrics.get("mape")
+        insight = f"Forecasting model for {target} is ready with {result.get('chosen_model')} and MAPE around {round(float(score), 3) if score is not None else 'n/a'}"
+    else:
+        score = metrics.get("r2")
+        insight = f"Predictive model for {target} is ready with {result.get('chosen_model')} and R2 around {round(float(score), 3) if score is not None else 'n/a'}"
+
+    return {
+        "type": "predictive_model",
+        "insight": insight,
+        "column": target,
+        "problem_type": problem_type,
+        "model_name": result.get("chosen_model"),
+        "metrics": metrics,
+        "top_drivers": result.get("top_drivers", []),
+        "predictions_preview": result.get("predictions_preview", []),
+        "limitations": result.get("limitations", []),
+        "readiness_warnings": result.get("readiness_warnings", []),
+        "validation_summary": result.get("validation_summary", {}),
+        "truthfulness_flags": result.get("truthfulness_flags", []),
+        "no_reliable_recommendation": bool(result.get("no_reliable_recommendation")),
+        "confidence_assessment": confidence_detail,
+        "confidence": confidence,
+    }
+
+
+def _prescriptive_story(result: Dict[str, Any]) -> Dict[str, Any] | None:
+    if result.get("error"):
+        return None
+    actions = result.get("recommended_actions", []) or []
+    if not actions:
+        return None
+    first = actions[0]
+    return {
+        "type": "prescriptive_action",
+        "insight": f"Best next action is {first.get('action')}",
+        "column": result.get("based_on_target"),
+        "objective": result.get("objective"),
+        "estimated_upside": result.get("estimated_upside"),
+        "recommended_actions": actions,
+        "scenario_summary": result.get("scenario_summary", []),
+        "decision_paths": result.get("decision_paths", []),
+        "assumptions": result.get("assumptions", []),
+        "truthfulness_notes": result.get("truthfulness_notes", []),
+        "confidence_assessment": result.get("confidence", {}) or {},
+        "confidence": result.get("confidence_level", "low"),
+    }
+
+
 def evidence_interpreter_node(state: AnalystState) -> AnalystState:
     """
     Interprets raw tool outputs into structured story candidates.
@@ -477,6 +540,14 @@ def evidence_interpreter_node(state: AnalystState) -> AnalystState:
                 guarded_story = _apply_semantic_guardrails(story, result, state)
                 if guarded_story:
                     story_candidates.append(guarded_story)
+        elif tool_type == "predictive_analysis":
+            story = _predictive_story(result)
+            if story:
+                story_candidates.append(story)
+        elif tool_type == "prescriptive_analysis":
+            story = _prescriptive_story(result)
+            if story:
+                story_candidates.append(story)
 
     evidence["story_candidates"] = story_candidates
 

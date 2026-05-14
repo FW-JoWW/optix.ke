@@ -1,3 +1,4 @@
+import re
 from typing import Dict, List
 
 from decision_engine import run_decision_engine
@@ -6,7 +7,12 @@ from state.state import AnalystState
 
 
 def _contains_any(text: str, words: List[str]) -> bool:
-    return any(word in text for word in words)
+    text = (text or "").lower()
+    for word in words:
+        pattern = rf"(?<!\w){re.escape(word.lower())}(?!\w)"
+        if re.search(pattern, text):
+            return True
+    return False
 
 
 def _pairwise_numeric_plans(columns: List[str], tool: str) -> List[Dict]:
@@ -115,6 +121,8 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
 
     relationship_words = ["relationship", "correlation", "affect", "impact", "cause", "causal", "drive"]
     comparison_words = ["compare", "difference", "better"]
+    predictive_words = ["predict", "forecast", "estimate", "project", "likely", "risk", "demand", "score", "propensity"]
+    prescriptive_words = ["optimize", "optimization", "recommend", "allocate", "allocation", "budget", "what if", "scenario", "reorder", "capacity", "pricing"]
     categorical_words = [
         "distribution",
         "frequency",
@@ -131,6 +139,45 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     ]
     grouped_numeric_words = ["average", "mean", "median", "summary", "describe"]
     grouped_numeric_query = bool(mentioned_numeric and mentioned_categorical and _contains_any(question, grouped_numeric_words))
+
+    predictive_mode = intent.get("analytic_intent") == "predictive" or _contains_any(question, predictive_words) or _contains_any(question, prescriptive_words)
+    if predictive_mode:
+        predictive_target = (mentioned_numeric[-1] if mentioned_numeric else None) or intent.get("aggregate_column")
+        if not predictive_target and len(target_numeric) == 1:
+            predictive_target = target_numeric[0]
+
+        predictive_source_df = (
+            state.get("raw_analysis_dataset")
+            if state.get("raw_analysis_dataset") is not None
+            else state.get("cleaned_data")
+            if state.get("cleaned_data") is not None
+            else state.get("dataframe")
+            if state.get("dataframe") is not None
+            else df
+        )
+        feature_pool = [
+            c for c in predictive_source_df.columns
+            if column_registry.get(c, {}).get("semantic_role") != "identifier"
+        ]
+        if predictive_target and predictive_target in feature_pool:
+            predictive_columns = [c for c in feature_pool if c != predictive_target] + [predictive_target]
+        else:
+            predictive_columns = feature_pool or selected_columns
+        plan.append(
+            {
+                "tool": "predictive_analysis",
+                "columns": predictive_columns,
+                "parameters": {"target_column": predictive_target},
+            }
+        )
+        if _contains_any(question, prescriptive_words):
+            plan.append(
+                {
+                    "tool": "prescriptive_analysis",
+                    "columns": predictive_columns,
+                    "parameters": {"target_column": predictive_target},
+                }
+            )
 
     if _contains_any(question, relationship_words):
         if len(target_numeric) >= 2 and not target_categorical:
@@ -255,10 +302,22 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
         required_columns.extend(item.get("columns", []))
 
     required_columns = _dedupe_preserve_order(selected_columns + required_columns)
-    available_columns = [col for col in required_columns if col in df.columns]
+    source_df = df
+    if any(item.get("tool") in {"predictive_analysis", "prescriptive_analysis"} for item in unique_plan):
+        source_df = (
+            state.get("raw_analysis_dataset")
+            if state.get("raw_analysis_dataset") is not None
+            else state.get("cleaned_data")
+            if state.get("cleaned_data") is not None
+            else state.get("dataframe")
+            if state.get("dataframe") is not None
+            else df
+        )
+
+    available_columns = [col for col in required_columns if col in source_df.columns]
     if available_columns:
         state["selected_columns"] = available_columns
-        state["analysis_dataset"] = df[available_columns].copy()
+        state["analysis_dataset"] = source_df[available_columns].copy()
 
     print("\n=== ANALYSIS PLAN ===")
     print("Dataset shape:", df.shape)

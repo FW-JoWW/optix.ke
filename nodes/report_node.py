@@ -65,6 +65,17 @@ def _format_tool_results(tool_results: Dict[str, Any]) -> str:
         elif tool == "categorical_analysis":
             result_keys = list((result.get("results") or {}).keys())
             lines.append(f"- categorical analysis on: {', '.join(result_keys) if result_keys else 'no columns'}")
+        elif tool == "predictive_analysis":
+            metrics = ((result.get("metrics") or {}).get("values")) or {}
+            confidence = result.get("confidence", {}) or {}
+            monitoring = ((result.get("validation_summary") or {}).get("monitoring")) or {}
+            lines.append(
+                f"- predictive {result.get('problem_type')} for {result.get('target_column')} using {result.get('chosen_model')}: metrics={metrics}, confidence={confidence.get('label')}({confidence.get('score')}), health={monitoring.get('health_score')}"
+            )
+        elif tool == "prescriptive_analysis":
+            lines.append(
+                f"- prescriptive analysis for {result.get('based_on_target')}: estimated_upside={result.get('estimated_upside')}, objective={result.get('objective')}"
+            )
         else:
             lines.append(f"- {tool}: {result}")
 
@@ -136,6 +147,91 @@ def _format_all_decision_records(decisions: List[Dict[str, Any]]) -> str:
     )
 
 
+def _format_judgment_summary(judgment: Dict[str, Any]) -> str:
+    if not judgment:
+        return "None"
+    return "\n".join(
+        [
+            f"- Dominant interpretation: {judgment.get('dominant_reasoning')}",
+            f"- Global confidence: {judgment.get('global_confidence')}",
+            f"- Actionability: {judgment.get('actionability')}",
+            f"- Allowed actions: {judgment.get('allowed_actions') or []}",
+            f"- Blocked actions: {judgment.get('blocked_actions') or []}",
+        ]
+    )
+
+
+def _executive_summary(evidence: Dict[str, Any], judgment: Dict[str, Any]) -> str:
+    first_decision = evidence.get("decision_recommended_first") or {}
+    top_story = (evidence.get("top_stories") or [{}])[0]
+    return "\n".join(
+        [
+            f"- Best action: {first_decision.get('recommended_action', 'None')}",
+            f"- Expected upside: {((first_decision.get('impact_assessment') or {}).get('impact_level', 'unknown'))}",
+            f"- Confidence level: {judgment.get('global_confidence', 'unknown')}",
+            f"- Core evidence: {top_story.get('insight', 'No strong story identified')}",
+        ]
+    )
+
+
+def _predictive_sections(tool_results: Dict[str, Any]) -> Dict[str, str]:
+    predictive = next((value for value in tool_results.values() if isinstance(value, dict) and value.get("tool") == "predictive_analysis"), None)
+    prescriptive = next((value for value in tool_results.values() if isinstance(value, dict) and value.get("tool") == "prescriptive_analysis"), None)
+    if not predictive and not prescriptive:
+        return {
+            "drivers": "None",
+            "risks": "None",
+            "best_action": "None",
+            "expected_upside": "None",
+            "constraints": "None",
+            "confidence": "None",
+            "monitoring_plan": "None",
+        }
+
+    top_drivers = predictive.get("top_drivers", []) if predictive else []
+    drivers = "\n".join(f"- {item.get('feature')}: importance={item.get('importance')}" for item in top_drivers[:5]) if top_drivers else "None"
+    limitations = (predictive.get("limitations", []) if predictive else []) or []
+    truthfulness = (prescriptive.get("truthfulness_notes", []) if prescriptive else []) or []
+    risks = "\n".join(f"- {item}" for item in [*limitations[:5], *truthfulness[:3]]) if (limitations or truthfulness) else "None"
+    best_action = "None"
+    expected_upside = "None"
+    constraints = "None"
+    if prescriptive:
+        decision_paths = prescriptive.get("decision_paths", []) or []
+        if decision_paths:
+            best_action = decision_paths[0].get("recommended_action", "None")
+            expected_upside = str(decision_paths[0].get("expected_impact_range", prescriptive.get("estimated_upside")))
+            constraints = "\n".join(
+                f"- {item}" for item in (decision_paths[0].get("constraint_explanations", []) or [])
+            ) or "None"
+        else:
+            actions = prescriptive.get("recommended_actions", []) or []
+            if actions:
+                best_action = actions[0].get("action", "None")
+                expected_upside = str(actions[0].get("estimated_uplift_range") or actions[0].get("estimated_uplift") or prescriptive.get("estimated_upside"))
+    confidence = "None"
+    if predictive and predictive.get("confidence"):
+        confidence = f"{predictive['confidence'].get('label')} ({predictive['confidence'].get('score')})"
+    monitoring = ((predictive.get("validation_summary") or {}).get("monitoring") if predictive else {}) or {}
+    monitoring_plan = "\n".join(f"- {item}" for item in monitoring.get("monitoring_plan", [])[:5]) if monitoring.get("monitoring_plan") else "None"
+    return {
+        "drivers": drivers,
+        "risks": risks,
+        "best_action": best_action,
+        "expected_upside": expected_upside,
+        "constraints": constraints,
+        "confidence": confidence,
+        "monitoring_plan": monitoring_plan,
+    }
+
+
+def _format_contradictions(judgment: Dict[str, Any]) -> str:
+    contradictions = (judgment or {}).get("contradictions_found", []) or []
+    if not contradictions:
+        return "None"
+    return "\n".join(f"- {item}" for item in contradictions)
+
+
 def report_node(state: AnalystState) -> AnalystState:
     """
     Generates a professional report that reads like a finished workflow output.
@@ -157,6 +253,7 @@ def report_node(state: AnalystState) -> AnalystState:
     decision_recommendations = evidence.get("decision_recommendations", []) or []
     decision_ranking = evidence.get("decision_priority_ranking", []) or []
     recommended_first = evidence.get("decision_recommended_first")
+    judgment = evidence.get("judgment_summary", {}) or {}
     decision_context = state.get("decision_context")
     if not decision_context:
         decision_context = derive_decision_from_top_stories(top_stories)
@@ -194,6 +291,12 @@ VISUALIZATIONS:
 DECISION CONTEXT:
 {decision_context}
 
+JUDGMENT SUMMARY:
+{_format_judgment_summary(judgment)}
+
+CONTRADICTIONS RESOLVED:
+{_format_contradictions(judgment)}
+
 ALL DECISION RECORDS:
 {_format_all_decision_records(decision_recommendations)}
 
@@ -201,10 +304,10 @@ PRIORITIZED DECISIONS:
 {_format_decisions(decision_ranking)}
 
 RECOMMENDED FIRST ACTION:
-{recommended_first if recommended_first else "None"}
+{judgment.get("recommended_first_action") if judgment else (recommended_first if recommended_first else "None")}
 
 DECISION ENGINE NOTES:
-{chr(10).join(f"- {note}" for note in decision_notes) if decision_notes else "None"}
+{chr(10).join(f"- {note}" for note in ([*(judgment.get('judgment_notes', []) if judgment else []), *decision_notes])) if ((judgment.get('judgment_notes', []) if judgment else []) or decision_notes) else "None"}
 
 HUMAN IN LOOP:
 {hitl_summary}

@@ -65,9 +65,32 @@ def _partial_corr(frame: pd.DataFrame, x_col: str, y_col: str, controls: List[st
     if len(work) < 10:
         return PartialCorrelationResult(computed=False, controls=usable, sample_size=len(work), note="Too few complete rows for partial correlation.")
 
-    control_matrix = pd.get_dummies(work[usable], drop_first=True)
+    safe_controls: List[str] = []
+    dropped_controls: List[str] = []
+    for column in usable:
+        series = work[column]
+        if pd.api.types.is_numeric_dtype(series):
+            safe_controls.append(column)
+            continue
+        unique_count = int(series.dropna().nunique())
+        unique_ratio = float(unique_count / max(int(series.notna().sum()), 1))
+        if unique_count <= 20 and unique_ratio <= 0.2:
+            safe_controls.append(column)
+        else:
+            dropped_controls.append(column)
+
+    if not safe_controls:
+        note = "Resolved confounders were too high-cardinality for safe control adjustment."
+        if dropped_controls:
+            note += f" Skipped controls: {', '.join(dropped_controls[:3])}."
+        return PartialCorrelationResult(computed=False, controls=usable, sample_size=len(work), note=note)
+
+    control_matrix = pd.get_dummies(work[safe_controls], drop_first=True)
+    if control_matrix.shape[1] > 100:
+        note = "Control design became too wide for safe partial correlation and was deferred."
+        return PartialCorrelationResult(computed=False, controls=safe_controls, sample_size=len(work), note=note)
     if control_matrix.empty:
-        return PartialCorrelationResult(computed=False, controls=usable, sample_size=len(work), note="Control variables did not produce a usable design matrix.")
+        return PartialCorrelationResult(computed=False, controls=safe_controls, sample_size=len(work), note="Control variables did not produce a usable design matrix.")
 
     design = np.column_stack([np.ones(len(control_matrix)), control_matrix.to_numpy(dtype=float)])
     x_values = pd.to_numeric(work[x_col], errors="coerce").to_numpy(dtype=float)
@@ -81,11 +104,15 @@ def _partial_corr(frame: pd.DataFrame, x_col: str, y_col: str, controls: List[st
     coeff, p_value = stats.pearsonr(resid_x, resid_y)
     return PartialCorrelationResult(
         computed=True,
-        controls=usable,
+        controls=safe_controls,
         coefficient=float(coeff),
         p_value=float(p_value),
         sample_size=len(work),
-        note="Computed by correlating residualized variables after linear control adjustment.",
+        note=(
+            "Computed by correlating residualized variables after linear control adjustment."
+            if not dropped_controls
+            else "Computed by correlating residualized variables after linear control adjustment, excluding high-cardinality controls."
+        ),
     )
 
 

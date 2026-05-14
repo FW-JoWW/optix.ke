@@ -180,6 +180,50 @@ def generate_regression_plot(df, story):
         "priority": "primary"
     }
 
+def generate_predictive_driver_bar(df, story):
+    del df
+    drivers = story.get("top_drivers") or []
+    if not drivers:
+        return None
+    top = drivers[:8]
+    labels = [str(item.get("feature")) for item in top]
+    values = [float(item.get("importance") or 0.0) for item in top]
+    plt.figure()
+    sns.barplot(x=values, y=labels, orient="h")
+    filename = f"charts/predictive_drivers_{story.get('column', 'target')}.png"
+    plt.title(f"Top Drivers for {story.get('column', 'target')}")
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    return {
+        "type": "predictive_drivers",
+        "file_path": filename,
+        "based_on": story,
+        "priority": "primary",
+    }
+
+def generate_prediction_fit_plot(df, story):
+    del df
+    preview = story.get("predictions_preview") or []
+    if not preview:
+        return None
+    preview_df = pd.DataFrame(preview)
+    if not {"actual", "predicted"}.issubset(preview_df.columns):
+        return None
+    plt.figure()
+    sns.scatterplot(data=preview_df, x="actual", y="predicted")
+    filename = f"charts/prediction_fit_{story.get('column', 'target')}.png"
+    plt.title(f"Prediction Fit for {story.get('column', 'target')}")
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+    return {
+        "type": "prediction_fit",
+        "file_path": filename,
+        "based_on": story,
+        "priority": "secondary",
+    }
+
 # ------------------------------
 # Story → Chart Mapper
 # ------------------------------
@@ -199,10 +243,15 @@ def map_story_to_chart(story, df):
         "grouped_numeric": generate_grouped_bar,
         "categorical_relationship": generate_heatmap,
         "inferential_categorical_association": generate_heatmap,
+        "predictive_model": generate_predictive_driver_bar,
     }
     chart_func = mapping.get(story.get("type"))
     if chart_func:
-        return chart_func(df, story)
+        primary = chart_func(df, story)
+        if primary or story.get("type") != "predictive_model":
+            return primary
+    if story.get("type") == "predictive_model":
+        return generate_prediction_fit_plot(df, story)
     return None
 
 # ------------------------------

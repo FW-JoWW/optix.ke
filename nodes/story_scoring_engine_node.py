@@ -114,6 +114,30 @@ def _base_score(story):
     if story_type == "summary_numeric":
         return 0.6
 
+    if story_type == "predictive_model":
+        metrics = story.get("metrics", {}) or {}
+        readiness = story.get("readiness_warnings", []) or []
+        penalty = sum(0.12 if item.get("severity") == "high" else 0.06 for item in readiness)
+        if story.get("problem_type") == "classification":
+            base = min(1.0, 0.4 + float(metrics.get("f1") or 0.0))
+        elif story.get("problem_type") == "forecasting":
+            mape = float(metrics.get("mape") or 1.0)
+            base = max(0.35, min(1.0, 1.0 - mape))
+        else:
+            base = max(0.35, min(1.0, 0.35 + float(metrics.get("r2") or 0.0)))
+        return max(0.25, min(1.0, base - penalty))
+
+    if story_type == "prescriptive_action":
+        upside = abs(float(story.get("estimated_upside") or 0.0))
+        confidence = str(story.get("confidence") or "low").lower()
+        if upside > 10000 or confidence == "high":
+            return 0.9
+        if upside > 1000 or confidence == "moderate":
+            return 0.8
+        if upside > 0:
+            return 0.7
+        return 0.5
+
     return 0.3
 
 

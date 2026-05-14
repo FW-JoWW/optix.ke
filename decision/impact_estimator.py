@@ -5,7 +5,10 @@ from typing import Any, Dict
 
 def _effect_value(story: Dict[str, Any]) -> float:
     effect = story.get("effect_size") or {}
-    value = effect.get("value", story.get("value", 0.0))
+    if isinstance(effect, dict):
+        value = effect.get("value", story.get("value", 0.0))
+    else:
+        value = effect if effect is not None else story.get("value", 0.0)
     try:
         return abs(float(value or 0.0))
     except Exception:
@@ -35,6 +38,57 @@ def estimate_impact(
             "impact_level": "none",
             "estimated_direction": "unclear",
             "confidence_adjusted_impact": 0.0,
+        }
+
+    story_type = story.get("type")
+    if story_type == "predictive_model":
+        metrics = story.get("metrics", {}) or {}
+        problem_type = story.get("problem_type")
+        readiness = story.get("readiness_warnings", []) or []
+        warning_penalty = sum(0.15 if item.get("severity") == "high" else 0.08 for item in readiness)
+        if problem_type == "classification":
+            raw_score = max(float(metrics.get("f1") or 0.0), float(metrics.get("roc_auc") or 0.0))
+        elif problem_type == "forecasting":
+            mape = float(metrics.get("mape") or 1.0)
+            raw_score = max(0.0, 1.0 - min(mape, 1.0))
+        else:
+            raw_score = max(0.0, min(float(metrics.get("r2") or 0.0), 1.0))
+        confidence = max(0.0, min(raw_score - warning_penalty, 1.0))
+        if confidence >= 0.8:
+            impact_level = "medium"
+        elif confidence >= 0.55:
+            impact_level = "low"
+        else:
+            impact_level = "uncertain"
+        return {
+            "impact_level": impact_level,
+            "estimated_direction": "unclear",
+            "confidence_adjusted_impact": round(confidence, 4),
+        }
+
+    if story_type == "prescriptive_action":
+        upside = float(story.get("estimated_upside") or 0.0)
+        confidence_label = str(story.get("confidence") or "low").lower()
+        base = 0.35
+        if upside > 0:
+            base += 0.2
+        if confidence_label == "high":
+            base += 0.25
+        elif confidence_label == "moderate":
+            base += 0.15
+        base = max(0.0, min(base, 1.0))
+        if base >= 0.75:
+            impact_level = "high"
+        elif base >= 0.55:
+            impact_level = "medium"
+        elif base > 0.0:
+            impact_level = "low"
+        else:
+            impact_level = "uncertain"
+        return {
+            "impact_level": impact_level,
+            "estimated_direction": "positive" if upside > 0 else "unclear",
+            "confidence_adjusted_impact": round(base, 4),
         }
 
     effect_value = _effect_value(story)

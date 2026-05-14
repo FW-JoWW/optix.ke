@@ -131,7 +131,8 @@ def classify_relationship(
 
     temporal_signal = (stats_output.get("temporal_signal") or {}) if isinstance(stats_output, dict) else {}
     if temporal_signal.get("applicable") and (
-        temporal_signal.get("best_lag") not in {None, 0} or temporal_signal.get("timestamp_column")
+        temporal_signal.get("lag_direction") in {"x_precedes_y", "y_precedes_x"}
+        or temporal_signal.get("best_lag") not in {None, 0}
     ):
         relationship_type = "temporal"
         triggered_rules.append("temporal_signal")

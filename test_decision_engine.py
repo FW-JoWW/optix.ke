@@ -70,8 +70,50 @@ def test_strong_causal_strategic() -> None:
     print("CASE 3 OK:", top)
 
 
+def test_predictive_story_stays_investigative_but_usable() -> None:
+    story = {
+        "type": "predictive_model",
+        "insight": "predictive model for revenue is ready",
+        "column": "revenue",
+        "problem_type": "regression",
+        "confidence": "high",
+        "metrics": {"r2": 0.86, "mae": 15.2, "rmse": 21.1},
+        "top_drivers": [{"feature": "marketing_spend", "importance": 0.44}],
+        "readiness_warnings": [],
+    }
+    state = decision_engine_node(build_state([story]))
+    top = state["analysis_evidence"]["decision_priority_ranking"][0]
+    assert top["action_type"] == "investigation"
+    assert top["recommended_action"].lower().startswith("use the model")
+    assert top["confidence_in_action"] >= 60
+    print("CASE 4 OK:", top)
+
+
+def test_prescriptive_story_becomes_ranked_optimization() -> None:
+    story = {
+        "type": "prescriptive_action",
+        "insight": "best next action is reallocate budget",
+        "column": "revenue",
+        "confidence": "moderate",
+        "estimated_upside": 12000.0,
+        "recommended_actions": [
+            {"action": "Reallocate budget toward high-return channels."},
+            {"action": "Pilot the reallocation for one quarter."},
+        ],
+        "scenario_summary": [{"scenario": "increase marketing_spend by 5%", "estimated_effect": 8000.0}],
+    }
+    state = decision_engine_node(build_state([story]))
+    top = state["analysis_evidence"]["decision_priority_ranking"][0]
+    assert top["action_type"] == "optimization"
+    assert "reallocate budget" in top["recommended_action"].lower()
+    assert top["priority"]["priority_level"] in {"medium", "high", "critical"}
+    print("CASE 5 OK:", top)
+
+
 if __name__ == "__main__":
     test_unit_conversion_no_action()
     test_low_causal_experiment_cap()
     test_strong_causal_strategic()
+    test_predictive_story_stays_investigative_but_usable()
+    test_prescriptive_story_becomes_ranked_optimization()
     print("All decision engine tests passed.")

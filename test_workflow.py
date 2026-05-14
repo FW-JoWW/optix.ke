@@ -23,7 +23,7 @@ print("\n===== DATA ANALYST AGENT =====\n")
 question = input("Enter your business question:\n> ").strip()
 mode = input("\nChoose mode (autonomous / guided / collaborative):\n> ").strip().lower() or "autonomous"
 
-dataset_path = "data/Car Dataset 1945-2020.csv"#"data/olist_merged_dataset.csv"
+dataset_path = "data/olist_merged_dataset.csv"#"data/Car Dataset 1945-2020.csv"
 df = load_default_dataframe(dataset_path)
 
 runtime_info = get_openai_runtime_info()
@@ -115,6 +115,9 @@ pprint.pprint(evidence.get("decision_priority_ranking"))
 
 print("\n===== ALL DECISION RECORDS =====")
 pprint.pprint(evidence.get("decision_recommendations"))
+
+print("\n===== JUDGMENT SUMMARY =====")
+pprint.pprint(evidence.get("judgment_summary"))
 
 print("\n===== RECOMMENDED FIRST ACTION =====")
 pprint.pprint(evidence.get("decision_recommended_first"))

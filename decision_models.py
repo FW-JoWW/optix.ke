@@ -61,6 +61,7 @@ class AnalysisPlanModel(BaseModel):
         "comparison",
         "relationship",
         "distribution",
+        "predictive",
         "unknown",
     ]
     operations: List[AnalysisOperation] = Field(default_factory=list)

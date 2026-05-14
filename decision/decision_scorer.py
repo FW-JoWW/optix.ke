@@ -24,10 +24,13 @@ def score_decision(
     causal_score = int(((story.get("causal_evidence") or {}).get("score")) or 0)
     bias_count = len(story.get("bias_risks", []) or [])
     missing_ratio = float(validity.get("missing_ratio", 0.0) or 0.0)
+    story_type = story.get("type")
+    readiness_warnings = story.get("readiness_warnings", []) or []
 
     quality_score = 100
     quality_score -= min(bias_count * 12, 36)
     quality_score -= 20 if missing_ratio > 0.2 else 0
+    quality_score -= sum(15 if item.get("severity") == "high" else 8 for item in readiness_warnings)
     severity = validity.get("severity", "low")
     if severity == "high":
         quality_score -= 20
@@ -35,10 +38,17 @@ def score_decision(
         quality_score -= 10
     quality_score = max(0, quality_score)
 
-    priority_score = int(round((0.45 * impact_score) + (0.35 * causal_score) + (0.20 * quality_score)))
+    if story_type == "predictive_model":
+        confidence_adjusted = float(impact_assessment.get("confidence_adjusted_impact") or 0.0)
+        priority_score = int(round((0.55 * impact_score) + (0.45 * (confidence_adjusted * 100))))
+    elif story_type == "prescriptive_action":
+        confidence_adjusted = float(impact_assessment.get("confidence_adjusted_impact") or 0.0)
+        priority_score = int(round((0.5 * impact_score) + (0.3 * quality_score) + (0.2 * (confidence_adjusted * 100))))
+    else:
+        priority_score = int(round((0.45 * impact_score) + (0.35 * causal_score) + (0.20 * quality_score)))
 
     causal_grade = ((story.get("causal_evidence") or {}).get("grade")) or "LOW"
-    if causal_grade == "LOW":
+    if story_type not in {"predictive_model", "prescriptive_action"} and causal_grade == "LOW":
         priority_score = min(priority_score, 40)
 
     priority_score = max(0, min(priority_score, 100))

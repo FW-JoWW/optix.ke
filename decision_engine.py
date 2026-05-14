@@ -37,7 +37,11 @@ def _trace(reason: str, confidence: float, signals: List[str]) -> DecisionTrace:
 
 def _contains_any(text: str, words: List[str]) -> bool:
     text = (text or "").lower()
-    return any(word in text for word in words)
+    for word in words:
+        pattern = rf"(?<!\w){re.escape(word.lower())}(?!\w)"
+        if re.search(pattern, text):
+            return True
+    return False
 
 
 def _base_name(column: str) -> str:
@@ -110,17 +114,37 @@ def _family_candidates(
 
 
 def _determine_strategy(question: str, intent: Dict[str, Any]) -> str:
+    strategies = _determine_strategies(question, intent)
+    return strategies[0] if strategies else "unknown"
+
+
+def _determine_strategies(question: str, intent: Dict[str, Any]) -> List[str]:
     query = (question or "").lower()
-    analytic = str(intent.get("analytic_intent") or intent.get("type") or "").lower()
-    if analytic == "relationship" or _contains_any(query, ["relationship", "correlation", "regression", "cause", "causal", "drive"]):
-        return "relationship"
-    if analytic == "comparison" or _contains_any(query, ["compare", "difference", "affect", "impact", "effect"]):
-        return "comparison"
-    if analytic in {"composition", "distribution"} or _contains_any(query, ["distribution", "frequency", "mode", "cardinality", "rare"]):
-        return "distribution"
-    if analytic in {"profiling", "aggregation"} or _contains_any(query, ["average", "mean", "median", "summary", "statistics", "sum", "total"]):
-        return "aggregation"
-    return "unknown"
+    explicit = [
+        str(item).lower()
+        for item in (
+            intent.get("analytic_intents")
+            or [intent.get("analytic_intent") or intent.get("type")]
+        )
+        if item
+    ]
+    ordered: List[str] = []
+
+    def add(strategy: str) -> None:
+        if strategy and strategy not in ordered:
+            ordered.append(strategy)
+
+    if "predictive" in explicit or _contains_any(query, ["predict", "forecast", "estimate", "project", "likely", "risk", "what if", "optimize", "scenario"]):
+        add("predictive")
+    if "relationship" in explicit or _contains_any(query, ["relationship", "correlation", "regression", "cause", "causal", "drive"]):
+        add("relationship")
+    if "comparison" in explicit or _contains_any(query, ["compare", "difference", "affect", "impact", "effect"]):
+        add("comparison")
+    if any(item in {"composition", "distribution"} for item in explicit) or _contains_any(query, ["distribution", "frequency", "mode", "cardinality", "rare"]):
+        add("distribution")
+    if any(item in {"profiling", "aggregation", "temporal", "extremes"} for item in explicit) or _contains_any(query, ["average", "mean", "median", "summary", "statistics", "sum", "total"]):
+        add("aggregation")
+    return ordered or ["unknown"]
 
 
 def _aggregation_method(question: str, default: str = "mean") -> str:
@@ -146,6 +170,20 @@ def _select_group_columns(
     context: Dict[str, Any],
     strategy: str,
 ) -> List[str]:
+    strategy_columns = [
+        col for col in ((intent.get("intent_columns") or {}).get(strategy) or [])
+        if col in (profile.get("column_names") or []) and _categorical_capable(profile, context, col)
+    ]
+    if strategy_columns:
+        return strategy_columns
+
+    explicit_group_columns = [
+        col for col in (intent.get("group_by_columns") or [])
+        if col in (profile.get("column_names") or []) and _categorical_capable(profile, context, col)
+    ]
+    if explicit_group_columns:
+        return explicit_group_columns
+
     group_by = intent.get("group_by")
     if group_by in (profile.get("column_names") or []) and _categorical_capable(profile, context, group_by):
         return [group_by]
@@ -191,6 +229,23 @@ def _select_metric_columns(
     relationships: Dict[str, Any],
     strategy: str,
 ) -> List[str]:
+    strategy_columns = [
+        col for col in ((intent.get("intent_columns") or {}).get(strategy) or [])
+        if col in (profile.get("column_names") or []) and _numeric_capable(profile, context, col)
+    ]
+    if strategy_columns:
+        if strategy == "aggregation" and _contains_any(question, ["summary", "statistics", "describe"]):
+            return strategy_columns
+        if strategy in {"relationship", "comparison"}:
+            return strategy_columns
+
+    explicit_aggregate_columns = [
+        col for col in (intent.get("aggregate_columns") or [])
+        if col in (profile.get("column_names") or []) and _numeric_capable(profile, context, col)
+    ]
+    if strategy == "aggregation" and explicit_aggregate_columns and _contains_any(question, ["summary", "statistics", "describe"]):
+        return explicit_aggregate_columns
+
     aggregate_column = intent.get("aggregate_column")
     if aggregate_column in (profile.get("column_names") or []):
         family_candidates = _family_candidates(aggregate_column, profile, context)
@@ -199,8 +254,12 @@ def _select_metric_columns(
                 key=lambda col: _metric_score(profile, context, relationships, col),
                 reverse=True,
             )
+            if strategy == "aggregation" and explicit_aggregate_columns and family_candidates[0] in explicit_aggregate_columns:
+                return explicit_aggregate_columns
             return [family_candidates[0]]
         if _numeric_capable(profile, context, aggregate_column):
+            if strategy == "aggregation" and explicit_aggregate_columns:
+                return explicit_aggregate_columns
             return [aggregate_column]
 
     numeric_candidates = [col for col in selected_columns if _numeric_capable(profile, context, col)]
@@ -235,6 +294,11 @@ def _select_metric_columns(
         if explicit_numeric:
             return explicit_numeric
         return [item[0] for item in scored[:2]]
+
+    if strategy == "aggregation":
+        explicit_numeric = [col for col in selected_columns if col in [item[0] for item in scored]]
+        if _contains_any(question, ["summary", "statistics", "describe"]) and explicit_numeric:
+            return explicit_numeric
 
     return [scored[0][0]] if scored else []
 
@@ -379,29 +443,27 @@ def build_computation_plan(
     # 2. validate grouping/metric choices against structure and sparsity
     # 3. leave tool selection to the later analysis-plan stage
     question = user_intent.get("query", "")
-    strategy = _determine_strategy(question, user_intent)
-    group_columns = _select_group_columns(
-        question,
-        user_intent,
-        selected_columns,
-        dataset_profile,
-        inferred_context,
-        strategy,
-    )
-    metric_columns = _select_metric_columns(
-        question,
-        user_intent,
-        selected_columns,
-        dataset_profile,
-        inferred_context,
-        relationship_signals,
-        strategy,
-    )
+    strategies = _determine_strategies(question, user_intent)
+    primary_strategy = strategies[0] if strategies else "unknown"
     steps: List[ComputationStep] = []
     confidence = 0.75
     notes: List[str] = []
 
-    if strategy == "unknown":
+    seen_steps = set()
+
+    def add_step(step: ComputationStep) -> None:
+        key = (
+            step.operation,
+            step.column,
+            tuple(step.columns),
+            tuple(sorted((step.parameters or {}).items())),
+        )
+        if key in seen_steps:
+            return
+        seen_steps.add(key)
+        steps.append(step)
+
+    if primary_strategy == "unknown":
         return ComputationPlanModel(
             steps=[],
             confidence_score=0.25,
@@ -409,141 +471,203 @@ def build_computation_plan(
             deferred=True,
         )
 
-    for group_col in group_columns:
-        reason = f"Group by {group_col} because it is the best structural match for the requested breakdown."
-        steps.append(
+    if "predictive" in strategies:
+        target = user_intent.get("aggregate_column") or (selected_columns[-1] if selected_columns else None)
+        reason = f"Build a supervised or forecasting workflow around {target or 'the resolved target'} because the question is predictive or prescriptive."
+        add_step(
             ComputationStep(
-                operation="group_by",
-                column=group_col,
+                operation="predict_target",
+                column=target,
+                columns=selected_columns,
                 justification=reason,
-                trace=_trace(reason, 0.8, [f"role:{_role(inferred_context, group_col)}"]),
+                trace=_trace(reason, 0.72, ["predictive_intent"]),
             )
         )
+        return ComputationPlanModel(
+            steps=steps,
+            confidence_score=0.72,
+            justification="Built a predictive workflow plan before model selection, preserving deterministic readiness checks and validation.",
+            deferred=False,
+        )
 
-    if strategy == "aggregation":
-        agg_method = _aggregation_method(question, default=user_intent.get("aggregation") or "mean")
-        if not metric_columns:
-            confidence = 0.25
-            notes.append("No reliable metric column was found for aggregation.")
-        else:
-            metric = metric_columns[0]
-            group_col = group_columns[0] if group_columns else None
-            metric_role = _role(inferred_context, metric)
-            if group_col and agg_method == "mean" and metric_role == "derived_metric":
-                reason = f"Summarize {metric} within each {group_col} group before averaging because the metric behaves like a derived measure."
-                steps.append(
-                    ComputationStep(
-                        operation="aggregate",
-                        column=metric,
-                        parameters={"method": "sum", "within": group_col},
-                        justification=reason,
-                        trace=_trace(reason, 0.72, ["derived_metric", "grouped_average"]),
-                    )
+    all_group_columns: List[str] = []
+    all_metric_columns: List[str] = []
+
+    for strategy in strategies:
+        group_columns = _select_group_columns(
+            question,
+            user_intent,
+            selected_columns,
+            dataset_profile,
+            inferred_context,
+            strategy,
+        )
+        metric_columns = _select_metric_columns(
+            question,
+            user_intent,
+            selected_columns,
+            dataset_profile,
+            inferred_context,
+            relationship_signals,
+            strategy,
+        )
+        all_group_columns.extend(group_columns)
+        all_metric_columns.extend(metric_columns)
+
+        for group_col in group_columns:
+            reason = f"Group by {group_col} because it is the best structural match for the requested breakdown."
+            add_step(
+                ComputationStep(
+                    operation="group_by",
+                    column=group_col,
+                    parameters={"intent_type": strategy},
+                    justification=reason,
+                    trace=_trace(reason, 0.8, [f"role:{_role(inferred_context, group_col)}"]),
                 )
-                reason = f"Compute the mean across grouped {metric} totals to answer the requested average per group."
-                steps.append(
+            )
+
+        if strategy == "aggregation":
+            agg_method = _aggregation_method(question, default=user_intent.get("aggregation") or "mean")
+            if not metric_columns:
+                confidence = min(confidence, 0.25)
+                notes.append("No reliable metric column was found for aggregation.")
+            elif _contains_any(question, ["summary", "statistics", "describe"]):
+                for metric in metric_columns:
+                    reason = f"Summarize {metric} directly because the user asked for descriptive statistics rather than a single aggregate."
+                    add_step(
+                        ComputationStep(
+                            operation="summarize_metric",
+                            column=metric,
+                            parameters={"intent_type": strategy},
+                            justification=reason,
+                            trace=_trace(reason, 0.82, ["summary_statistics_intent"]),
+                        )
+                    )
+            else:
+                metric = metric_columns[0]
+                group_col = group_columns[0] if group_columns else None
+                metric_role = _role(inferred_context, metric)
+                if group_col and agg_method == "mean" and metric_role == "derived_metric":
+                    reason = f"Summarize {metric} within each {group_col} group before averaging because the metric behaves like a derived measure."
+                    add_step(
+                        ComputationStep(
+                            operation="aggregate",
+                            column=metric,
+                            parameters={"method": "sum", "within": group_col, "intent_type": strategy},
+                            justification=reason,
+                            trace=_trace(reason, 0.72, ["derived_metric", "grouped_average"]),
+                        )
+                    )
+                    reason = f"Compute the mean across grouped {metric} totals to answer the requested average per group."
+                    add_step(
+                        ComputationStep(
+                            operation="aggregate",
+                            column=metric,
+                            parameters={"method": "mean", "scope": "group_results", "intent_type": strategy},
+                            justification=reason,
+                            trace=_trace(reason, 0.72, ["aggregation_mapping"]),
+                        )
+                    )
+                else:
+                    reason = f"Apply {agg_method} to {metric} because this directly answers the requested aggregation."
+                    add_step(
+                        ComputationStep(
+                            operation="aggregate",
+                            column=metric,
+                            parameters={"method": agg_method, "within": group_col, "intent_type": strategy} if group_col else {"method": agg_method, "intent_type": strategy},
+                            justification=reason,
+                            trace=_trace(reason, 0.8, ["intent_to_computation"]),
+                        )
+                    )
+
+        elif strategy == "comparison":
+            if metric_columns and group_columns:
+                for metric in metric_columns:
+                    for group_col in group_columns:
+                        reason = f"Compare grouped values of {metric} across {group_col} before considering any inferential method."
+                        add_step(
+                            ComputationStep(
+                                operation="group_compare",
+                                column=metric,
+                                columns=[metric, group_col],
+                                parameters={"group_by": group_col, "aggregate": _aggregation_method(question, "mean"), "intent_type": strategy},
+                                justification=reason,
+                                trace=_trace(reason, 0.78, ["comparison_intent", "structure_first"]),
+                            )
+                        )
+            else:
+                confidence = min(confidence, 0.3)
+                notes.append("Comparison requested but the engine could not resolve both a grouping column and a metric column.")
+
+        elif strategy == "relationship":
+            if len(metric_columns) >= 2:
+                for idx, left in enumerate(metric_columns):
+                    for right in metric_columns[idx + 1:]:
+                        reason = f"Evaluate the relationship between {left} and {right} because both are valid metric columns for the requested relationship analysis."
+                        add_step(
+                            ComputationStep(
+                                operation="pairwise_relationship",
+                                columns=[left, right],
+                                parameters={"intent_type": strategy},
+                                justification=reason,
+                                trace=_trace(reason, 0.78, ["relationship_intent"]),
+                            )
+                        )
+            elif metric_columns and group_columns:
+                for metric in metric_columns:
+                    for group_col in group_columns:
+                        reason = f"The resolved structure indicates a metric-to-group relationship between {metric} and {group_col}, so grouped comparison is the minimal valid computation."
+                        add_step(
+                            ComputationStep(
+                                operation="group_compare",
+                                columns=[metric, group_col],
+                                parameters={"group_by": group_col, "aggregate": "mean", "intent_type": strategy},
+                                justification=reason,
+                                trace=_trace(reason, 0.68, ["relationship_intent", "mixed_input_types"]),
+                            )
+                        )
+            elif len(group_columns) >= 2:
+                for idx, left in enumerate(group_columns):
+                    for right in group_columns[idx + 1:]:
+                        reason = f"The resolved structure indicates a categorical association question between {left} and {right}, so association testing is the minimal valid computation."
+                        add_step(
+                            ComputationStep(
+                                operation="categorical_association",
+                                columns=[left, right],
+                                parameters={"intent_type": strategy},
+                                justification=reason,
+                                trace=_trace(reason, 0.72, ["relationship_intent", "categorical_inputs"]),
+                            )
+                        )
+            else:
+                confidence = min(confidence, 0.3)
+                notes.append("Relationship analysis requested but the engine could not resolve structurally valid variables.")
+
+        elif strategy == "distribution":
+            target = group_columns[0] if group_columns else (metric_columns[0] if metric_columns else None)
+            if target:
+                op = "frequency_distribution" if _categorical_capable(dataset_profile, inferred_context, target) else "numeric_distribution"
+                reason = f"Compute the distribution of {target} because that directly answers the descriptive question."
+                add_step(
                     ComputationStep(
-                        operation="aggregate",
-                        column=metric,
-                        parameters={"method": "mean", "scope": "group_results"},
+                        operation=op,
+                        column=target,
+                        parameters={"intent_type": strategy},
                         justification=reason,
-                        trace=_trace(reason, 0.72, ["aggregation_mapping"]),
+                        trace=_trace(reason, 0.8, ["distribution_intent"]),
                     )
                 )
             else:
-                reason = f"Apply {agg_method} to {metric} because this directly answers the requested aggregation."
-                steps.append(
-                    ComputationStep(
-                        operation="aggregate",
-                        column=metric,
-                        parameters={"method": agg_method, "within": group_col} if group_col else {"method": agg_method},
-                        justification=reason,
-                        trace=_trace(reason, 0.8, ["intent_to_computation"]),
-                    )
-                )
+                confidence = min(confidence, 0.3)
+                notes.append("Distribution analysis requested but the engine could not resolve a valid target column.")
 
-    elif strategy == "comparison":
-        if metric_columns and group_columns:
-            metric = metric_columns[0]
-            group_col = group_columns[0]
-            reason = f"Compare grouped values of {metric} across {group_col} before considering any inferential method."
-            steps.append(
-                ComputationStep(
-                    operation="group_compare",
-                    column=metric,
-                    columns=[metric, group_col],
-                    parameters={"group_by": group_col, "aggregate": _aggregation_method(question, "mean")},
-                    justification=reason,
-                    trace=_trace(reason, 0.78, ["comparison_intent", "structure_first"]),
-                )
-            )
-        else:
-            confidence = 0.3
-            notes.append("Comparison requested but the engine could not resolve both a grouping column and a metric column.")
+    deduped_group_columns = list(dict.fromkeys(all_group_columns))
+    deduped_metric_columns = list(dict.fromkeys(all_metric_columns))
 
-    elif strategy == "relationship":
-        if len(metric_columns) >= 2:
-            for idx, left in enumerate(metric_columns):
-                for right in metric_columns[idx + 1:]:
-                    reason = f"Evaluate the relationship between {left} and {right} because both are valid metric columns for the requested relationship analysis."
-                    steps.append(
-                        ComputationStep(
-                            operation="pairwise_relationship",
-                            columns=[left, right],
-                            justification=reason,
-                            trace=_trace(reason, 0.78, ["relationship_intent"]),
-                        )
-                    )
-        elif metric_columns and group_columns:
-            for metric in metric_columns:
-                for group_col in group_columns:
-                    reason = f"The resolved structure indicates a metric-to-group relationship between {metric} and {group_col}, so grouped comparison is the minimal valid computation."
-                    steps.append(
-                        ComputationStep(
-                            operation="group_compare",
-                            columns=[metric, group_col],
-                            parameters={"group_by": group_col, "aggregate": "mean"},
-                            justification=reason,
-                            trace=_trace(reason, 0.68, ["relationship_intent", "mixed_input_types"]),
-                        )
-                    )
-        elif len(group_columns) >= 2:
-            for idx, left in enumerate(group_columns):
-                for right in group_columns[idx + 1:]:
-                    reason = f"The resolved structure indicates a categorical association question between {left} and {right}, so association testing is the minimal valid computation."
-                    steps.append(
-                        ComputationStep(
-                            operation="categorical_association",
-                            columns=[left, right],
-                            justification=reason,
-                            trace=_trace(reason, 0.72, ["relationship_intent", "categorical_inputs"]),
-                        )
-                    )
-        else:
-            confidence = 0.3
-            notes.append("Relationship analysis requested but the engine could not resolve structurally valid variables.")
-
-    elif strategy == "distribution":
-        target = group_columns[0] if group_columns else (metric_columns[0] if metric_columns else None)
-        if target:
-            op = "frequency_distribution" if _categorical_capable(dataset_profile, inferred_context, target) else "numeric_distribution"
-            reason = f"Compute the distribution of {target} because that directly answers the descriptive question."
-            steps.append(
-                ComputationStep(
-                    operation=op,
-                    column=target,
-                    justification=reason,
-                    trace=_trace(reason, 0.8, ["distribution_intent"]),
-                )
-            )
-        else:
-            confidence = 0.3
-            notes.append("Distribution analysis requested but the engine could not resolve a valid target column.")
-
-    if group_columns and _info(dataset_profile, group_columns[0]).get("unique_count", 0) < 2:
+    if deduped_group_columns and _info(dataset_profile, deduped_group_columns[0]).get("unique_count", 0) < 2:
         confidence -= 0.3
         notes.append("Grouping column does not contain enough distinct values.")
-    if metric_columns and _info(dataset_profile, metric_columns[0]).get("missing_ratio", 0.0) > 0.8:
+    if deduped_metric_columns and _info(dataset_profile, deduped_metric_columns[0]).get("missing_ratio", 0.0) > 0.8:
         confidence -= 0.3
         notes.append("Metric column is too sparse for reliable computation.")
     if structural_signals.get("primary_structure_confidence", 1.0) < 0.45:
@@ -553,6 +677,8 @@ def build_computation_plan(
     confidence = _bounded_confidence(confidence)
     deferred = confidence < 0.45 or not steps
     justification = "Built the computation plan before tool selection using resolved grouping columns, metric columns, and structural validity checks."
+    if len(strategies) > 1:
+        justification += f" Combined analytical intents were preserved: {', '.join(strategies)}."
     if notes:
         justification += " " + " ".join(notes)
 
@@ -577,7 +703,8 @@ def build_analysis_plan(
     # Tool selection is intentionally last. If the computation plan already
     # answers the question deterministically, we keep the plan simple and avoid
     # inferential tests.
-    strategy = _determine_strategy(user_intent.get("query", ""), user_intent)
+    strategies = _determine_strategies(user_intent.get("query", ""), user_intent)
+    strategy = strategies[0] if strategies else "unknown"
     confidence = computation_plan.confidence_score
 
     if computation_plan.deferred:
@@ -591,110 +718,131 @@ def build_analysis_plan(
 
     operations: List[AnalysisOperation] = []
     notes: List[str] = []
+    computation_dump = [item.model_dump() for item in computation_plan.steps]
 
-    if strategy in {"aggregation", "distribution"}:
+    summarize_steps = [step for step in computation_plan.steps if step.operation == "summarize_metric" and step.column]
+    if summarize_steps:
+        columns = list(dict.fromkeys([step.column for step in summarize_steps if step.column]))
+        reason = "Summary statistics are the direct deterministic answer for a descriptive multi-metric request."
+        operations.append(
+            AnalysisOperation(
+                tool="summary_statistics",
+                columns=columns,
+                computation_refs=[step.operation for step in summarize_steps],
+                parameters={},
+                justification=reason,
+                trace=_trace(reason, confidence, ["computation_first", "summary_statistics_intent"]),
+            )
+        )
+
+    direct_steps = [
+        step for step in computation_plan.steps
+        if step.operation in {"aggregate", "frequency_distribution", "numeric_distribution"}
+    ]
+    if direct_steps:
         columns = []
         refs = []
-        for step in computation_plan.steps:
+        for step in direct_steps:
             refs.append(step.operation)
             if step.column:
                 columns.append(step.column)
             columns.extend(step.columns)
         columns = list(dict.fromkeys([col for col in columns if col]))
-        reason = "Direct deterministic computation is sufficient and preferable to statistical testing for this request."
+        reason = "Direct deterministic computation is sufficient and preferable to statistical testing for this part of the request."
         operations.append(
             AnalysisOperation(
                 tool="direct_computation",
                 columns=columns,
                 computation_refs=refs,
-                parameters={"computation_plan": [step.model_dump() for step in computation_plan.steps], "strategy": strategy},
+                parameters={"computation_plan": [step.model_dump() for step in direct_steps], "strategy": strategy},
                 justification=reason,
                 trace=_trace(reason, confidence, ["computation_first", "no_inferential_test_needed"]),
             )
         )
+
+    if strategy == "predictive":
+        preserved_operations: List[AnalysisOperation] = []
+        for item in candidate_plan:
+            tool = item.get("tool")
+            if tool not in {"predictive_analysis", "prescriptive_analysis"}:
+                continue
+            columns = item.get("columns", []) or selected_columns
+            reason = "Predictive and prescriptive workflows are handled by the dedicated deterministic modeling engines after readiness validation."
+            preserved_operations.append(
+                AnalysisOperation(
+                    tool=tool,
+                    columns=columns,
+                    computation_refs=[step.operation for step in computation_plan.steps],
+                    parameters=item.get("parameters", {}),
+                    justification=reason,
+                    trace=_trace(reason, confidence, ["predictive_intent", "deterministic_modeling"]),
+                )
+            )
         return AnalysisPlanModel(
             analytical_strategy=strategy,
-            operations=operations,
+            operations=preserved_operations,
             confidence_score=confidence,
-            justification="Selected direct computation because the requested answer is an aggregation or distribution, not an inferential test.",
+            justification="Preserved predictive and prescriptive operations for dedicated modeling execution.",
+            deferred=not preserved_operations,
         )
 
-    if strategy == "comparison":
-        step = next((item for item in computation_plan.steps if item.operation == "group_compare"), None)
-        if step is not None:
+    for step in computation_plan.steps:
+        if step.operation == "pairwise_relationship":
+            reason = "The resolved computation requires measuring the relationship between numeric-capable variables."
+            operations.append(
+                AnalysisOperation(
+                    tool="correlation",
+                    columns=step.columns[:2],
+                    computation_refs=[step.operation],
+                    parameters={"computation_plan": computation_dump, "strategy": strategy},
+                    justification=reason,
+                    trace=_trace(reason, confidence, ["relationship_intent"]),
+                )
+            )
+        elif step.operation == "group_compare":
             metric = step.column or (step.columns[0] if step.columns else None)
             group_col = step.parameters.get("group_by") or (step.columns[-1] if step.columns else None)
             if metric and group_col:
                 unique_count = _info(dataset_profile, group_col).get("unique_count", 0)
+                intent_type = step.parameters.get("intent_type")
                 explicit_inference = _contains_any(user_intent.get("query", ""), ["affect", "effect", "significant", "difference between groups", "independent"])
-                if explicit_inference:
-                    tool = "ttest" if unique_count == 2 else "anova"
-                    reason = "Inferential language in the question justifies a group-comparison test after grouped computation planning."
-                else:
+                if intent_type == "comparison" and not explicit_inference:
                     tool = "direct_computation"
                     reason = "The question asks for comparison, so grouped aggregation is the minimal valid answer and inferential testing is unnecessary."
+                else:
+                    tool = "ttest" if unique_count == 2 else "anova"
+                    reason = "The resolved structure is a metric-to-group relationship, so grouped comparison testing is the valid final step."
                 operations.append(
                     AnalysisOperation(
                         tool=tool,
                         columns=[metric, group_col],
                         computation_refs=[step.operation],
-                        parameters={"computation_plan": [item.model_dump() for item in computation_plan.steps], "strategy": strategy},
+                        parameters={"computation_plan": computation_dump, "strategy": strategy},
                         justification=reason,
                         trace=_trace(reason, confidence, ["comparison_intent", "analysis_validity"]),
                     )
                 )
             else:
                 confidence = _bounded_confidence(confidence - 0.25)
-
-    elif strategy == "relationship":
-        computation_dump = [item.model_dump() for item in computation_plan.steps]
-        for step in computation_plan.steps:
-            if step.operation == "pairwise_relationship":
-                reason = "The resolved computation requires measuring the relationship between numeric-capable variables."
-                operations.append(
-                    AnalysisOperation(
-                        tool="correlation",
-                        columns=step.columns[:2],
-                        computation_refs=[step.operation],
-                        parameters={"computation_plan": computation_dump, "strategy": strategy},
-                        justification=reason,
-                        trace=_trace(reason, confidence, ["relationship_intent"]),
-                    )
+        elif step.operation == "categorical_association":
+            reason = "The resolved structure is categorical-versus-categorical, so a chi-square test of independence is the valid final step."
+            operations.append(
+                AnalysisOperation(
+                    tool="chi_square",
+                    columns=step.columns[:2],
+                    computation_refs=[step.operation],
+                    parameters={"computation_plan": computation_dump, "strategy": strategy},
+                    justification=reason,
+                    trace=_trace(reason, confidence, ["relationship_intent", "categorical_inputs"]),
                 )
-            elif step.operation == "group_compare":
-                metric = step.columns[0] if step.columns else None
-                group_col = step.parameters.get("group_by") or (step.columns[-1] if step.columns else None)
-                if metric and group_col:
-                    unique_count = _info(dataset_profile, group_col).get("unique_count", 0)
-                    tool = "ttest" if unique_count == 2 else "anova"
-                    reason = "The resolved structure is a metric-to-group relationship, so grouped comparison testing is the valid final step."
-                    operations.append(
-                        AnalysisOperation(
-                            tool=tool,
-                            columns=[metric, group_col],
-                            computation_refs=[step.operation],
-                            parameters={"computation_plan": computation_dump, "strategy": strategy},
-                            justification=reason,
-                            trace=_trace(reason, confidence, ["relationship_intent", "mixed_input_types"]),
-                        )
-                    )
-            elif step.operation == "categorical_association":
-                reason = "The resolved structure is categorical-versus-categorical, so a chi-square test of independence is the valid final step."
-                operations.append(
-                    AnalysisOperation(
-                        tool="chi_square",
-                        columns=step.columns[:2],
-                        computation_refs=[step.operation],
-                        parameters={"computation_plan": computation_dump, "strategy": strategy},
-                        justification=reason,
-                        trace=_trace(reason, confidence, ["relationship_intent", "categorical_inputs"]),
-                    )
-                )
+            )
 
     if not operations:
         notes.append("No valid tool could be selected after computation-first validation.")
 
     justification = "Selected tools only after validating the required computation plan and checking structural validity."
+    if len(strategies) > 1:
+        justification += f" Preserved multiple analytical intents in one coordinated plan: {', '.join(strategies)}."
     if notes:
         justification += " " + " ".join(notes)
     if structural_signals.get("signals"):

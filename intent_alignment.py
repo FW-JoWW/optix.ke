@@ -18,11 +18,15 @@ def validate_analysis_plan_against_intent(
     if any(word in question for word in ["outlier", "anomaly", "unusual"]):
         allowed_tools.add("detect_outliers")
     if any(word in question for word in ["relationship", "correlation", "cause", "causal", "drive"]):
-        allowed_tools.add("correlation")
+        allowed_tools.update({"correlation", "chi_square", "ttest", "anova"})
     if any(word in question for word in ["compare", "difference", "affect", "impact", "effect"]):
-        allowed_tools.update({"ttest", "anova"})
+        allowed_tools.update({"ttest", "anova", "direct_computation"})
     if any(word in question for word in ["distribution", "frequency", "cardinality", "rare", "mode", "category"]):
         allowed_tools.add("categorical_analysis")
+    if any(word in question for word in ["predict", "forecast", "estimate", "project", "likely", "risk", "score"]):
+        allowed_tools.add("predictive_analysis")
+    if any(word in question for word in ["optimize", "optimization", "recommend", "allocate", "allocation", "what if", "scenario", "reorder", "capacity", "pricing"]):
+        allowed_tools.update({"predictive_analysis", "prescriptive_analysis"})
 
     if not allowed_tools:
         allowed_tools = {item.get("tool") for item in plan}
@@ -31,13 +35,16 @@ def validate_analysis_plan_against_intent(
     seen = set()
     for item in plan:
         tool = item.get("tool")
-        columns = [col for col in item.get("columns", []) if not selected_set or col in selected_set]
+        if tool in {"predictive_analysis", "prescriptive_analysis"}:
+            columns = item.get("columns", [])
+        else:
+            columns = [col for col in item.get("columns", []) if not selected_set or col in selected_set]
         if tool not in allowed_tools or not columns:
             continue
         key = (tool, tuple(columns))
         if key in seen:
             continue
         seen.add(key)
-        validated.append({"tool": tool, "columns": columns})
+        validated.append({"tool": tool, "columns": columns, "parameters": item.get("parameters", {})})
 
     return validated

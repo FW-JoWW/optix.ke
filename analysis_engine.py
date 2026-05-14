@@ -6,6 +6,8 @@ import math
 import pandas as pd
 
 from inferential_engine import run_inferential_analysis
+from predictive.predictive_engine import run_predictive_analysis
+from prescriptive.prescriptive_engine import run_prescriptive_analysis
 from tools.anova_tool import anova_tool
 from tools.categorical_analysis_tool import categorical_analysis_tool
 from tools.correlation_tool import correlation_tool
@@ -25,6 +27,8 @@ TOOL_MAPPING = {
     "regression": regression_tool,
     "anova": anova_tool,
     "categorical_analysis": categorical_analysis_tool,
+    "predictive_analysis": None,
+    "prescriptive_analysis": None,
 }
 
 
@@ -68,11 +72,38 @@ def _contains_invalid_number(value: Any) -> bool:
     return False
 
 
+def _sanitize_numbers(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _sanitize_numbers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_numbers(item) for item in value]
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    return value
+
+
+def _inferential_result_is_invalid(result: Dict[str, Any]) -> bool:
+    if result.get("error"):
+        return True
+    method = result.get("method_selected")
+    if not method:
+        return True
+    hypothesis = result.get("hypothesis_test", {}) or {}
+    effect_size = result.get("effect_size", {}) or {}
+    if hypothesis.get("p_value") is None and hypothesis.get("test_statistic") is None:
+        return True
+    if effect_size and effect_size.get("metric") and effect_size.get("value") is None and hypothesis.get("p_value") is None:
+        return True
+    return False
+
+
 def _result_is_invalid(result: Any) -> bool:
     if result is None:
         return True
     if isinstance(result, dict) and result.get("error"):
         return True
+    if isinstance(result, dict) and result.get("tool") == "inferential_analysis":
+        return _inferential_result_is_invalid(result)
     return _contains_invalid_number(result)
 
 
@@ -81,6 +112,8 @@ def _fallback_result(
     original_tool: str,
     columns: List[str],
 ) -> Dict[str, Any] | None:
+    if original_tool in {"predictive_analysis", "prescriptive_analysis"}:
+        return None
     numeric_columns = [col for col in columns if pd.api.types.is_numeric_dtype(_coerce_numeric_like(df[col]))]
     if not numeric_columns:
         return None
@@ -199,7 +232,7 @@ def execute_analysis_plan(
         tool_name = task["tool"]
         columns = task.get("columns", [])
         tool_func = TOOL_MAPPING.get(tool_name)
-        if tool_name not in {"direct_computation", "chi_square"} and tool_func is None:
+        if tool_name not in {"direct_computation", "chi_square", "predictive_analysis", "prescriptive_analysis"} and tool_func is None:
             continue
         if any(col not in df.columns for col in columns):
             continue
@@ -208,6 +241,22 @@ def execute_analysis_plan(
         try:
             if tool_name == "direct_computation":
                 result = _run_direct_computation(prepared_df, task)
+            elif tool_name == "predictive_analysis":
+                result = run_predictive_analysis(prepared_df, task, state_context=state_context)
+            elif tool_name == "prescriptive_analysis":
+                predictive_context = state_context.get("analysis_evidence", {}).get("predictive_result")
+                if predictive_context is None:
+                    predictive_context = next(
+                        (
+                            value for value in results.values()
+                            if isinstance(value, dict) and value.get("tool") == "predictive_analysis"
+                        ),
+                        None,
+                    )
+                result = run_prescriptive_analysis(
+                    predictive_result=predictive_context or {"error": "No predictive result found."},
+                    question=state_context.get("business_question", ""),
+                )
             elif tool_name in {"ttest", "anova", "correlation", "chi_square"}:
                 result = run_inferential_analysis(prepared_df, task, state_context=state_context)
             elif tool_name in {"detect_outliers", "summary_statistics"}:
@@ -221,6 +270,8 @@ def execute_analysis_plan(
         except Exception as exc:
             result = {"tool": tool_name, "error": str(exc)}
 
+        result = _sanitize_numbers(result)
+
         if _result_is_invalid(result):
             fallback = _fallback_result(prepared_df, tool_name, columns)
             if fallback is not None and not _result_is_invalid(fallback):
@@ -228,6 +279,8 @@ def execute_analysis_plan(
 
         if result is not None and isinstance(result, dict) and "tool" not in result:
             result["tool"] = tool_name
+        if isinstance(result, dict) and result.get("tool") == "predictive_analysis":
+            state_context.setdefault("analysis_evidence", {})["predictive_result"] = result
         key = f"{tool_name}_{'_'.join(columns)}" if columns else tool_name
         results[key] = result
 

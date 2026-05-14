@@ -184,6 +184,19 @@ def _fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
         )
         implication = f"This gives a baseline operating range for {column} that can anchor planning and anomaly checks."
         action = f"Use the typical range of {column} to set benchmarks, thresholds, or target bands."
+    elif story_type == "predictive_model":
+        target = story.get("column", "target")
+        model_name = story.get("model_name", "model")
+        problem_type = story.get("problem_type", "prediction")
+        explanation = f"The system can now use {model_name} to produce {problem_type} estimates for {target}."
+        implication = f"This enables forward-looking planning for {target} rather than only descriptive reporting."
+        action = f"Operationalize the {target} model in planning workflows and track its predictive quality over time."
+    elif story_type == "prescriptive_action":
+        target = story.get("column", "target")
+        upside = story.get("estimated_upside")
+        explanation = f"The prescriptive engine translated the model output for {target} into a concrete next-best action."
+        implication = "This helps the business move from prediction to operational decision-making."
+        action = f"Pilot the top recommendation first{'' if upside is None else f'; estimated upside is about {round(float(upside), 4)}'}."
 
     return {
         "related_story_signature": _story_signature(story),

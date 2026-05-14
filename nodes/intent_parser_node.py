@@ -40,6 +40,17 @@ def _dedupe_preserve_order(values):
             seen.add(value)
     return ordered
 
+
+def _combine_analytic_intents(primary_intent, detected_intents):
+    ordered = []
+    if primary_intent and primary_intent != "unknown":
+        ordered.append(primary_intent)
+    for item in detected_intents or []:
+        intent_type = item.get("type")
+        if intent_type and intent_type != "unknown" and intent_type not in ordered:
+            ordered.append(intent_type)
+    return ordered
+
 def extract_mentioned_columns(query: str, columns: list[str]):
     normalized_query = normalize(query)
     mentioned = []
@@ -47,6 +58,26 @@ def extract_mentioned_columns(query: str, columns: list[str]):
         if normalize(col) in normalized_query:
             mentioned.append(col)
     return mentioned
+
+
+def extract_columns_from_intent_clause(query: str, columns: list[str], keywords: list[str]):
+    lowered = query.lower()
+    match_positions = []
+    for keyword in keywords:
+        match = re.search(rf"(?<!\w){re.escape(keyword.lower())}(?!\w)", lowered)
+        if match:
+            match_positions.append(match.start())
+    if not match_positions:
+        return []
+
+    start = min(match_positions)
+    boundary_pattern = r"\band\b\s+(summary|statistics|average|mean|median|relationship|correlation|compare|difference|distribution|frequency|predict|forecast|outlier|outliers|trend|breakdown)\b"
+    boundary_match = re.search(boundary_pattern, lowered[start + 1 :], flags=re.IGNORECASE)
+    end = len(query)
+    if boundary_match:
+        end = start + 1 + boundary_match.start()
+    clause = query[start:end]
+    return extract_mentioned_columns(clause, columns)
 
 def get_numeric_columns(df):
     if df is None:
@@ -739,7 +770,7 @@ def detect_intents(query: str):
     intents = []
 
     # --- COMPARISON ---
-    if any(word in query for word in ["compare", "vs", "versus", "difference", "between", "affect"]):
+    if any(word in query for word in ["compare", "vs", "versus", "difference", "affect"]):
         intents.append({"type": "comparison", "confidence": 0.8})
 
     # --- TEMPORAL ---
@@ -897,13 +928,17 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     intent = {
         "type": "ast",
         "analytic_intent": analytic_intent,
+        "analytic_intents": [],
+        "intent_columns": {},
         "ast": ast,
         "filters": filters,
         "has_filters": bool(filters),
         "wants_analysis": _has_analysis_request(analytic_intent, query),
         "group_by": None,
+        "group_by_columns": [],
         "aggregation": None,
         "aggregate_column": None,
+        "aggregate_columns": [],
 
         "intents": [],
         "operations_hint": [],
@@ -931,10 +966,12 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
                 intent["aggregation"] = agg_type
                 if mentioned_numeric:
                     intent["aggregate_column"] = mentioned_numeric[0]
+                    intent["aggregate_columns"] = mentioned_numeric
                 else:
                     for col in numeric_columns:
                         if normalize(col) in normalize(query):
                             intent["aggregate_column"] = col
+                            intent["aggregate_columns"] = [col]
                             break
                 break
 
@@ -945,15 +982,19 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
                 intent["aggregation"] = "mean"
                 if mentioned_numeric:
                     intent["aggregate_column"] = mentioned_numeric[0]
+                    intent["aggregate_columns"] = mentioned_numeric
                 elif numeric_columns:
                     intent["aggregate_column"] = numeric_columns[0]
+                    intent["aggregate_columns"] = [numeric_columns[0]]
             elif intent_type == "temporal":
                 # For trends, default to sum over time
                 intent["aggregation"] = "sum"
                 if mentioned_numeric:
                     intent["aggregate_column"] = mentioned_numeric[0]
+                    intent["aggregate_columns"] = mentioned_numeric
                 elif numeric_columns:
                     intent["aggregate_column"] = numeric_columns[0]
+                    intent["aggregate_columns"] = [numeric_columns[0]]
 
     # ------------------------
     # GROUP BY )
@@ -963,10 +1004,12 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
         categorical_columns = state.get("dataset_profile", {}).get("categorical_columns", [])
         if mentioned_categorical:
             intent["group_by"] = mentioned_categorical[0]
+            intent["group_by_columns"] = mentioned_categorical
         else:
             for col in categorical_columns:
                 if normalize(col) in normalize(query):
                     intent["group_by"] = col
+                    intent["group_by_columns"] = [col]
                     break
 
         # If no group_by detected, infer from analytic intent
@@ -974,6 +1017,7 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
             if intent_type in ["comparison", "composition"]:
                 if categorical_columns:
                     intent["group_by"] = categorical_columns[0]
+                    intent["group_by_columns"] = [categorical_columns[0]]
     
     '''# --- ENSURE NEGATION APPLIED TO FILTERS ---
     if filters:
@@ -1004,6 +1048,31 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     # ------------------------
     detected_intents = detect_intents(query)
     state["intent"]["intents"] = detected_intents
+    state["intent"]["analytic_intents"] = _combine_analytic_intents(analytic_intent, detected_intents)
+    if df is not None:
+        all_columns = list(df.columns)
+        state["intent"]["intent_columns"] = {
+            "aggregation": extract_columns_from_intent_clause(
+                query,
+                all_columns,
+                ["summary", "statistics", "average", "mean", "median", "total", "sum"],
+            ),
+            "relationship": extract_columns_from_intent_clause(
+                query,
+                all_columns,
+                ["relationship", "correlation", "cause", "causal", "drive"],
+            ),
+            "comparison": extract_columns_from_intent_clause(
+                query,
+                all_columns,
+                ["compare", "difference", "affect", "impact", "effect"],
+            ),
+            "distribution": extract_columns_from_intent_clause(
+                query,
+                all_columns,
+                ["distribution", "frequency", "mode", "cardinality", "rare"],
+            ),
+        }
     if selected_columns:
         state["selected_columns"] = selected_columns
 
@@ -1023,6 +1092,9 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
             llm_group_by = reasoning.get("group_by", []) or []
             if llm_group_by and not state["intent"].get("group_by"):
                 state["intent"]["group_by"] = llm_group_by[0]
+            merged_group_columns = _dedupe_preserve_order((state["intent"].get("group_by_columns") or []) + llm_group_by)
+            if merged_group_columns:
+                state["intent"]["group_by_columns"] = merged_group_columns
 
             llm_aggregation = reasoning.get("aggregation", {}) or {}
             llm_agg_type = llm_aggregation.get("type")
@@ -1031,6 +1103,11 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
                 state["intent"]["aggregation"] = llm_agg_type
             if llm_agg_target and not state["intent"].get("aggregate_column"):
                 state["intent"]["aggregate_column"] = llm_agg_target
+            merged_aggregate_columns = _dedupe_preserve_order(
+                (state["intent"].get("aggregate_columns") or []) + ([llm_agg_target] if llm_agg_target else [])
+            )
+            if merged_aggregate_columns:
+                state["intent"]["aggregate_columns"] = merged_aggregate_columns
 
             llm_columns = [
                 c.get("field")
@@ -1063,8 +1140,12 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     final_selected_columns = state["intent"].get("selected_columns") or selected_columns
     if state["intent"].get("group_by"):
         final_selected_columns = _dedupe_preserve_order(final_selected_columns + [state["intent"]["group_by"]])
+    if state["intent"].get("group_by_columns"):
+        final_selected_columns = _dedupe_preserve_order(final_selected_columns + state["intent"]["group_by_columns"])
     if state["intent"].get("aggregate_column"):
         final_selected_columns = _dedupe_preserve_order(final_selected_columns + [state["intent"]["aggregate_column"]])
+    if state["intent"].get("aggregate_columns"):
+        final_selected_columns = _dedupe_preserve_order(final_selected_columns + state["intent"]["aggregate_columns"])
     if final_selected_columns:
         state["intent"]["selected_columns"] = final_selected_columns
         state["selected_columns"] = final_selected_columns

@@ -83,6 +83,20 @@ def fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
         )
         implication = f"These categories should be analyzed jointly because treating them as independent could distort conclusions, and the practical association looks {effect}."
         action = f"Report and monitor {columns[0]} together with {columns[1]} instead of summarizing them separately."
+    elif story_type == "predictive_model":
+        target = story.get("column", "target")
+        model_name = story.get("model_name", "model")
+        problem_type = story.get("problem_type", "prediction")
+        metrics = story.get("metrics", {}) or {}
+        explanation = f"A {problem_type} model for {target} was successfully trained, with {model_name} performing best."
+        implication = f"This means the system can now estimate future or unknown values for {target} in a repeatable way."
+        action = f"Use the model for decision support around {target}, but monitor quality metrics like {', '.join(metrics.keys()) if metrics else 'model performance'}."
+    elif story_type == "prescriptive_action":
+        target = story.get("column", "target")
+        upside = story.get("estimated_upside")
+        explanation = f"The prescriptive engine identified a next-best action for improving or protecting {target}."
+        implication = "This translates model output into a concrete operational decision instead of stopping at prediction."
+        action = f"Start with the top recommended action and measure observed change{'' if upside is None else f'; estimated upside is about {round(float(upside), 4)}'}."
 
     return {
         "related_story_signature": _story_signature(story),

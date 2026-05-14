@@ -46,6 +46,11 @@ def detect_confounders(
             x_strength = _strength_numeric(df[column], df[x_col])
             y_strength = _strength_numeric(df[column], df[y_col])
         elif column in categorical_columns:
+            non_null = int(df[column].notna().sum())
+            unique_count = int(df[column].dropna().nunique())
+            unique_ratio = float(unique_count / max(non_null, 1)) if non_null else 0.0
+            if unique_count > 25 or unique_ratio > 0.2:
+                continue
             x_strength = _strength_categorical(df[column], df[x_col])
             y_strength = _strength_categorical(df[column], df[y_col])
         else:

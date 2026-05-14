@@ -39,11 +39,23 @@ def sanitize_causal_language(text: str, causal_grade: str) -> str:
 
 def numeric_consistency_issues(text: str, payload: Dict[str, Any]) -> List[str]:
     allowed = allowed_numeric_tokens(payload)
+    allowed_numbers = []
+    for token in allowed:
+        try:
+            allowed_numbers.append(float(token))
+        except Exception:
+            continue
     found = re.findall(r"-?\d+(?:\.\d+)?", text)
     issues: List[str] = []
     for token in found:
         if token not in allowed:
-            issues.append(f"Unexpected numeric token in LLM output: {token}")
+            try:
+                numeric_token = float(token)
+            except Exception:
+                issues.append(f"Unexpected numeric token in LLM output: {token}")
+                continue
+            if not any(abs(numeric_token - allowed_value) <= 0.02 for allowed_value in allowed_numbers):
+                issues.append(f"Unexpected numeric token in LLM output: {token}")
     return issues
 
 
