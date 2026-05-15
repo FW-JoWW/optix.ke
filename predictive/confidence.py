@@ -20,9 +20,15 @@ def calibrate_confidence(
     diagnostics: Dict[str, Any],
     readiness_warnings: List[Dict[str, str]],
     weak_model: bool,
+    drift_summary: Dict[str, Any] | None = None,
+    feature_diagnostics: Dict[str, Any] | None = None,
+    scenario_uncertainty: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     score = 55
     reasons: List[str] = []
+    drift_summary = drift_summary or {}
+    feature_diagnostics = feature_diagnostics or {}
+    scenario_uncertainty = scenario_uncertainty or {}
 
     if sample_size >= 500:
         score += 12
@@ -84,12 +90,50 @@ def calibrate_confidence(
 
     overfit_gap = diagnostics.get("overfit_gap")
     if overfit_gap is not None:
-        if float(overfit_gap) > 0.15:
+        if float(overfit_gap) > 0.22:
+            score -= 18
+            reasons.append("Train-vs-test gap is large enough to make the model operationally fragile.")
+        elif float(overfit_gap) > 0.15:
             score -= 12
             reasons.append("Train-vs-test gap suggests meaningful overfitting.")
         elif float(overfit_gap) <= 0.05:
             score += 4
             reasons.append("Train-vs-test performance gap is controlled.")
+
+    residual_skew = diagnostics.get("residual_skew")
+    if residual_skew is not None:
+        skew = abs(float(residual_skew))
+        if skew > 1.0:
+            score -= 10
+            reasons.append("Residual skew suggests the model error profile is asymmetric and less stable in deployment.")
+        elif skew > 0.6:
+            score -= 5
+            reasons.append("Residual skew is noticeable, so confidence is reduced modestly.")
+
+    top_driver_share = float(feature_diagnostics.get("top_driver_share", 0.0) or 0.0)
+    concentration_score = float(feature_diagnostics.get("driver_concentration_score", 0.0) or 0.0)
+    if top_driver_share >= 0.6:
+        score -= 12
+        reasons.append("The model depends heavily on a single dominant driver, which makes operational recommendations less diversified and less stable.")
+    elif concentration_score >= 0.45:
+        score -= 6
+        reasons.append("Driver influence is concentrated in a narrow set of features.")
+
+    average_drift = float(drift_summary.get("average_drift_score", 0.0) or 0.0)
+    if average_drift >= 0.2:
+        score -= 8
+        reasons.append("Feature drift between train and score windows reduces reliability.")
+    elif average_drift >= 0.1:
+        score -= 4
+        reasons.append("Mild drift is present, so monitoring should stay active.")
+
+    scenario_spread = float(scenario_uncertainty.get("spread_ratio", 0.0) or 0.0)
+    if scenario_spread >= 1.2:
+        score -= 10
+        reasons.append("Scenario uncertainty is wide, so operational confidence should be lower than predictive fit alone suggests.")
+    elif scenario_spread >= 0.7:
+        score -= 5
+        reasons.append("Scenario outcomes vary materially, so action confidence should remain moderated.")
 
     penalty = sum(8 if item.get("severity") == "high" else 4 for item in readiness_warnings if item.get("severity") in {"medium", "high"})
     score -= penalty
@@ -113,6 +157,9 @@ def calibrate_confidence(
             },
             "cross_validation": cv_summary,
             "diagnostics": diagnostics,
+            "feature_diagnostics": feature_diagnostics,
+            "drift_summary": drift_summary,
+            "scenario_uncertainty": scenario_uncertainty,
             "weak_model": weak_model,
         },
     }

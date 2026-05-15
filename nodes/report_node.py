@@ -174,9 +174,20 @@ def _executive_summary(evidence: Dict[str, Any], judgment: Dict[str, Any]) -> st
     )
 
 
+def _first_tool_result(tool_results: Dict[str, Any], tool_name: str) -> Dict[str, Any] | None:
+    return next(
+        (
+            value
+            for value in tool_results.values()
+            if isinstance(value, dict) and value.get("tool") == tool_name
+        ),
+        None,
+    )
+
+
 def _predictive_sections(tool_results: Dict[str, Any]) -> Dict[str, str]:
-    predictive = next((value for value in tool_results.values() if isinstance(value, dict) and value.get("tool") == "predictive_analysis"), None)
-    prescriptive = next((value for value in tool_results.values() if isinstance(value, dict) and value.get("tool") == "prescriptive_analysis"), None)
+    predictive = _first_tool_result(tool_results, "predictive_analysis")
+    prescriptive = _first_tool_result(tool_results, "prescriptive_analysis")
     if not predictive and not prescriptive:
         return {
             "drivers": "None",
@@ -186,16 +197,38 @@ def _predictive_sections(tool_results: Dict[str, Any]) -> Dict[str, str]:
             "constraints": "None",
             "confidence": "None",
             "monitoring_plan": "None",
+            "action_paths": "None",
+            "assumption_stress": "None",
+            "reliability": "None",
+            "operational_sensitivity": "None",
+            "dependency_risks": "None",
+            "experiment_design": "None",
+            "early_warnings": "None",
+            "what_could_go_wrong": "None",
         }
 
     top_drivers = predictive.get("top_drivers", []) if predictive else []
-    drivers = "\n".join(f"- {item.get('feature')}: importance={item.get('importance')}" for item in top_drivers[:5]) if top_drivers else "None"
+    drivers = "\n".join(
+        f"- {item.get('feature')}: importance={item.get('importance')}"
+        for item in top_drivers[:5]
+    ) if top_drivers else "None"
     limitations = (predictive.get("limitations", []) if predictive else []) or []
     truthfulness = (prescriptive.get("truthfulness_notes", []) if prescriptive else []) or []
-    risks = "\n".join(f"- {item}" for item in [*limitations[:5], *truthfulness[:3]]) if (limitations or truthfulness) else "None"
+    monitoring = ((predictive.get("validation_summary") or {}).get("monitoring") if predictive else {}) or {}
+    performance_decay = ((predictive.get("validation_summary") or {}).get("performance_decay") if predictive else {}) or {}
+    confidence = predictive.get("confidence", {}) if predictive else {}
+    risks_payload: List[str] = []
+    risks_payload.extend(limitations[:5])
+    risks_payload.extend(truthfulness[:3])
+    risks_payload.extend(monitoring.get("warnings", [])[:3])
+    risks_payload.extend(performance_decay.get("warnings", [])[:2])
+    if confidence:
+        risks_payload.append(f"Confidence explanation: {confidence.get('explanation')}")
+    risks = "\n".join(f"- {item}" for item in risks_payload) if risks_payload else "None"
     best_action = "None"
     expected_upside = "None"
     constraints = "None"
+    action_paths = "None"
     if prescriptive:
         decision_paths = prescriptive.get("decision_paths", []) or []
         if decision_paths:
@@ -204,16 +237,64 @@ def _predictive_sections(tool_results: Dict[str, Any]) -> Dict[str, str]:
             constraints = "\n".join(
                 f"- {item}" for item in (decision_paths[0].get("constraint_explanations", []) or [])
             ) or "None"
+            action_paths = "\n".join(
+                f"- {item.get('scenario')}: {item.get('recommended_action')} | score={item.get('score')} | tradeoffs={item.get('tradeoffs')}"
+                for item in decision_paths[:4]
+            ) or "None"
         else:
             actions = prescriptive.get("recommended_actions", []) or []
             if actions:
                 best_action = actions[0].get("action", "None")
                 expected_upside = str(actions[0].get("estimated_uplift_range") or actions[0].get("estimated_uplift") or prescriptive.get("estimated_upside"))
+                action_paths = "\n".join(
+                    f"- {item.get('action')} | risk={item.get('risk_level')} | feasibility={item.get('feasibility')}"
+                    for item in actions[:4]
+                ) or "None"
     confidence = "None"
     if predictive and predictive.get("confidence"):
-        confidence = f"{predictive['confidence'].get('label')} ({predictive['confidence'].get('score')})"
-    monitoring = ((predictive.get("validation_summary") or {}).get("monitoring") if predictive else {}) or {}
+        confidence = (
+            f"{predictive['confidence'].get('label')} "
+            f"({predictive['confidence'].get('score')}) - "
+            f"{predictive['confidence'].get('explanation')}"
+        )
     monitoring_plan = "\n".join(f"- {item}" for item in monitoring.get("monitoring_plan", [])[:5]) if monitoring.get("monitoring_plan") else "None"
+    driver_diag = ((predictive.get("validation_summary") or {}).get("driver_diagnostics") if predictive else {}) or {}
+    assumption_stress = "\n".join(
+        f"- {item}" for item in ((prescriptive.get("assumptions", []) if prescriptive else [])[:4])
+    ) if prescriptive and prescriptive.get("assumptions") else "None"
+    reliability = "None"
+    operational_sensitivity = "None"
+    dependency_risks = "None"
+    experiment_design = "None"
+    early_warnings = "None"
+    what_could_go_wrong = "None"
+    if prescriptive:
+        operational_confidence = (prescriptive.get("operational_confidence") or {}) if isinstance(prescriptive, dict) else {}
+        if operational_confidence:
+            reliability = (
+                f"- Predictive confidence: {confidence}\n"
+                f"- Operational confidence: {operational_confidence.get('label')} ({operational_confidence.get('score')}) - {operational_confidence.get('explanation')}"
+            )
+        best_path = ((prescriptive.get("decision_paths") or [{}])[0]) or {}
+        operational_sensitivity = "\n".join(
+            f"- {item}" for item in ((best_path.get("constraint_explanations", []) or []) + (best_path.get("downside_risks", []) or []))[:6]
+        ) or "None"
+        experiment_design = (
+            "- Start with a phased rollout on the affected segments.\n"
+            "- Compare results with a holdout or pre-change baseline.\n"
+            f"- Monitor {', '.join(best_path.get('monitoring_kpis', [])[:4]) if best_path.get('monitoring_kpis') else 'target KPI and customer response indicators'}."
+        )
+        early_warning_items = (best_path.get("failure_conditions", []) or []) + (best_path.get("monitoring_kpis", []) or [])
+        early_warnings = "\n".join(f"- {item}" for item in early_warning_items[:6]) if early_warning_items else "None"
+        what_could_go_wrong = "\n".join(f"- {item}" for item in (best_path.get("downside_risks", []) or [])[:6]) or "None"
+    if predictive and driver_diag:
+        dependency_lines = [
+            f"- Top driver share: {driver_diag.get('top_driver_share')}",
+            f"- Driver concentration score: {driver_diag.get('driver_concentration_score')}",
+            f"- Signal diversity: {driver_diag.get('signal_diversity')}",
+        ]
+        dependency_lines.extend(f"- {item}" for item in driver_diag.get("warnings", [])[:4])
+        dependency_risks = "\n".join(dependency_lines)
     return {
         "drivers": drivers,
         "risks": risks,
@@ -222,6 +303,14 @@ def _predictive_sections(tool_results: Dict[str, Any]) -> Dict[str, str]:
         "constraints": constraints,
         "confidence": confidence,
         "monitoring_plan": monitoring_plan,
+        "action_paths": action_paths,
+        "assumption_stress": assumption_stress,
+        "reliability": reliability,
+        "operational_sensitivity": operational_sensitivity,
+        "dependency_risks": dependency_risks,
+        "experiment_design": experiment_design,
+        "early_warnings": early_warnings,
+        "what_could_go_wrong": what_could_go_wrong,
     }
 
 
@@ -230,6 +319,11 @@ def _format_contradictions(judgment: Dict[str, Any]) -> str:
     if not contradictions:
         return "None"
     return "\n".join(f"- {item}" for item in contradictions)
+
+
+def _format_recommendation_paths(tool_results: Dict[str, Any]) -> str:
+    sections = _predictive_sections(tool_results)
+    return sections.get("action_paths", "None")
 
 
 def report_node(state: AnalystState) -> AnalystState:
@@ -259,6 +353,7 @@ def report_node(state: AnalystState) -> AnalystState:
         decision_context = derive_decision_from_top_stories(top_stories)
     human_in_loop = evidence.get("human_in_loop")
     decision_notes = evidence.get("decision_notes", [])
+    predictive_sections = _predictive_sections(tool_results)
 
     hitl_summary = "None"
     if human_in_loop:
@@ -269,6 +364,9 @@ def report_node(state: AnalystState) -> AnalystState:
 
 BUSINESS QUESTION:
 {business_question}
+
+EXECUTIVE SUMMARY:
+{_executive_summary(evidence, judgment)}
 
 ANALYSIS PLAN:
 {_format_analysis_plan(analysis_plan)}
@@ -290,6 +388,54 @@ VISUALIZATIONS:
 
 DECISION CONTEXT:
 {decision_context}
+
+KEY DRIVERS:
+{predictive_sections["drivers"]}
+
+RISKS:
+{predictive_sections["risks"]}
+
+BEST ACTION:
+{predictive_sections["best_action"]}
+
+EXPECTED UPSIDE:
+{predictive_sections["expected_upside"]}
+
+CONSTRAINTS:
+{predictive_sections["constraints"]}
+
+CONFIDENCE LEVEL:
+{predictive_sections["confidence"]}
+
+MONITORING PLAN:
+{predictive_sections["monitoring_plan"]}
+
+ACTION PATHS:
+{_format_recommendation_paths(tool_results)}
+
+EXECUTIVE RISKS:
+{predictive_sections["risks"]}
+
+ASSUMPTION STRESS POINTS:
+{predictive_sections["assumption_stress"]}
+
+RECOMMENDATION RELIABILITY:
+{predictive_sections["reliability"]}
+
+OPERATIONAL SENSITIVITY:
+{predictive_sections["operational_sensitivity"]}
+
+MODEL DEPENDENCY RISKS:
+{predictive_sections["dependency_risks"]}
+
+RECOMMENDED EXPERIMENT DESIGN:
+{predictive_sections["experiment_design"]}
+
+EARLY WARNING INDICATORS:
+{predictive_sections["early_warnings"]}
+
+WHAT COULD GO WRONG:
+{predictive_sections["what_could_go_wrong"]}
 
 JUDGMENT SUMMARY:
 {_format_judgment_summary(judgment)}

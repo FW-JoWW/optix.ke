@@ -54,6 +54,16 @@ def numeric_consistency_issues(text: str, payload: Dict[str, Any]) -> List[str]:
             except Exception:
                 issues.append(f"Unexpected numeric token in LLM output: {token}")
                 continue
+            if any(abs(numeric_token - allowed_value) <= 0.02 for allowed_value in allowed_numbers):
+                continue
+            # Allow percentage phrasing when the deterministic source contains
+            # a probability or importance ratio in the 0-1 range.
+            if any(
+                0.0 <= allowed_value <= 1.0
+                and abs(numeric_token - (allowed_value * 100.0)) <= 0.1
+                for allowed_value in allowed_numbers
+            ):
+                continue
             if not any(abs(numeric_token - allowed_value) <= 0.02 for allowed_value in allowed_numbers):
                 issues.append(f"Unexpected numeric token in LLM output: {token}")
     return issues

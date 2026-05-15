@@ -61,6 +61,12 @@ class PrescriptiveAction(BaseModel):
     affected_segments: List[str] = Field(default_factory=list)
     requires_experiment: bool = True
     causal_safety_note: str | None = None
+    evidence_summary: List[str] = Field(default_factory=list)
+    monitoring_kpis: List[str] = Field(default_factory=list)
+    downside_risks: List[str] = Field(default_factory=list)
+    failure_conditions: List[str] = Field(default_factory=list)
+    reliability: Literal["low", "moderate", "high"] = "low"
+    safety_grade: Literal["guarded", "controlled", "expansion_ready"] = "guarded"
 
 
 class PrescriptiveResult(BaseModel):
@@ -74,4 +80,5 @@ class PrescriptiveResult(BaseModel):
     assumptions: List[str] = Field(default_factory=list)
     confidence_level: Literal["low", "moderate", "high"]
     confidence: ConfidenceAssessment | None = None
+    operational_confidence: ConfidenceAssessment | None = None
     truthfulness_notes: List[str] = Field(default_factory=list)

@@ -99,7 +99,7 @@ def _story_action_confidence(story: Dict[str, Any], priority_score: int) -> int:
         penalty = sum(12 if item.get("severity") == "high" else 6 for item in (story.get("readiness_warnings") or []))
         return max(0, min(100, min(base, base + int(priority_score * 0.15) - penalty)))
     if story_type == "prescriptive_action":
-        confidence_detail = story.get("confidence_assessment", {}) or {}
+        confidence_detail = story.get("operational_confidence_assessment", {}) or story.get("confidence_assessment", {}) or {}
         if confidence_detail.get("score") is not None:
             base = int(confidence_detail["score"])
         else:

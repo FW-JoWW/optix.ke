@@ -113,6 +113,37 @@ def _extract_feature_importance(model: object, feature_names: List[str]) -> List
     return [{"feature": feature, "importance": round(float(importance), 4)} for feature, importance in ranked]
 
 
+def _driver_diagnostics(feature_importance: List[Dict[str, float | str]]) -> Dict[str, Any]:
+    if not feature_importance:
+        return {
+            "top_driver_share": 0.0,
+            "driver_concentration_score": 0.0,
+            "signal_diversity": "unknown",
+            "warnings": [],
+        }
+
+    values = [max(float(item.get("importance") or 0.0), 0.0) for item in feature_importance]
+    total = sum(values) or 1.0
+    shares = [value / total for value in values]
+    top_share = max(shares)
+    concentration = sum(share ** 2 for share in shares)
+    warnings: List[str] = []
+    signal_diversity = "healthy"
+    if top_share >= 0.6:
+        signal_diversity = "low"
+        warnings.append("Predictive signal is heavily dominated by one feature.")
+    elif concentration >= 0.45:
+        signal_diversity = "moderate"
+        warnings.append("Predictive signal is concentrated in a narrow set of drivers.")
+
+    return {
+        "top_driver_share": round(top_share, 4),
+        "driver_concentration_score": round(concentration, 4),
+        "signal_diversity": signal_diversity,
+        "warnings": warnings,
+    }
+
+
 def run_predictive_analysis(df: pd.DataFrame, task: Dict[str, Any], state_context: Dict[str, Any] | None = None) -> Dict[str, Any]:
     state_context = state_context or {}
     question = state_context.get("business_question", "")
@@ -181,6 +212,7 @@ def run_predictive_analysis(df: pd.DataFrame, task: Dict[str, Any], state_contex
     best_predictions: np.ndarray | None = None
     best_model_name: str | None = None
     best_feature_importance: List[Dict[str, float | str]] = []
+    best_driver_diagnostics: Dict[str, Any] = {}
     best_truthfulness_flags: List[str] = []
     best_no_reliable_recommendation = False
 
@@ -231,6 +263,7 @@ def run_predictive_analysis(df: pd.DataFrame, task: Dict[str, Any], state_contex
         stability_penalty = float((cv_summary.get("std", {}) or {}).get("r2" if problem_type in {"regression", "forecasting"} else "f1") or 0.0)
         combined_score = selection_metric + (float(cv_primary or 0.0) * 5.0) - (stability_penalty * 10.0)
         feature_importance = _extract_feature_importance(model, list(X.columns))
+        driver_diagnostics = _driver_diagnostics(feature_importance)
         weak_model = False
         truthfulness_flags: List[str] = []
         if problem_type in {"regression", "forecasting"}:
@@ -260,6 +293,7 @@ def run_predictive_analysis(df: pd.DataFrame, task: Dict[str, Any], state_contex
             "cross_validation": cv_summary,
             "baseline": {"model": baseline_label, "metrics": baseline_metrics},
             "diagnostics": diagnostics,
+            "driver_diagnostics": driver_diagnostics,
             "weak_model": weak_model,
         }
         model_results.append(
@@ -282,6 +316,7 @@ def run_predictive_analysis(df: pd.DataFrame, task: Dict[str, Any], state_contex
             best_predictions = predictions
             best_model_name = model_name
             best_feature_importance = feature_importance
+            best_driver_diagnostics = driver_diagnostics
             best_truthfulness_flags = truthfulness_flags
             best_no_reliable_recommendation = weak_model
 
@@ -302,6 +337,15 @@ def run_predictive_analysis(df: pd.DataFrame, task: Dict[str, Any], state_contex
         limitations.extend(item["message"] for item in readiness_payload if item["severity"] in {"medium", "high"})
     limitations.extend(best_truthfulness_flags)
 
+    monitoring = detect_data_drift(
+        training_frame=X_train,
+        scoring_frame=X_test,
+        feature_columns=list(X_train.columns),
+    )
+    decay = performance_decay_monitor(best_metrics, best_baseline_metrics, problem_type)
+    if decay["warnings"]:
+        limitations.extend(decay["warnings"])
+    limitations.extend(best_driver_diagnostics.get("warnings", []))
     confidence_payload = calibrate_confidence(
         problem_type=problem_type,
         sample_size=len(X),
@@ -314,18 +358,12 @@ def run_predictive_analysis(df: pd.DataFrame, task: Dict[str, Any], state_contex
         },
         readiness_warnings=readiness_payload,
         weak_model=best_no_reliable_recommendation,
+        drift_summary=monitoring,
+        feature_diagnostics=best_driver_diagnostics,
+        scenario_uncertainty={},
     )
     if best_no_reliable_recommendation:
         limitations.append("No reliable operational recommendation should be made until model quality improves.")
-
-    monitoring = detect_data_drift(
-        training_frame=X_train,
-        scoring_frame=X_test,
-        feature_columns=list(X_train.columns),
-    )
-    decay = performance_decay_monitor(best_metrics, best_baseline_metrics, problem_type)
-    if decay["warnings"]:
-        limitations.extend(decay["warnings"])
 
     result = PredictiveResult(
         problem_type=problem_type,
@@ -346,6 +384,7 @@ def run_predictive_analysis(df: pd.DataFrame, task: Dict[str, Any], state_contex
             "cross_validation": best_cv_summary,
             "baseline_metrics": best_baseline_metrics,
             "diagnostics": best_diagnostics,
+            "driver_diagnostics": best_driver_diagnostics,
             "runtime_report": runtime_report,
             "monitoring": monitoring,
             "performance_decay": decay,

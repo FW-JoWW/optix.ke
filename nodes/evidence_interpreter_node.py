@@ -461,6 +461,7 @@ def _predictive_story(result: Dict[str, Any]) -> Dict[str, Any] | None:
         "limitations": result.get("limitations", []),
         "readiness_warnings": result.get("readiness_warnings", []),
         "validation_summary": result.get("validation_summary", {}),
+        "driver_diagnostics": ((result.get("validation_summary") or {}).get("driver_diagnostics")) or {},
         "truthfulness_flags": result.get("truthfulness_flags", []),
         "no_reliable_recommendation": bool(result.get("no_reliable_recommendation")),
         "confidence_assessment": confidence_detail,
@@ -487,6 +488,7 @@ def _prescriptive_story(result: Dict[str, Any]) -> Dict[str, Any] | None:
         "assumptions": result.get("assumptions", []),
         "truthfulness_notes": result.get("truthfulness_notes", []),
         "confidence_assessment": result.get("confidence", {}) or {},
+        "operational_confidence_assessment": result.get("operational_confidence", {}) or {},
         "confidence": result.get("confidence_level", "low"),
     }
 

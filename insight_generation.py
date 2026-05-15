@@ -88,15 +88,39 @@ def fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
         model_name = story.get("model_name", "model")
         problem_type = story.get("problem_type", "prediction")
         metrics = story.get("metrics", {}) or {}
+        driver_diag = story.get("driver_diagnostics", {}) or {}
+        top_drivers = story.get("top_drivers", []) or []
+        top_driver = top_drivers[0] if top_drivers else {}
+        top_feature = top_driver.get("feature", "the leading feature")
+        top_share = driver_diag.get("top_driver_share")
         explanation = f"A {problem_type} model for {target} was successfully trained, with {model_name} performing best."
+        if top_feature:
+            explanation += f" The signal is led by {top_feature}"
+            if top_share is not None:
+                explanation += f", which contributes roughly {round(float(top_share) * 100, 2)}% of modeled importance."
         implication = f"This means the system can now estimate future or unknown values for {target} in a repeatable way."
-        action = f"Use the model for decision support around {target}, but monitor quality metrics like {', '.join(metrics.keys()) if metrics else 'model performance'}."
+        if driver_diag.get("signal_diversity") == "low":
+            implication += " The model is powerful, but it is relying on a narrow driver set, so operational rollout confidence should stay below predictive fit confidence."
+        action = f"Use the model for decision support around {target}, and monitor {' ,'.join(metrics.keys()) if metrics else 'model performance'} plus any drift in the dominant drivers."
     elif story_type == "prescriptive_action":
         target = story.get("column", "target")
         upside = story.get("estimated_upside")
+        actions = story.get("recommended_actions", []) or []
+        best = actions[0] if actions else {}
+        kpis = best.get("monitoring_kpis", []) or []
+        segments = best.get("affected_segments", []) or []
         explanation = f"The prescriptive engine identified a next-best action for improving or protecting {target}."
+        if segments:
+            explanation += f" It is aimed primarily at {', '.join(segments[:3])}."
         implication = "This translates model output into a concrete operational decision instead of stopping at prediction."
-        action = f"Start with the top recommended action and measure observed change{'' if upside is None else f'; estimated upside is about {round(float(upside), 4)}'}."
+        if best.get("safety_grade") == "guarded":
+            implication += " The recommendation should be treated as a controlled test rather than a broad rollout because causal certainty remains limited."
+        action = (
+            f"Start with the top recommended action and measure observed change"
+            f"{'' if upside is None else f'; estimated upside is about {round(float(upside), 4)}'}."
+        )
+        if kpis:
+            action += f" Monitor {', '.join(kpis[:4])} as the early-warning KPI set."
 
     return {
         "related_story_signature": _story_signature(story),

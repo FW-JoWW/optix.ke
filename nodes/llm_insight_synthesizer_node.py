@@ -188,15 +188,31 @@ def _fallback_detail(story: Dict[str, Any]) -> Dict[str, Any]:
         target = story.get("column", "target")
         model_name = story.get("model_name", "model")
         problem_type = story.get("problem_type", "prediction")
+        driver_diag = story.get("driver_diagnostics", {}) or {}
+        top_drivers = story.get("top_drivers", []) or []
+        top_driver = top_drivers[0] if top_drivers else {}
         explanation = f"The system can now use {model_name} to produce {problem_type} estimates for {target}."
+        if top_driver:
+            explanation += f" The signal is led by {top_driver.get('feature')}."
         implication = f"This enables forward-looking planning for {target} rather than only descriptive reporting."
-        action = f"Operationalize the {target} model in planning workflows and track its predictive quality over time."
+        if driver_diag.get("signal_diversity") == "low":
+            implication += " At the same time, the model is leaning heavily on a narrow driver set, so operational dependence should stay controlled."
+        action = f"Operationalize the {target} model in planning workflows, but track both predictive quality and drift in the dominant features over time."
     elif story_type == "prescriptive_action":
         target = story.get("column", "target")
         upside = story.get("estimated_upside")
+        best = (story.get("recommended_actions") or [{}])[0]
+        kpis = best.get("monitoring_kpis", []) or []
+        segments = best.get("affected_segments", []) or []
         explanation = f"The prescriptive engine translated the model output for {target} into a concrete next-best action."
+        if segments:
+            explanation += f" The recommendation is concentrated on {', '.join(segments[:3])}."
         implication = "This helps the business move from prediction to operational decision-making."
+        if best.get("safety_grade") == "guarded":
+            implication += " Because the recommendation is still grounded in observational model behavior, it should start as a controlled experiment or phased rollout."
         action = f"Pilot the top recommendation first{'' if upside is None else f'; estimated upside is about {round(float(upside), 4)}'}."
+        if kpis:
+            action += f" Watch {', '.join(kpis[:4])} as the primary early-warning indicators."
 
     return {
         "related_story_signature": _story_signature(story),
@@ -303,6 +319,8 @@ You MUST follow these rules:
 - State why the pattern matters for revenue, pricing, operations, strategy, risk, customer behavior, or resource allocation, whichever is actually supported.
 - Give specific actions the decision-maker can take.
 - Include limitations, especially when the evidence is weak, moderate, incomplete, or could be influenced by other variables.
+- When a recommendation is present, explain which segments are affected, which KPI should be monitored, and what would make the recommendation fail.
+- Vary sentence structure and avoid repeating the same recommendation phrasing across stories.
 
 STRICTLY DO NOT:
 - Repeat or lightly paraphrase the raw statistical output.
@@ -341,6 +359,7 @@ Mandatory semantic rules:
 - If insight_validity.valid is false, do not present the finding as decision-ready.
 - If recommendation_restrictions are present, recommendations must stay within the allowed actions and must not include blocked actions.
 - If causal evidence is LOW or not strong, never claim that one variable causes the other.
+- If a recommendation includes safety_grade of guarded or controlled, keep the language cautious and rollout-oriented.
 
 Return exactly in this format:
 

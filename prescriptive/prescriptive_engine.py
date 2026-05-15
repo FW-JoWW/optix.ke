@@ -27,6 +27,8 @@ def _action_templates(problem_type: str, target: str, confidence: str) -> List[P
                 affected_segments=[target],
                 requires_experiment=True,
                 causal_safety_note=causal_safety_note,
+                reliability="moderate" if confidence == "high" else "low",
+                safety_grade="controlled",
             ),
             PrescriptiveAction(
                 action="Run a controlled treatment on the top-risk segment before scaling.",
@@ -36,6 +38,8 @@ def _action_templates(problem_type: str, target: str, confidence: str) -> List[P
                 affected_segments=[target],
                 requires_experiment=True,
                 causal_safety_note=causal_safety_note,
+                reliability="moderate" if confidence == "high" else "low",
+                safety_grade="controlled",
             ),
         ]
     if problem_type == "forecasting":
@@ -48,6 +52,8 @@ def _action_templates(problem_type: str, target: str, confidence: str) -> List[P
                 affected_segments=[target],
                 requires_experiment=False,
                 causal_safety_note="Forecasts are scenario-based estimates, not guarantees. Use buffers for operational planning.",
+                reliability="moderate" if confidence != "low" else "low",
+                safety_grade="controlled",
             ),
             PrescriptiveAction(
                 action="Stress-test the forecast under a downside demand scenario before committing full capacity.",
@@ -57,6 +63,8 @@ def _action_templates(problem_type: str, target: str, confidence: str) -> List[P
                 affected_segments=[target],
                 requires_experiment=False,
                 causal_safety_note="Use operational buffers because forecast error can widen under shocks.",
+                reliability="moderate" if confidence != "low" else "low",
+                safety_grade="guarded",
             ),
         ]
     return [
@@ -68,6 +76,8 @@ def _action_templates(problem_type: str, target: str, confidence: str) -> List[P
             affected_segments=[target],
             requires_experiment=True,
             causal_safety_note=causal_safety_note,
+            reliability="moderate" if confidence == "high" else "low",
+            safety_grade="guarded",
         ),
         PrescriptiveAction(
             action="Run a limited controlled rollout before a broader policy shift.",
@@ -77,8 +87,54 @@ def _action_templates(problem_type: str, target: str, confidence: str) -> List[P
             affected_segments=[target],
             requires_experiment=True,
             causal_safety_note=causal_safety_note,
+            reliability="moderate" if confidence == "high" else "low",
+            safety_grade="controlled",
         ),
     ]
+
+
+def _operational_confidence(
+    predictive_result: Dict[str, Any],
+    scenarios: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    predictive_confidence = (predictive_result.get("confidence") or {}).copy()
+    base = int(predictive_confidence.get("score", 40) or 40)
+    reasons: List[str] = []
+    driver_diagnostics = ((predictive_result.get("validation_summary") or {}).get("driver_diagnostics")) or {}
+    top_share = float(driver_diagnostics.get("top_driver_share", 0.0) or 0.0)
+    if top_share >= 0.6:
+        base -= 18
+        reasons.append("Operational confidence is lower because the recommendation depends heavily on one dominant driver.")
+    truthfulness_flags = predictive_result.get("truthfulness_flags", []) or []
+    if truthfulness_flags:
+        base -= 10
+        reasons.append("Operational confidence is reduced because causal certainty remains limited.")
+    scenario_effects = [float(item.get("estimated_effect") or 0.0) for item in scenarios]
+    spread_ratio = 0.0
+    if scenario_effects:
+        high = max(scenario_effects)
+        low = min(scenario_effects)
+        spread_ratio = abs(high - low) / max(abs(sum(scenario_effects) / len(scenario_effects)), 1e-6)
+        if spread_ratio >= 1.0:
+            base -= 12
+            reasons.append("Scenario outcomes vary widely, so rollout confidence should remain controlled.")
+        elif spread_ratio >= 0.5:
+            base -= 6
+            reasons.append("Scenario outcomes show meaningful spread, so operational estimates should be treated as ranges.")
+
+    score = max(0, min(base, 100))
+    label = "high" if score >= 75 else "moderate" if score >= 45 else "low"
+    explanation = " ".join(reasons) if reasons else "Operational confidence remains close to predictive confidence because scenario risk is contained."
+    return {
+        "score": score,
+        "label": label,
+        "explanation": explanation,
+        "factors": {
+            "predictive_confidence": predictive_confidence,
+            "feature_dominance": driver_diagnostics,
+            "scenario_instability": {"spread_ratio": round(spread_ratio, 4)},
+        },
+    }
 
 
 def run_prescriptive_analysis(predictive_result: Dict[str, Any], question: str) -> Dict[str, Any]:
@@ -97,6 +153,7 @@ def run_prescriptive_analysis(predictive_result: Dict[str, Any], question: str) 
     actions = _action_templates(problem_type, target, confidence)
     truthfulness_notes: List[str] = []
     memory_calibration = calibrate_from_memory(target)
+    operational_confidence = _operational_confidence(predictive_result, scenarios)
 
     if predictive_result.get("no_reliable_recommendation"):
         truthfulness_notes.append("Predictive evidence is not stable enough for a reliable operational recommendation.")
@@ -109,6 +166,8 @@ def run_prescriptive_analysis(predictive_result: Dict[str, Any], question: str) 
                 affected_segments=[target],
                 requires_experiment=False,
                 causal_safety_note="No operational rollout is recommended from the current evidence base.",
+                reliability="low",
+                safety_grade="guarded",
             )
         ]
 
@@ -117,8 +176,13 @@ def run_prescriptive_analysis(predictive_result: Dict[str, Any], question: str) 
             best_match = scenarios[0]
             action.estimated_uplift = round(float(best_match.get("estimated_effect") or 0.0), 4)
             action.estimated_uplift_range = best_match.get("estimated_range", {})
-            if not action.affected_segments:
-                action.affected_segments = best_match.get("affected_segments", [])
+            action.affected_segments = best_match.get("affected_segments", action.affected_segments or [])
+            action.evidence_summary = best_match.get("evidence_summary", [])
+            action.monitoring_kpis = best_match.get("monitoring_kpis", [])
+            action.downside_risks = best_match.get("downside_risks", [])
+            action.failure_conditions = best_match.get("failure_conditions", [])
+            action.safety_grade = best_match.get("safety_grade", action.safety_grade)
+            action.reliability = operational_confidence["label"]
 
     estimated_upside = None
     if scenarios:
@@ -130,6 +194,13 @@ def run_prescriptive_analysis(predictive_result: Dict[str, Any], question: str) 
     if optimization.get("best_action"):
         best_action_text = optimization["best_action"]["recommended_action"]
         actions.sort(key=lambda item: 0 if item.action == best_action_text else 1)
+        best_action = optimization["best_action"]
+        if actions:
+            actions[0].monitoring_kpis = best_action.get("monitoring_kpis", actions[0].monitoring_kpis)
+            actions[0].downside_risks = best_action.get("downside_risks", actions[0].downside_risks)
+            actions[0].failure_conditions = best_action.get("failure_conditions", actions[0].failure_conditions)
+            actions[0].safety_grade = best_action.get("safety_grade", actions[0].safety_grade)
+            actions[0].reliability = best_action.get("reliability", actions[0].reliability)
 
     store_recommendation_snapshot(
         {
@@ -155,11 +226,13 @@ def run_prescriptive_analysis(predictive_result: Dict[str, Any], question: str) 
         ],
         confidence_level=confidence if confidence in {"low", "moderate", "high"} else "low",
         confidence=ConfidenceAssessment(**predictive_result["confidence"]) if predictive_result.get("confidence") else None,
+        operational_confidence=ConfidenceAssessment(**operational_confidence),
         truthfulness_notes=[note for note in (
             truthfulness_notes
             or [
                 "Use the recommendation as a directional planning input, not as causal proof.",
                 "Validate any material rollout through controlled experimentation or phased deployment.",
+                operational_confidence.get("explanation"),
                 memory_calibration.get("note"),
             ]
         ) if note],

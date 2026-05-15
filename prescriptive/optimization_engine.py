@@ -32,7 +32,10 @@ def optimize_actions(
 ) -> Dict[str, Any]:
     constraints = parse_constraints(question)
     confidence = ((predictive_result.get("confidence") or {}).get("score")) or 40
+    confidence_label = ((predictive_result.get("confidence") or {}).get("label")) or "low"
     truthfulness_flags = predictive_result.get("truthfulness_flags", []) or []
+    driver_diagnostics = ((predictive_result.get("validation_summary") or {}).get("driver_diagnostics")) or {}
+    dominance = float(driver_diagnostics.get("top_driver_share", 0.0) or 0.0)
 
     ranked_actions: List[Dict[str, Any]] = []
     for scenario in scenario_summary:
@@ -45,6 +48,7 @@ def optimize_actions(
         confidence_multiplier = max(float(confidence) / 100.0, 0.25)
         score = midpoint * risk_penalty * feasibility_bonus * confidence_multiplier
         explanation = []
+        safety_grade = scenario.get("safety_grade", "guarded")
         if constraints.get("risk_tolerance") == "low" and risk_level == "high":
             score *= 0.7
             explanation.append("Penalized because it exceeds the requested risk tolerance.")
@@ -55,6 +59,10 @@ def optimize_actions(
         if truthfulness_flags:
             score *= 0.85
             explanation.append("Confidence-adjusted downward because predictive truthfulness flags remain active.")
+        if dominance >= 0.6 and scenario.get("driver_family") == "pricing":
+            score *= 0.82
+            explanation.append("Downgraded because the recommendation depends heavily on one dominant feature without direct elasticity evidence.")
+            safety_grade = "guarded"
 
         ranked_actions.append(
             {
@@ -69,6 +77,12 @@ def optimize_actions(
                 },
                 "constraint_explanations": explanation,
                 "affected_segments": scenario.get("affected_segments", []),
+                "monitoring_kpis": scenario.get("monitoring_kpis", []),
+                "downside_risks": scenario.get("downside_risks", []),
+                "failure_conditions": scenario.get("failure_conditions", []),
+                "reliability": confidence_label,
+                "intervention_confidence": scenario.get("intervention_confidence", "low"),
+                "safety_grade": safety_grade,
             }
         )
 

@@ -137,7 +137,11 @@ class JudgmentOrchestrator:
         story = self.primary_story
         validity = story.get("insight_validity") or {}
         causal = story.get("causal_evidence") or {}
-        confidence_assessment = story.get("confidence_assessment") or {}
+        confidence_assessment = (
+            story.get("operational_confidence_assessment")
+            or story.get("confidence_assessment")
+            or {}
+        )
 
         base = int(confidence_assessment.get("score", 0) or 0)
         if base == 0:
