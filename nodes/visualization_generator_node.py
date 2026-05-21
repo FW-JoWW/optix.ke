@@ -115,8 +115,32 @@ def generate_category_bar(df, story):
 def generate_grouped_bar(df, story):
     num_col = story.get("column")
     cat_col = story.get("group_column")
-    if num_col not in df.columns or cat_col not in df.columns:
-        return None
+    if num_col not in df.columns or cat_col not in df.columns or not pd.api.types.is_numeric_dtype(df[num_col]):
+        top_group = story.get("top_group")
+        bottom_group = story.get("bottom_group")
+        top_value = story.get("top_value")
+        bottom_value = story.get("bottom_value")
+        if top_group is None or top_value is None:
+            return None
+        labels = [str(top_group)]
+        values = [float(top_value)]
+        if bottom_group is not None and bottom_value is not None and str(bottom_group) != str(top_group):
+            labels.append(str(bottom_group))
+            values.append(float(bottom_value))
+        plt.figure()
+        sns.barplot(x=labels, y=values)
+        plt.xticks(rotation=45, ha="right")
+        filename = f"charts/bar_story_{num_col or 'metric'}_by_{cat_col or 'group'}.png"
+        plt.title(story.get("insight", f"{num_col} by {cat_col}"))
+        plt.tight_layout()
+        plt.savefig(filename)
+        plt.close()
+        return {
+            "type": "grouped_bar",
+            "file_path": filename,
+            "based_on": story,
+            "priority": "primary"
+        }
 
     grouped = (
         df[[cat_col, num_col]]

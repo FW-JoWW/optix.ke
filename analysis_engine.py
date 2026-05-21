@@ -142,7 +142,22 @@ def _run_direct_computation(df: pd.DataFrame, task: Dict[str, Any]) -> Dict[str,
 
         if operation == "group_by" and column in current.columns:
             current[column] = _coerce_datetime_like(current[column])
-            current_group = column
+            bucket = params.get("bucket")
+            if bucket and pd.api.types.is_datetime64_any_dtype(current[column]):
+                if bucket == "month":
+                    bucket_col = f"{column}__month"
+                    current[bucket_col] = current[column].dt.to_period("M").astype(str)
+                elif bucket == "quarter":
+                    bucket_col = f"{column}__quarter"
+                    current[bucket_col] = current[column].dt.to_period("Q").astype(str)
+                elif bucket == "year":
+                    bucket_col = f"{column}__year"
+                    current[bucket_col] = current[column].dt.to_period("Y").astype(str)
+                else:
+                    bucket_col = column
+                current_group = bucket_col
+            else:
+                current_group = column
         elif operation == "aggregate" and column in current.columns:
             method = params.get("method", "mean")
             if params.get("scope") == "group_results" and current_series is not None:
@@ -208,6 +223,258 @@ def _run_direct_computation(df: pd.DataFrame, task: Dict[str, Any]) -> Dict[str,
                 "min": float(series.min()),
                 "max": float(series.max()),
             }
+        elif operation == "distinct_count" and column in current.columns:
+            if current_group:
+                current_series = current.groupby(current_group)[column].nunique(dropna=True)
+            else:
+                result_payload["value"] = int(current[column].nunique(dropna=True))
+        elif operation == "row_expression" and column in current.columns:
+            subtract_column = params.get("subtract_column")
+            expression_name = params.get("expression_name") or column
+            if subtract_column in current.columns:
+                left = pd.to_numeric(current[column], errors="coerce")
+                right = pd.to_numeric(current[subtract_column], errors="coerce")
+                derived = left - right
+                current[expression_name] = derived
+                current_series = derived
+                result_payload["derived_column"] = expression_name
+        elif operation == "share_of_total" and column in current.columns:
+            entity_column = params.get("entity_column")
+            top_n = int(params.get("top_n", 10) or 10)
+            if entity_column in current.columns:
+                grouped = current.groupby(entity_column)[column].sum().sort_values(ascending=False)
+                top_share = float(grouped.head(top_n).sum() / grouped.sum()) if float(grouped.sum()) else 0.0
+                result_payload["value"] = top_share
+                result_payload["rows"] = grouped.head(top_n).reset_index().to_dict(orient="records")
+                result_payload["top_n"] = top_n
+        elif operation == "repeat_rate" and column in current.columns:
+            entity_column = params.get("entity_column")
+            if entity_column in current.columns:
+                grouped = current.groupby(entity_column)[column].nunique(dropna=True)
+                repeat_share = float((grouped > 1).mean()) if len(grouped) else 0.0
+                result_payload["value"] = repeat_share
+                result_payload["summary"] = {
+                    "repeat_entities": int((grouped > 1).sum()),
+                    "total_entities": int(len(grouped)),
+                }
+        elif operation == "growth_rate" and column in current.columns:
+            method = params.get("method", "sum")
+            if current_group:
+                grouped = current.groupby(current_group)[column]
+                if method == "distinct_count":
+                    entity_column = params.get("entity_column") or column
+                    if entity_column in current.columns:
+                        series = current.groupby(current_group)[entity_column].nunique(dropna=True)
+                    else:
+                        series = grouped.nunique(dropna=True)
+                elif method == "sum":
+                    series = grouped.sum()
+                elif method == "mean":
+                    series = grouped.mean()
+                else:
+                    series = grouped.sum()
+                growth = series.pct_change().replace([float("inf"), float("-inf")], pd.NA)
+                growth_rows = pd.DataFrame(
+                    {
+                        "period": series.index.astype(str),
+                        "value": series.values,
+                        "growth_rate": growth.values,
+                    }
+                )
+                result_payload["rows"] = _sanitize_numbers(growth_rows.to_dict(orient="records"))
+                valid_growth = growth.dropna()
+                result_payload["value"] = float(valid_growth.iloc[-1]) if not valid_growth.empty else None
+        elif operation == "rank_entities" and column in current.columns:
+            entity_column = params.get("entity_column")
+            method = params.get("method", "sum")
+            top_n = int(params.get("top_n", 10) or 10)
+            ascending = str(params.get("sort", "desc")).lower() == "asc"
+            if entity_column in current.columns:
+                if method == "distinct_count":
+                    grouped = current.groupby(entity_column)[column].nunique(dropna=True)
+                elif method == "mean":
+                    grouped = current.groupby(entity_column)[column].mean()
+                elif method == "count":
+                    grouped = current.groupby(entity_column)[column].count()
+                else:
+                    grouped = current.groupby(entity_column)[column].sum()
+                ranked = grouped.sort_values(ascending=ascending).head(top_n)
+                result_payload["rows"] = ranked.reset_index().to_dict(orient="records")
+                result_payload["value"] = float(ranked.iloc[0]) if len(ranked) else None
+                result_payload["ranking_sort"] = "asc" if ascending else "desc"
+        elif operation == "segment_contrast":
+            entity_column = params.get("entity_column")
+            primary_metric = params.get("primary_metric")
+            primary_method = params.get("primary_method", "distinct_count")
+            secondary_metric = params.get("secondary_metric")
+            secondary_method = params.get("secondary_method", "sum")
+            pattern = params.get("pattern", "high_low")
+            top_n = int(params.get("top_n", 10) or 10)
+            if entity_column in current.columns and primary_metric in current.columns and secondary_metric in current.columns:
+                if primary_method == "distinct_count":
+                    primary_series = current.groupby(entity_column)[primary_metric].nunique(dropna=True)
+                elif primary_method == "mean":
+                    primary_series = current.groupby(entity_column)[primary_metric].mean()
+                else:
+                    primary_series = current.groupby(entity_column)[primary_metric].sum()
+
+                if secondary_method == "mean":
+                    secondary_series = current.groupby(entity_column)[secondary_metric].mean()
+                elif secondary_method == "distinct_count":
+                    secondary_series = current.groupby(entity_column)[secondary_metric].nunique(dropna=True)
+                else:
+                    secondary_series = current.groupby(entity_column)[secondary_metric].sum()
+
+                contrast_df = pd.DataFrame({
+                    entity_column: primary_series.index,
+                    "primary_value": primary_series.values,
+                    "secondary_value": secondary_series.reindex(primary_series.index).values,
+                }).dropna()
+                if not contrast_df.empty:
+                    if pattern == "high_low":
+                        p_cut = contrast_df["primary_value"].quantile(0.75)
+                        s_cut = contrast_df["secondary_value"].quantile(0.25)
+                        subset = contrast_df[(contrast_df["primary_value"] >= p_cut) & (contrast_df["secondary_value"] <= s_cut)].copy()
+                        subset["contrast_score"] = subset["primary_value"].rank(pct=True) - subset["secondary_value"].rank(pct=True)
+                        subset = subset.sort_values("contrast_score", ascending=False)
+                    else:
+                        p_cut = contrast_df["primary_value"].quantile(0.25)
+                        s_cut = contrast_df["secondary_value"].quantile(0.75)
+                        subset = contrast_df[(contrast_df["primary_value"] <= p_cut) & (contrast_df["secondary_value"] >= s_cut)].copy()
+                        subset["contrast_score"] = subset["secondary_value"].rank(pct=True) - subset["primary_value"].rank(pct=True)
+                        subset = subset.sort_values("contrast_score", ascending=False)
+                    if subset.empty:
+                        subset = contrast_df.copy()
+                        subset["contrast_score"] = (
+                            subset["primary_value"].rank(pct=True, ascending=(pattern != "high_low"))
+                            + subset["secondary_value"].rank(pct=True, ascending=(pattern == "high_low"))
+                        )
+                        subset = subset.sort_values("contrast_score", ascending=False)
+                    subset = subset.head(top_n)
+                    result_payload["rows"] = subset.to_dict(orient="records")
+                    result_payload["value"] = float(subset.iloc[0]["contrast_score"]) if len(subset) else None
+                    result_payload["contrast_pattern"] = pattern
+        elif operation == "segment_growth_rank":
+            entity_column = params.get("entity_column")
+            time_column = params.get("time_column")
+            bucket = params.get("bucket", "month")
+            method = params.get("method", "sum")
+            top_n = int(params.get("top_n", 10) or 10)
+            ascending = str(params.get("sort", "desc")).lower() == "asc"
+            if entity_column in current.columns and time_column in current.columns and column in current.columns:
+                time_series = _coerce_datetime_like(current[time_column])
+                if pd.api.types.is_datetime64_any_dtype(time_series):
+                    temp = current.copy()
+                    temp[time_column] = time_series
+                    if bucket == "quarter":
+                        temp["_period_bucket"] = temp[time_column].dt.to_period("Q").astype(str)
+                    elif bucket == "year":
+                        temp["_period_bucket"] = temp[time_column].dt.to_period("Y").astype(str)
+                    else:
+                        temp["_period_bucket"] = temp[time_column].dt.to_period("M").astype(str)
+                    if method == "distinct_count":
+                        grouped = temp.groupby([entity_column, "_period_bucket"])[column].nunique(dropna=True)
+                    elif method == "mean":
+                        grouped = temp.groupby([entity_column, "_period_bucket"])[column].mean()
+                    else:
+                        grouped = temp.groupby([entity_column, "_period_bucket"])[column].sum()
+                    growth_rows = []
+                    for entity, series in grouped.groupby(level=0):
+                        entity_series = series.droplevel(0).sort_index()
+                        growth = entity_series.pct_change().replace([float("inf"), float("-inf")], pd.NA).dropna()
+                        if growth.empty:
+                            continue
+                        growth_rows.append({
+                            entity_column: entity,
+                            "latest_growth_rate": growth.iloc[-1],
+                            "average_growth_rate": growth.mean(),
+                            "periods": int(len(entity_series)),
+                        })
+                    growth_df = pd.DataFrame(growth_rows)
+                    if not growth_df.empty:
+                        sort_col = "average_growth_rate"
+                        growth_df = growth_df.sort_values(sort_col, ascending=ascending).head(top_n)
+                        result_payload["rows"] = _sanitize_numbers(growth_df.to_dict(orient="records"))
+                        result_payload["value"] = float(growth_df.iloc[0][sort_col]) if len(growth_df) else None
+                        result_payload["growth_sort"] = "asc" if ascending else "desc"
+        elif operation == "segment_seasonality":
+            entity_column = params.get("entity_column")
+            time_column = params.get("time_column")
+            method = params.get("method", "sum")
+            top_n = int(params.get("top_n", 10) or 10)
+            if entity_column in current.columns and time_column in current.columns and column in current.columns:
+                time_series = _coerce_datetime_like(current[time_column])
+                if pd.api.types.is_datetime64_any_dtype(time_series):
+                    temp = current.copy()
+                    temp[time_column] = time_series
+                    temp["_month_bucket"] = temp[time_column].dt.month
+                    if method == "distinct_count":
+                        grouped = temp.groupby([entity_column, "_month_bucket"])[column].nunique(dropna=True)
+                    elif method == "mean":
+                        grouped = temp.groupby([entity_column, "_month_bucket"])[column].mean()
+                    else:
+                        grouped = temp.groupby([entity_column, "_month_bucket"])[column].sum()
+                    rows = []
+                    for entity, series in grouped.groupby(level=0):
+                        entity_series = series.droplevel(0)
+                        mean_value = float(entity_series.mean()) if len(entity_series) else 0.0
+                        std_value = float(entity_series.std(ddof=0)) if len(entity_series) > 1 else 0.0
+                        seasonality_score = float(std_value / mean_value) if mean_value else 0.0
+                        rows.append({
+                            entity_column: entity,
+                            "seasonality_score": seasonality_score,
+                            "peak_month": int(entity_series.idxmax()) if len(entity_series) else None,
+                        })
+                    seasonality_df = pd.DataFrame(rows)
+                    if not seasonality_df.empty:
+                        seasonality_df = seasonality_df.sort_values("seasonality_score", ascending=False).head(top_n)
+                        result_payload["rows"] = _sanitize_numbers(seasonality_df.to_dict(orient="records"))
+                        result_payload["value"] = float(seasonality_df.iloc[0]["seasonality_score"]) if len(seasonality_df) else None
+        elif operation == "concentration_score":
+            parent_column = params.get("parent_column")
+            child_column = params.get("child_column")
+            method = params.get("method", "sum")
+            top_n = int(params.get("top_n", 10) or 10)
+            if parent_column in current.columns and child_column in current.columns and column in current.columns:
+                if method == "distinct_count":
+                    grouped = current.groupby([parent_column, child_column])[column].nunique(dropna=True)
+                elif method == "mean":
+                    grouped = current.groupby([parent_column, child_column])[column].mean()
+                else:
+                    grouped = current.groupby([parent_column, child_column])[column].sum()
+                rows = []
+                for parent, series in grouped.groupby(level=0):
+                    child_series = series.droplevel(0).sort_values(ascending=False)
+                    total = float(child_series.sum())
+                    if not total:
+                        continue
+                    top_share = float(child_series.iloc[0] / total)
+                    hhi = float(((child_series / total) ** 2).sum())
+                    rows.append({
+                        parent_column: parent,
+                        "top_child_share": top_share,
+                        "concentration_score": hhi,
+                        "top_child": str(child_series.index[0]),
+                    })
+                concentration_df = pd.DataFrame(rows)
+                if not concentration_df.empty:
+                    concentration_df = concentration_df.sort_values("concentration_score", ascending=False).head(top_n)
+                    result_payload["rows"] = _sanitize_numbers(concentration_df.to_dict(orient="records"))
+                    result_payload["value"] = float(concentration_df.iloc[0]["concentration_score"]) if len(concentration_df) else None
+        elif operation == "trend_classification" and column in current.columns:
+            source = params.get("source")
+            if source == "growth_rows" and result_payload.get("rows"):
+                growth_values = [row.get("growth_rate") for row in result_payload["rows"] if row.get("growth_rate") is not None]
+                if growth_values:
+                    avg_growth = sum(growth_values) / len(growth_values)
+                    if avg_growth > 0.03:
+                        trend = "growing"
+                    elif avg_growth < -0.03:
+                        trend = "declining"
+                    else:
+                        trend = "flat"
+                    result_payload["trend"] = trend
+                    result_payload["value"] = avg_growth
 
     if current_series is not None:
         if isinstance(current_series, pd.Series):

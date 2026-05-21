@@ -113,18 +113,18 @@ def classify_analytic_intent(query: str):
 
     intent_map = {
         "comparison": ["compare", "vs", "versus", "difference", "against"],
-        "temporal": ["trend", "over time", "per day", "per month", "growth", "decline"],
-        "composition": ["breakdown", "distribution", "percentage", "share", "portion"],
+        "temporal": ["trend", "over time", "per day", "per month", "growth", "decline", "monthly", "quarterly", "month-over-month", "quarter-over-quarter", "seasonal", "seasonality", "growing fastest"],
+        "composition": ["breakdown", "distribution", "percentage", "share", "portion", "repeat purchases", "top customers", "product mix", "overdependent"],
         "relationship": ["correlation", "relationship", "impact", "effect", "influence", "affect", "cause", "causal", "drive"],
-        "extremes": ["top", "bottom", "highest", "lowest", "max", "min"],
-        "profiling": ["average", "mean", "median", "summary", "stats", "statistics"],
+        "extremes": ["top", "bottom", "highest", "lowest", "max", "min", "best", "worst", "best sellers", "rarely sold", "sell the most"],
+        "profiling": ["average", "mean", "median", "summary", "stats", "statistics", "total", "how many", "count", "revenue", "orders", "customers", "profit proxy", "sell", "sold", "pricing", "volume"],
         "outliers": ["outlier", "outliers", "unusual", "anomaly", "anomalies"],
-        "investigative": ["why", "drill down", "details", "explain"],
+        "investigative": ["why", "drill down", "details", "explain", "scaling efficiently", "lower quality"],
         "predictive": ["forecast", "predict", "what if", "estimate"]
     }
 
     for intent, keywords in intent_map.items():
-        if any(word in query for word in keywords):
+        if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in keywords):
             return intent
 
     return "unknown"
@@ -770,23 +770,23 @@ def detect_intents(query: str):
     intents = []
 
     # --- COMPARISON ---
-    if any(word in query for word in ["compare", "vs", "versus", "difference", "affect"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["compare", "vs", "versus", "difference", "affect"]):
         intents.append({"type": "comparison", "confidence": 0.8})
 
     # --- TEMPORAL ---
-    if any(word in query for word in ["over time", "trend", "monthly", "yearly", "daily", "growth"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["over time", "trend", "monthly", "yearly", "daily", "growth", "month-over-month", "quarter-over-quarter", "seasonal", "seasonality", "declining", "growing fastest"]):
         intents.append({"type": "temporal", "confidence": 0.75})
 
     # --- EXTREMES ---
-    if any(word in query for word in ["top", "highest", "lowest", "max", "min"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["top", "highest", "lowest", "max", "min", "best", "worst", "best sellers", "rarely sold"]):
         intents.append({"type": "extremes", "confidence": 0.8})
 
     # --- COMPOSITION ---
-    if any(word in query for word in ["percentage", "ratio", "breakdown", "share"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["percentage", "ratio", "breakdown", "share", "repeat purchases", "product mix", "overdependent"]):
         intents.append({"type": "composition", "confidence": 0.75})
 
     # --- PROFILING ---
-    if any(word in query for word in ["average", "mean", "distribution", "median", "summary", "statistics"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["average", "mean", "distribution", "median", "summary", "statistics", "total", "count", "how many", "revenue", "orders", "customers", "profit proxy", "sell", "sold", "volume", "pricing"]):
         intents.append({"type": "profiling", "confidence": 0.7})
 
     # --- OUTLIER DETECTION ---
@@ -859,8 +859,30 @@ def _has_analysis_request(analytic_intent: str, query: str) -> bool:
         "median",
         "outlier",
         "trend",
+        "total",
+        "count",
+        "how many",
+        "revenue",
+        "orders",
+        "customers",
+        "growth",
+        "month-over-month",
+        "quarter-over-quarter",
+        "percentage",
+        "share",
+        "profit proxy",
+        "repeat purchases",
+        "sell",
+        "sold",
+        "volume",
+        "seasonal",
+        "seasonality",
+        "product mix",
+        "overdependent",
+        "best sellers",
+        "rarely sold",
     ]
-    return any(keyword in query for keyword in analysis_keywords)
+    return any(re.search(rf"(?<!\\w){re.escape(keyword)}(?!\\w)", query) for keyword in analysis_keywords)
 
 # ------------------------
 # MAIN NODE
@@ -926,6 +948,7 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     )
 
     intent = {
+        "query": original_query,
         "type": "ast",
         "analytic_intent": analytic_intent,
         "analytic_intents": [],

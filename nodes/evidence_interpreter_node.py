@@ -202,24 +202,178 @@ def _direct_computation_stories(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     strategy = payload.get("strategy")
     stories: List[Dict[str, Any]] = []
 
+    if payload.get("trend"):
+        stories.append({
+            "type": "summary_numeric",
+            "insight": f"The period trend is {payload.get('trend')}",
+            "column": strategy or "trend",
+            "mean": float(value) if value is not None else None,
+            "median": float(value) if value is not None else None,
+            "min": float(value) if value is not None else None,
+            "max": float(value) if value is not None else None,
+            "confidence": "medium",
+        })
+        return stories
+
+    if payload.get("top_n") and value is not None:
+        stories.append({
+            "type": "summary_numeric",
+            "insight": f"Top contributors account for about {round(float(value) * 100, 2)}% of the total",
+            "column": strategy or "share",
+            "mean": float(value),
+            "median": float(value),
+            "min": float(value),
+            "max": float(value),
+            "confidence": "medium",
+        })
+        return stories
+
+    if payload.get("summary", {}).get("repeat_entities") is not None and value is not None:
+        stories.append({
+            "type": "summary_numeric",
+            "insight": f"About {round(float(value) * 100, 2)}% of entities are repeat purchasers",
+            "column": strategy or "repeat_rate",
+            "mean": float(value),
+            "median": float(value),
+            "min": float(value),
+            "max": float(value),
+            "confidence": "medium",
+        })
+        return stories
+
     if rows:
         first = rows[0]
         keys = list(first.keys())
-        if len(keys) >= 2:
+        if payload.get("ranking_sort") in {"asc", "desc"} and len(keys) >= 2:
             group_key, value_key = keys[0], keys[1]
-            ranked = sorted(rows, key=lambda row: row.get(value_key, float("-inf")), reverse=True)
-            top = ranked[0]
-            bottom = ranked[-1]
+            ascending = payload.get("ranking_sort") == "asc"
+            top = rows[0]
+            if ascending:
+                insight = f"{top[group_key]} is among the lowest-selling {group_key} values"
+            else:
+                insight = f"{top[group_key]} leads on {value_key}"
             stories.append({
                 "type": "grouped_numeric",
-                "insight": f"{top[group_key]} has the highest {value_key} and {bottom[group_key]} the lowest",
+                "insight": insight,
                 "column": value_key,
                 "group_column": group_key,
                 "top_group": str(top[group_key]),
-                "bottom_group": str(bottom[group_key]),
                 "top_value": float(top[value_key]),
-                "bottom_value": float(bottom[value_key]),
-                "effect_size": float(top[value_key]) - float(bottom[value_key]),
+                "effect_size": float(top[value_key]),
+                "confidence": "medium",
+            })
+            return stories
+        if {"primary_value", "secondary_value", "contrast_score"}.issubset(first.keys()):
+            top = rows[0]
+            entity_key = next((key for key in keys if key not in {"primary_value", "secondary_value", "contrast_score"}), "segment")
+            pattern = payload.get("contrast_pattern")
+            if pattern == "high_low":
+                insight = f"{top[entity_key]} combines strong volume with comparatively weak revenue"
+            elif pattern == "low_high":
+                insight = f"{top[entity_key]} combines lower volume with premium pricing"
+            else:
+                insight = f"{top[entity_key]} best matches the requested volume-versus-value contrast"
+            stories.append({
+                "type": "grouped_numeric",
+                "insight": insight,
+                "column": "contrast_score",
+                "group_column": entity_key,
+                "top_group": str(top[entity_key]),
+                "top_value": float(top["contrast_score"]),
+                "effect_size": float(top["contrast_score"]),
+                "confidence": "medium",
+            })
+            return stories
+        elif {"latest_growth_rate", "average_growth_rate"}.issubset(first.keys()):
+            entity_key = next((key for key in keys if key not in {"latest_growth_rate", "average_growth_rate", "periods"}), "segment")
+            top = rows[0]
+            if payload.get("growth_sort") == "asc":
+                insight = f"{top[entity_key]} shows the weakest growth pattern"
+            else:
+                insight = f"{top[entity_key]} shows the strongest recent growth pattern"
+            stories.append({
+                "type": "grouped_numeric",
+                "insight": insight,
+                "column": "average_growth_rate",
+                "group_column": entity_key,
+                "top_group": str(top[entity_key]),
+                "top_value": float(top["average_growth_rate"]),
+                "effect_size": float(top["average_growth_rate"]),
+                "confidence": "medium",
+            })
+            return stories
+        elif {"seasonality_score", "peak_month"}.issubset(first.keys()):
+            entity_key = next((key for key in keys if key not in {"seasonality_score", "peak_month"}), "segment")
+            top = rows[0]
+            stories.append({
+                "type": "grouped_numeric",
+                "insight": f"{top[entity_key]} appears most seasonal, peaking around month {top['peak_month']}",
+                "column": "seasonality_score",
+                "group_column": entity_key,
+                "top_group": str(top[entity_key]),
+                "top_value": float(top["seasonality_score"]),
+                "effect_size": float(top["seasonality_score"]),
+                "confidence": "medium",
+            })
+            return stories
+        elif {"top_child_share", "concentration_score", "top_child"}.issubset(first.keys()):
+            entity_key = next((key for key in keys if key not in {"top_child_share", "concentration_score", "top_child"}), "segment")
+            top = rows[0]
+            stories.append({
+                "type": "grouped_numeric",
+                "insight": f"{top[entity_key]} is highly concentrated in {top['top_child']}",
+                "column": "concentration_score",
+                "group_column": entity_key,
+                "top_group": str(top[entity_key]),
+                "top_value": float(top["concentration_score"]),
+                "effect_size": float(top["top_child_share"]),
+                "confidence": "medium",
+            })
+            return stories
+        if {"period", "value", "growth_rate"}.issubset(first.keys()):
+            valid_growth = [row for row in rows if row.get("growth_rate") is not None]
+            if valid_growth:
+                latest = valid_growth[-1]
+                stories.append({
+                    "type": "summary_numeric",
+                    "insight": f"Latest period growth is {round(float(latest['growth_rate']) * 100, 2)}%",
+                    "column": "growth_rate",
+                    "mean": float(latest["growth_rate"]),
+                    "median": float(latest["growth_rate"]),
+                    "min": float(latest["growth_rate"]),
+                    "max": float(latest["growth_rate"]),
+                    "confidence": "medium",
+                })
+        elif len(keys) >= 2:
+            group_key, value_key = keys[0], keys[1]
+            ranked = sorted(rows, key=lambda row: row.get(value_key, float("-inf")), reverse=True)
+            ascending = payload.get("ranking_sort") == "asc"
+            top = ranked[0] if not ascending else ranked[-1]
+            bottom = ranked[-1] if not ascending else ranked[0]
+            if ascending:
+                insight = f"{bottom[group_key]} is among the lowest {value_key} groups and {top[group_key]} among the highest"
+                top_group = str(bottom[group_key])
+                top_value = float(bottom[value_key])
+                bottom_group = str(top[group_key])
+                bottom_value = float(top[value_key])
+                effect_size = top_value - bottom_value
+            else:
+                insight = f"{top[group_key]} has the highest {value_key} and {bottom[group_key]} the lowest"
+                top_group = str(top[group_key])
+                top_value = float(top[value_key])
+                bottom_group = str(bottom[group_key])
+                bottom_value = float(bottom[value_key])
+                effect_size = top_value - bottom_value
+            stories.append({
+                "type": "grouped_numeric",
+                "insight": insight,
+                "column": value_key,
+                "group_column": group_key,
+                "top_group": top_group,
+                "bottom_group": bottom_group,
+                "top_value": top_value,
+                "bottom_value": bottom_value,
+                "effect_size": effect_size,
                 "confidence": "medium",
             })
     elif value is not None:

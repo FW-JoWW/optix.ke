@@ -303,16 +303,19 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
 
     required_columns = _dedupe_preserve_order(selected_columns + required_columns)
     source_df = df
+    broader_source_df = (
+        state.get("raw_analysis_dataset")
+        if state.get("raw_analysis_dataset") is not None
+        else state.get("cleaned_data")
+        if state.get("cleaned_data") is not None
+        else state.get("dataframe")
+        if state.get("dataframe") is not None
+        else df
+    )
     if any(item.get("tool") in {"predictive_analysis", "prescriptive_analysis"} for item in unique_plan):
-        source_df = (
-            state.get("raw_analysis_dataset")
-            if state.get("raw_analysis_dataset") is not None
-            else state.get("cleaned_data")
-            if state.get("cleaned_data") is not None
-            else state.get("dataframe")
-            if state.get("dataframe") is not None
-            else df
-        )
+        source_df = broader_source_df
+    elif any(col not in df.columns for col in required_columns):
+        source_df = broader_source_df
 
     available_columns = [col for col in required_columns if col in source_df.columns]
     if available_columns:

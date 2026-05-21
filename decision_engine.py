@@ -23,6 +23,25 @@ def _info(profile: Dict[str, Any], column: str) -> Dict[str, Any]:
     return (profile.get("columns") or {}).get(column, {})
 
 
+def _all_columns(profile: Dict[str, Any]) -> List[str]:
+    explicit = profile.get("column_names")
+    if explicit:
+        return explicit
+    columns_dict = profile.get("columns") or {}
+    if columns_dict:
+        return list(columns_dict.keys())
+    ordered: List[str] = []
+    for group in ("numeric_columns", "categorical_columns", "datetime_columns", "identifier_columns"):
+        for column in profile.get(group, []) or []:
+            if column not in ordered:
+                ordered.append(column)
+    unique_counts = profile.get("unique_counts") or {}
+    for column in unique_counts.keys():
+        if column not in ordered:
+            ordered.append(column)
+    return ordered
+
+
 def _role(context: Dict[str, Any], column: str) -> str:
     return (context.get("column_roles") or {}).get(column, "unknown")
 
@@ -44,6 +63,151 @@ def _contains_any(text: str, words: List[str]) -> bool:
     return False
 
 
+def _best_text_match(query: str, candidates: List[str], required_tokens: List[str] | None = None) -> str | None:
+    query_tokens = [token for token in re.findall(r"[a-z0-9_]+", (query or "").lower()) if token]
+    best_column = None
+    best_score = 0.0
+    for candidate in candidates:
+        candidate_tokens = [token for token in re.split(r"[_\W]+", str(candidate).lower()) if token]
+        if required_tokens and not any(token in candidate_tokens for token in required_tokens):
+            continue
+        overlap = len(set(query_tokens) & set(candidate_tokens))
+        similarity = max((_similarity(candidate, token) for token in query_tokens), default=0.0)
+        score = overlap + similarity
+        if score > best_score:
+            best_score = score
+            best_column = candidate
+    return best_column
+
+
+def _profile_group(profile: Dict[str, Any], group_name: str) -> List[str]:
+    return list(profile.get(group_name, []) or [])
+
+
+def _name_contains_any(column: str, tokens: List[str]) -> bool:
+    parts = [token for token in re.split(r"[_\W]+", str(column).lower()) if token]
+    return any(token in parts for token in tokens)
+
+
+def _identifier_columns(profile: Dict[str, Any], context: Dict[str, Any]) -> List[str]:
+    columns = _all_columns(profile)
+    identifiers = []
+    for col in columns:
+        lower = str(col).lower()
+        if _role(context, col) == "identifier" or lower.endswith("_id") or lower == "id":
+            identifiers.append(col)
+    return identifiers
+
+
+def _business_time_column(question: str, profile: Dict[str, Any], context: Dict[str, Any], selected_columns: List[str]) -> str | None:
+    profile_columns = _all_columns(profile)
+    datetime_columns = _profile_group(profile, "datetime_columns")
+    candidates = [
+        col for col in _all_columns(profile)
+        if (_timestamp_like(profile, context, col) or col in datetime_columns)
+    ]
+    if not candidates:
+        candidates = [
+            col for col in profile_columns
+            if any(token in str(col).lower() for token in ["date", "time", "timestamp", "month", "quarter", "year"])
+        ]
+    if not candidates:
+        return None
+
+    def time_score(column: str) -> float:
+        lower = str(column).lower()
+        score = 0.0
+        if any(token in lower for token in ["purchase", "order"]):
+            score += 3.0
+        if "approved" in lower:
+            score += 2.0
+        if any(token in lower for token in ["purchase", "created", "event"]):
+            score += 2.0
+        if any(token in lower for token in ["timestamp", "date", "time"]):
+            score += 1.5
+        if any(token in lower for token in ["delivered", "estimated", "shipping", "limit"]):
+            score -= 0.8
+        lexical = max((_similarity(column, token) for token in re.findall(r"[a-z0-9_]+", (question or "").lower())), default=0.0)
+        return score + lexical
+
+    ranked = sorted(candidates, key=time_score, reverse=True)
+    preferred = _best_text_match(question, ranked, ["purchase", "order", "date", "time", "month", "quarter", "year"])
+    return preferred or ranked[0]
+
+
+def _business_entity_column(question: str, profile: Dict[str, Any], context: Dict[str, Any], entity: str) -> str | None:
+    identifiers = _identifier_columns(profile, context)
+    required = {
+        "order": ["order"],
+        "customer": ["customer"],
+    }.get(entity, [entity])
+    matches = [col for col in identifiers if any(token in re.split(r"[_\W]+", str(col).lower()) for token in required)]
+    if not matches:
+        return _best_text_match(question, identifiers, required)
+
+    def entity_score(column: str) -> float:
+        lower = str(column).lower()
+        score = 0.0
+        if entity == "order" and lower == "order_id":
+            score += 3.0
+        if entity == "customer" and "unique" in lower:
+            score += 3.0
+        if lower.endswith("_id"):
+            score += 1.0
+        score += max((_similarity(column, token) for token in required), default=0.0)
+        return score
+
+    matches.sort(key=entity_score, reverse=True)
+    return matches[0]
+
+
+def _growth_bucket(question: str) -> str:
+    if _contains_any(question, ["quarter", "quarterly", "qoq"]):
+        return "quarter"
+    if _contains_any(question, ["year", "yearly", "annual"]):
+        return "year"
+    return "month"
+
+
+def _looks_like_count_question(question: str) -> bool:
+    return _contains_any(question, ["how many", "number of", "count", "total orders", "unique customers"])
+
+
+def _looks_like_share_question(question: str) -> bool:
+    return _contains_any(question, ["percentage", "share", "portion", "comes from top"])
+
+
+def _looks_like_growth_question(question: str) -> bool:
+    return _contains_any(question, ["growth rate", "month-over-month", "quarter-over-quarter", "mom", "qoq"])
+
+
+def _business_segment_column(profile: Dict[str, Any], context: Dict[str, Any], entity: str) -> str | None:
+    candidates = [
+        col for col in _all_columns(profile)
+        if col in _profile_group(profile, "categorical_columns") or _role(context, col) in {"categorical_feature", "grouping_key"}
+    ]
+    if not candidates:
+        return None
+
+    def score(column: str) -> float:
+        lower = str(column).lower()
+        value = 0.0
+        if entity == "category":
+            if "category" in lower:
+                value += 4.0
+            if "english" in lower:
+                value += 1.0
+        elif entity == "product":
+            if "product" in lower:
+                value += 4.0
+            if lower == "product_id":
+                value += 2.0
+        return value
+
+    ranked = sorted(candidates, key=score, reverse=True)
+    return ranked[0] if score(ranked[0]) > 0 else None
+
+
 def _base_name(column: str) -> str:
     return re.sub(r"_+\d+$", "", str(column).strip().lower())
 
@@ -55,7 +219,9 @@ def _similarity(left: str, right: str) -> float:
 def _numeric_capable(profile: Dict[str, Any], context: Dict[str, Any], column: str) -> bool:
     info = _info(profile, column)
     return (
-        info.get("inferred_type") == "numeric"
+        column in _profile_group(profile, "numeric_columns")
+        or info.get("inferred_type") == "numeric"
+        or info.get("dtype", "").startswith(("int", "float"))
         or info.get("numeric_like_ratio", 0.0) >= 0.65
         or _role(context, column) in {"numeric_measure", "derived_metric"}
     )
@@ -66,12 +232,22 @@ def _categorical_capable(profile: Dict[str, Any], context: Dict[str, Any], colum
     role = _role(context, column)
     if role in {"numeric_measure", "derived_metric"}:
         return False
-    return info.get("inferred_type") in {"categorical", "datetime"} or role in {"categorical_feature", "grouping_key", "timestamp"}
+    return (
+        column in _profile_group(profile, "categorical_columns")
+        or column in _profile_group(profile, "datetime_columns")
+        or info.get("inferred_type") in {"categorical", "datetime"}
+        or role in {"categorical_feature", "grouping_key", "timestamp"}
+    )
 
 
 def _timestamp_like(profile: Dict[str, Any], context: Dict[str, Any], column: str) -> bool:
     info = _info(profile, column)
+    if column in _profile_group(profile, "numeric_columns") or _role(context, column) in {"numeric_measure", "derived_metric"}:
+        return column in _profile_group(profile, "datetime_columns") or _role(context, column) == "timestamp"
     return (
+        column in _profile_group(profile, "datetime_columns")
+        or _name_contains_any(column, ["timestamp", "date", "time"])
+        or
         info.get("inferred_type") == "datetime"
         or info.get("datetime_like_ratio", 0.0) >= 0.65
         or _role(context, column) == "timestamp"
@@ -93,7 +269,48 @@ def _metric_score(
         score += 0.05
     if column in relationships.get("derived_columns", []):
         score += 0.05
+    lower = str(column).lower()
+    if any(token in lower for token in ["price", "revenue", "sales", "payment", "amount", "value", "total", "profit", "cost", "freight"]):
+        score += 0.18
+    if lower.endswith("_id") or lower in {"id", "order_item_id"}:
+        score -= 0.35
+    if any(token in lower for token in ["zip", "prefix", "count", "qty", "lenght", "weight", "height", "width"]):
+        score -= 0.08
     return _bounded_confidence(score)
+
+
+def _preferred_business_metrics(question: str, profile: Dict[str, Any], context: Dict[str, Any], relationships: Dict[str, Any]) -> List[str]:
+    candidates = [
+        col for col in _all_columns(profile)
+        if _numeric_capable(profile, context, col)
+    ]
+    if not candidates:
+        return []
+
+    tokens = re.findall(r"[a-z0-9_]+", (question or "").lower())
+
+    def score(column: str) -> float:
+        lower = str(column).lower()
+        value = _metric_score(profile, context, relationships, column)
+        if _contains_any(question, ["revenue", "sales", "order value", "aov"]):
+            if any(token in lower for token in ["payment", "revenue", "sales", "amount"]):
+                value += 0.6
+            elif "price" in lower:
+                value += 0.35
+            elif "total" in lower and "freight" not in lower:
+                value += 0.25
+            if "freight" in lower or "cost" in lower:
+                value -= 0.18
+        if _contains_any(question, ["profit", "cost", "freight"]):
+            if any(token in lower for token in ["profit", "cost", "freight", "price", "payment", "margin"]):
+                value += 0.2
+        if _contains_any(question, ["quality"]):
+            if any(token in lower for token in ["review", "score", "rating", "quality"]):
+                value += 0.2
+        lexical = max((_similarity(column, token) for token in tokens), default=0.0)
+        return value + 0.15 * lexical
+
+    return [item[0] for item in sorted(((col, score(col)) for col in candidates), key=lambda item: item[1], reverse=True)]
 
 
 def _family_candidates(
@@ -105,7 +322,7 @@ def _family_candidates(
         return []
     family = _base_name(column)
     candidates = []
-    for candidate in profile.get("column_names", []) or []:
+    for candidate in _all_columns(profile):
         if _base_name(candidate) != family:
             continue
         if _numeric_capable(profile, context, candidate):
@@ -140,10 +357,12 @@ def _determine_strategies(question: str, intent: Dict[str, Any]) -> List[str]:
         add("relationship")
     if "comparison" in explicit or _contains_any(query, ["compare", "difference", "affect", "impact", "effect"]):
         add("comparison")
-    if any(item in {"composition", "distribution"} for item in explicit) or _contains_any(query, ["distribution", "frequency", "mode", "cardinality", "rare"]):
+    if any(item in {"composition", "distribution"} for item in explicit) or _contains_any(query, ["distribution", "frequency", "mode", "cardinality", "rare", "share", "mix", "overdependent"]):
         add("distribution")
-    if any(item in {"profiling", "aggregation", "temporal", "extremes"} for item in explicit) or _contains_any(query, ["average", "mean", "median", "summary", "statistics", "sum", "total"]):
+    if any(item in {"profiling", "aggregation", "temporal", "extremes"} for item in explicit) or _contains_any(query, ["average", "mean", "median", "summary", "statistics", "sum", "total", "sell", "sold", "best seller", "best sellers", "pricing", "volume", "revenue"]):
         add("aggregation")
+    if _contains_any(query, ["trend", "growth", "declining", "seasonal", "seasonality"]):
+        add("temporal")
     return ordered or ["unknown"]
 
 
@@ -171,27 +390,27 @@ def _select_group_columns(
     strategy: str,
 ) -> List[str]:
     strategy_columns = [
-        col for col in ((intent.get("intent_columns") or {}).get(strategy) or [])
-        if col in (profile.get("column_names") or []) and _categorical_capable(profile, context, col)
+            col for col in ((intent.get("intent_columns") or {}).get(strategy) or [])
+            if col in _all_columns(profile) and _categorical_capable(profile, context, col)
     ]
     if strategy_columns:
         return strategy_columns
 
     explicit_group_columns = [
         col for col in (intent.get("group_by_columns") or [])
-        if col in (profile.get("column_names") or []) and _categorical_capable(profile, context, col)
+        if col in _all_columns(profile) and _categorical_capable(profile, context, col)
     ]
     if explicit_group_columns:
         return explicit_group_columns
 
     group_by = intent.get("group_by")
-    if group_by in (profile.get("column_names") or []) and _categorical_capable(profile, context, group_by):
+    if group_by in _all_columns(profile) and _categorical_capable(profile, context, group_by):
         return [group_by]
 
     candidates = [col for col in selected_columns if _categorical_capable(profile, context, col)]
     if not candidates:
         candidates = [
-            col for col in (profile.get("column_names") or [])
+            col for col in _all_columns(profile)
             if _categorical_capable(profile, context, col)
         ]
     if not candidates:
@@ -229,9 +448,10 @@ def _select_metric_columns(
     relationships: Dict[str, Any],
     strategy: str,
 ) -> List[str]:
+    business_metric_candidates = _preferred_business_metrics(question, profile, context, relationships)
     strategy_columns = [
         col for col in ((intent.get("intent_columns") or {}).get(strategy) or [])
-        if col in (profile.get("column_names") or []) and _numeric_capable(profile, context, col)
+        if col in _all_columns(profile) and _numeric_capable(profile, context, col)
     ]
     if strategy_columns:
         if strategy == "aggregation" and _contains_any(question, ["summary", "statistics", "describe"]):
@@ -241,13 +461,19 @@ def _select_metric_columns(
 
     explicit_aggregate_columns = [
         col for col in (intent.get("aggregate_columns") or [])
-        if col in (profile.get("column_names") or []) and _numeric_capable(profile, context, col)
+        if col in _all_columns(profile) and _numeric_capable(profile, context, col)
     ]
     if strategy == "aggregation" and explicit_aggregate_columns and _contains_any(question, ["summary", "statistics", "describe"]):
         return explicit_aggregate_columns
 
+    if strategy == "aggregation" and _contains_any(question, ["revenue", "sales", "profit", "freight", "order value", "aov"]):
+        if explicit_aggregate_columns:
+            return explicit_aggregate_columns
+        if business_metric_candidates:
+            return business_metric_candidates[:1]
+
     aggregate_column = intent.get("aggregate_column")
-    if aggregate_column in (profile.get("column_names") or []):
+    if aggregate_column in _all_columns(profile):
         family_candidates = _family_candidates(aggregate_column, profile, context)
         if family_candidates:
             family_candidates.sort(
@@ -265,7 +491,7 @@ def _select_metric_columns(
     numeric_candidates = [col for col in selected_columns if _numeric_capable(profile, context, col)]
     if not numeric_candidates:
         numeric_candidates = [
-            col for col in (profile.get("column_names") or [])
+            col for col in _all_columns(profile)
             if _numeric_capable(profile, context, col)
         ]
     if not numeric_candidates:
@@ -299,6 +525,8 @@ def _select_metric_columns(
         explicit_numeric = [col for col in selected_columns if col in [item[0] for item in scored]]
         if _contains_any(question, ["summary", "statistics", "describe"]) and explicit_numeric:
             return explicit_numeric
+        if _contains_any(question, ["revenue", "sales", "profit", "freight", "order value", "aov"]) and business_metric_candidates:
+            return business_metric_candidates[:1]
 
     return [scored[0][0]] if scored else []
 
@@ -492,6 +720,571 @@ def build_computation_plan(
 
     all_group_columns: List[str] = []
     all_metric_columns: List[str] = []
+
+    time_column = _business_time_column(question, dataset_profile, inferred_context, selected_columns)
+    order_column = _business_entity_column(question, dataset_profile, inferred_context, "order")
+    customer_column = _business_entity_column(question, dataset_profile, inferred_context, "customer")
+    category_column = _business_segment_column(dataset_profile, inferred_context, "category")
+    product_column = _business_segment_column(dataset_profile, inferred_context, "product")
+    bucket = _growth_bucket(question)
+    business_metric_candidates = _preferred_business_metrics(
+        question,
+        dataset_profile,
+        inferred_context,
+        relationship_signals,
+    )
+    primary_metric = _select_metric_columns(
+        question,
+        user_intent,
+        selected_columns,
+        dataset_profile,
+        inferred_context,
+        relationship_signals,
+        "aggregation",
+    )
+    if _contains_any(question, ["revenue", "sales", "order value", "aov"]) and business_metric_candidates:
+        primary_metric = business_metric_candidates[:1]
+
+    if _contains_any(question, ["over time", "trend", "monthly sales", "monthly revenue", "sales trends", "revenue generated over time"]) and time_column and primary_metric:
+        group_reason = f"Group by {time_column} in {bucket} buckets because the question explicitly asks for performance over time."
+        add_step(
+            ComputationStep(
+                operation="group_by",
+                column=time_column,
+                parameters={"intent_type": "aggregation", "bucket": bucket},
+                justification=group_reason,
+                trace=_trace(group_reason, 0.86, ["temporal_intent", "timestamp_resolved"]),
+            )
+        )
+        agg_reason = f"Aggregate {primary_metric[0]} within each {bucket} bucket to produce the requested time series."
+        add_step(
+            ComputationStep(
+                operation="aggregate",
+                column=primary_metric[0],
+                parameters={"method": "sum", "within": time_column, "intent_type": "aggregation"},
+                justification=agg_reason,
+                trace=_trace(agg_reason, 0.84, ["time_series_aggregation"]),
+            )
+        )
+        return ComputationPlanModel(
+            steps=steps,
+            confidence_score=0.84,
+            justification="Built a temporal KPI plan with explicit time bucketing and grouped aggregation.",
+            deferred=False,
+        )
+
+    if _looks_like_count_question(question):
+        if _contains_any(question, ["unique customer", "customers purchased"]) and customer_column:
+            reason = f"Count distinct values of {customer_column} because the question asks for unique purchasing customers."
+            add_step(
+                ComputationStep(
+                    operation="distinct_count",
+                    column=customer_column,
+                    justification=reason,
+                    trace=_trace(reason, 0.9, ["distinct_count_intent", "customer_identifier"]),
+                )
+            )
+            return ComputationPlanModel(
+                steps=steps,
+                confidence_score=0.9,
+                justification="Built a distinct-customer count plan from the resolved customer identifier.",
+                deferred=False,
+            )
+        if _contains_any(question, ["total orders", "orders were placed"]) and order_column:
+            reason = f"Count distinct values of {order_column} because the question asks for total orders rather than row counts or sums."
+            add_step(
+                ComputationStep(
+                    operation="distinct_count",
+                    column=order_column,
+                    justification=reason,
+                    trace=_trace(reason, 0.9, ["distinct_count_intent", "order_identifier"]),
+                )
+            )
+            return ComputationPlanModel(
+                steps=steps,
+                confidence_score=0.9,
+                justification="Built a distinct-order count plan from the resolved order identifier.",
+                deferred=False,
+            )
+
+    if _contains_any(question, ["average order value", "aov"]) and primary_metric and order_column:
+        group_reason = f"Group by {order_column} because average order value must be computed at the order level first."
+        add_step(
+            ComputationStep(
+                operation="group_by",
+                column=order_column,
+                parameters={"intent_type": "aggregation"},
+                justification=group_reason,
+                trace=_trace(group_reason, 0.88, ["order_level_metric"]),
+            )
+        )
+        agg_reason = f"Sum {primary_metric[0]} within each order to construct order-level revenue."
+        add_step(
+            ComputationStep(
+                operation="aggregate",
+                column=primary_metric[0],
+                parameters={"method": "sum", "within": order_column, "intent_type": "aggregation"},
+                justification=agg_reason,
+                trace=_trace(agg_reason, 0.88, ["order_level_metric"]),
+            )
+        )
+        mean_reason = "Average the order-level totals to compute AOV."
+        add_step(
+            ComputationStep(
+                operation="aggregate",
+                column=primary_metric[0],
+                parameters={"method": "mean", "scope": "group_results", "intent_type": "aggregation"},
+                justification=mean_reason,
+                trace=_trace(mean_reason, 0.88, ["aov_definition"]),
+            )
+        )
+        return ComputationPlanModel(
+            steps=steps,
+            confidence_score=0.88,
+            justification="Built an order-level aggregation plan for average order value instead of averaging merged line rows directly.",
+            deferred=False,
+        )
+
+    if _contains_any(question, ["average revenue per customer"]) and primary_metric and customer_column:
+        group_reason = f"Group by {customer_column} because revenue per customer must be computed at the customer level."
+        add_step(
+            ComputationStep(
+                operation="group_by",
+                column=customer_column,
+                parameters={"intent_type": "aggregation"},
+                justification=group_reason,
+                trace=_trace(group_reason, 0.88, ["customer_level_metric"]),
+            )
+        )
+        agg_reason = f"Sum {primary_metric[0]} within each customer to construct customer-level revenue."
+        add_step(
+            ComputationStep(
+                operation="aggregate",
+                column=primary_metric[0],
+                parameters={"method": "sum", "within": customer_column, "intent_type": "aggregation"},
+                justification=agg_reason,
+                trace=_trace(agg_reason, 0.88, ["customer_level_metric"]),
+            )
+        )
+        mean_reason = "Average the customer-level totals to compute average revenue per customer."
+        add_step(
+            ComputationStep(
+                operation="aggregate",
+                column=primary_metric[0],
+                parameters={"method": "mean", "scope": "group_results", "intent_type": "aggregation"},
+                justification=mean_reason,
+                trace=_trace(mean_reason, 0.88, ["customer_revenue_definition"]),
+            )
+        )
+        return ComputationPlanModel(
+            steps=steps,
+            confidence_score=0.88,
+            justification="Built a customer-level aggregation plan for average revenue per customer.",
+            deferred=False,
+        )
+
+    if _looks_like_share_question(question) and primary_metric:
+        if _contains_any(question, ["top customers"]) and customer_column:
+            reason = f"Compute the share of total {primary_metric[0]} contributed by the top customers."
+            add_step(
+                ComputationStep(
+                    operation="share_of_total",
+                    column=primary_metric[0],
+                    parameters={"entity_column": customer_column, "top_n": 10, "intent_type": "composition"},
+                    justification=reason,
+                    trace=_trace(reason, 0.82, ["share_of_total", "customer_identifier"]),
+                )
+            )
+            return ComputationPlanModel(
+                steps=steps,
+                confidence_score=0.82,
+                justification="Built a top-customer share-of-revenue plan using grouped customer contribution.",
+                deferred=False,
+            )
+        if _contains_any(question, ["repeat purchases"]) and customer_column and order_column:
+            reason = f"Measure the share of customers with more than one distinct {order_column}."
+            add_step(
+                ComputationStep(
+                    operation="repeat_rate",
+                    column=order_column,
+                    parameters={"entity_column": customer_column, "intent_type": "composition"},
+                    justification=reason,
+                    trace=_trace(reason, 0.86, ["repeat_purchase_rate", "customer_identifier", "order_identifier"]),
+                )
+            )
+            return ComputationPlanModel(
+                steps=steps,
+                confidence_score=0.86,
+                justification="Built a repeat-purchase rate plan using distinct orders per customer.",
+                deferred=False,
+            )
+
+    if _contains_any(question, ["profit proxy", "after freight"]) and primary_metric:
+        freight_column = _best_text_match(question + " freight", _all_columns(dataset_profile), ["freight"])
+        if freight_column:
+            reason = f"Construct a profit proxy by subtracting {freight_column} from {primary_metric[0]} before aggregation."
+            add_step(
+                ComputationStep(
+                    operation="row_expression",
+                    column=primary_metric[0],
+                    parameters={"subtract_column": freight_column, "expression_name": "profit_proxy", "intent_type": "aggregation"},
+                    justification=reason,
+                    trace=_trace(reason, 0.84, ["derived_metric", "profit_proxy"]),
+                )
+            )
+            agg_reason = "Aggregate the derived profit proxy to answer the requested proxy metric."
+            add_step(
+                ComputationStep(
+                    operation="aggregate",
+                    column="profit_proxy",
+                    parameters={"method": "sum", "intent_type": "aggregation"},
+                    justification=agg_reason,
+                    trace=_trace(agg_reason, 0.84, ["derived_metric", "aggregation_mapping"]),
+                )
+            )
+            return ComputationPlanModel(
+                steps=steps,
+                confidence_score=0.84,
+                justification="Built a derived-metric plan for profit proxy after freight costs.",
+                deferred=False,
+            )
+
+    if _looks_like_growth_question(question) and time_column:
+        group_reason = f"Group by {time_column} in {bucket} buckets because the question asks for period-over-period growth."
+        add_step(
+            ComputationStep(
+                operation="group_by",
+                column=time_column,
+                parameters={"intent_type": "temporal", "bucket": bucket},
+                justification=group_reason,
+                trace=_trace(group_reason, 0.86, ["growth_intent", "timestamp_resolved"]),
+            )
+        )
+        if _contains_any(question, ["customer growth"]) and customer_column:
+            growth_reason = f"Count distinct {customer_column} in each {bucket} bucket and compute period-over-period growth."
+            add_step(
+                ComputationStep(
+                    operation="growth_rate",
+                    column=customer_column,
+                    parameters={"method": "distinct_count", "entity_column": customer_column, "intent_type": "temporal"},
+                    justification=growth_reason,
+                    trace=_trace(growth_reason, 0.86, ["growth_rate", "customer_identifier"]),
+                )
+            )
+        elif _contains_any(question, ["order growth"]) and order_column:
+            growth_reason = f"Count distinct {order_column} in each {bucket} bucket and compute period-over-period growth."
+            add_step(
+                ComputationStep(
+                    operation="growth_rate",
+                    column=order_column,
+                    parameters={"method": "distinct_count", "entity_column": order_column, "intent_type": "temporal"},
+                    justification=growth_reason,
+                    trace=_trace(growth_reason, 0.86, ["growth_rate", "order_identifier"]),
+                )
+            )
+        elif primary_metric:
+            growth_reason = f"Aggregate {primary_metric[0]} in each {bucket} bucket and compute period-over-period growth."
+            add_step(
+                ComputationStep(
+                    operation="growth_rate",
+                    column=primary_metric[0],
+                    parameters={"method": "sum", "intent_type": "temporal"},
+                    justification=growth_reason,
+                    trace=_trace(growth_reason, 0.84, ["growth_rate", "time_series_aggregation"]),
+                )
+            )
+        if _contains_any(question, ["growing", "flat", "declining"]):
+            trend_reason = "Classify the resulting period growth pattern as growing, flat, or declining."
+            add_step(
+                ComputationStep(
+                    operation="trend_classification",
+                    column=primary_metric[0] if primary_metric else (order_column or customer_column or time_column),
+                    parameters={"source": "growth_rows", "intent_type": "temporal"},
+                    justification=trend_reason,
+                    trace=_trace(trend_reason, 0.8, ["trend_classification"]),
+                )
+            )
+        return ComputationPlanModel(
+            steps=steps,
+            confidence_score=0.85,
+            justification="Built a temporal growth-rate plan with explicit period bucketing and period-over-period computation.",
+            deferred=False,
+        )
+
+    if _contains_any(question, ["best and worst"]) and _contains_any(question, ["month", "months"]) and time_column and primary_metric:
+        group_reason = f"Group by {time_column} in month buckets because the question asks which months performed best and worst."
+        add_step(
+            ComputationStep(
+                operation="group_by",
+                column=time_column,
+                parameters={"intent_type": "temporal", "bucket": "month"},
+                justification=group_reason,
+                trace=_trace(group_reason, 0.85, ["temporal_intent", "extremes"]),
+            )
+        )
+        agg_reason = f"Aggregate {primary_metric[0]} within each month to rank monthly performance."
+        add_step(
+            ComputationStep(
+                operation="aggregate",
+                column=primary_metric[0],
+                parameters={"method": "sum", "within": time_column, "intent_type": "aggregation"},
+                justification=agg_reason,
+                trace=_trace(agg_reason, 0.84, ["monthly_ranking"]),
+            )
+        )
+        return ComputationPlanModel(
+            steps=steps,
+            confidence_score=0.84,
+            justification="Built a monthly aggregation plan to identify best and worst periods.",
+            deferred=False,
+        )
+
+    if _contains_any(question, ["growing, flat, or declining", "growing", "flat", "declining"]) and not _contains_any(question, ["categories", "products"]) and time_column and primary_metric:
+        group_reason = f"Group by {time_column} in month buckets because the question asks for directional trend classification."
+        add_step(
+            ComputationStep(
+                operation="group_by",
+                column=time_column,
+                parameters={"intent_type": "temporal", "bucket": "month"},
+                justification=group_reason,
+                trace=_trace(group_reason, 0.84, ["trend_intent", "timestamp_resolved"]),
+            )
+        )
+        growth_reason = f"Aggregate {primary_metric[0]} by month and compute period-over-period growth before classifying the trend."
+        add_step(
+            ComputationStep(
+                operation="growth_rate",
+                column=primary_metric[0],
+                parameters={"method": "sum", "intent_type": "temporal"},
+                justification=growth_reason,
+                trace=_trace(growth_reason, 0.84, ["trend_intent", "growth_rate"]),
+            )
+        )
+        trend_reason = "Classify the average period growth as growing, flat, or declining."
+        add_step(
+            ComputationStep(
+                operation="trend_classification",
+                column=primary_metric[0],
+                parameters={"source": "growth_rows", "intent_type": "temporal"},
+                justification=trend_reason,
+                trace=_trace(trend_reason, 0.82, ["trend_classification"]),
+            )
+        )
+        return ComputationPlanModel(
+            steps=steps,
+            confidence_score=0.84,
+            justification="Built a temporal trend-classification plan from grouped revenue growth.",
+            deferred=False,
+        )
+
+    if _contains_any(question, ["scaling efficiently", "lower quality"]) and time_column and primary_metric:
+        group_reason = f"Group by {time_column} in month buckets to compare commercial growth with quality signals over time."
+        add_step(
+            ComputationStep(
+                operation="group_by",
+                column=time_column,
+                parameters={"intent_type": "temporal", "bucket": "month"},
+                justification=group_reason,
+                trace=_trace(group_reason, 0.72, ["composite_business_question", "timestamp_resolved"]),
+            )
+        )
+        add_step(
+            ComputationStep(
+                operation="aggregate",
+                column=primary_metric[0],
+                parameters={"method": "sum", "within": time_column, "intent_type": "aggregation"},
+                justification="Track revenue over time as the scale signal.",
+                trace=_trace("Track revenue over time as the scale signal.", 0.72, ["scale_signal"]),
+            )
+        )
+        quality_metric = _best_text_match(question + " review quality", dataset_profile.get("column_names", []) or [], ["review", "score", "quality"])
+        if quality_metric:
+            add_step(
+                ComputationStep(
+                    operation="aggregate",
+                    column=quality_metric,
+                    parameters={"method": "mean", "within": time_column, "intent_type": "aggregation"},
+                    justification="Track average review quality over time as the quality signal.",
+                    trace=_trace("Track average review quality over time as the quality signal.", 0.7, ["quality_signal"]),
+                )
+            )
+        return ComputationPlanModel(
+            steps=steps,
+            confidence_score=0.68,
+            justification="Built a composite monthly monitoring plan comparing scale signals with quality signals. This answers the question directionally but still requires executive interpretation.",
+            deferred=False,
+        )
+
+    if category_column and _contains_any(question, ["highest order volume but low revenue", "low volume but premium pricing"]):
+        contrast_pattern = "high_low" if _contains_any(question, ["highest order volume but low revenue"]) else "low_high"
+        secondary_metric = None
+        if _contains_any(question, ["revenue"]) and business_metric_candidates:
+            secondary_metric = business_metric_candidates[0]
+        elif _contains_any(question, ["pricing", "price", "premium"]) and any("price" in str(col).lower() for col in business_metric_candidates):
+            secondary_metric = next(col for col in business_metric_candidates if "price" in str(col).lower())
+        elif primary_metric:
+            secondary_metric = primary_metric[0]
+        if order_column and secondary_metric:
+            reason = f"Compare categories on both volume and value metrics to surface the requested contrast pattern."
+            add_step(
+                ComputationStep(
+                    operation="segment_contrast",
+                    column=secondary_metric,
+                    parameters={
+                        "entity_column": category_column,
+                        "primary_metric": order_column,
+                        "primary_method": "distinct_count",
+                        "secondary_metric": secondary_metric,
+                        "secondary_method": "mean" if contrast_pattern == "low_high" else "sum",
+                        "pattern": contrast_pattern,
+                        "top_n": 10,
+                        "intent_type": "comparison",
+                    },
+                    justification=reason,
+                    trace=_trace(reason, 0.8, ["segment_contrast", "multi_metric_reasoning"]),
+                )
+            )
+            return ComputationPlanModel(steps=steps, confidence_score=0.8, justification="Built a dual-metric contrast plan for category performance.", deferred=False)
+
+    if _contains_any(question, ["product categories", "categories"]) and _contains_any(question, ["sell the most", "most sold", "highest order volume"]):
+        entity_column = category_column
+        if entity_column and order_column:
+            reason = f"Rank {entity_column} by distinct {order_column} to identify the categories with the highest selling volume."
+            add_step(
+                ComputationStep(
+                    operation="rank_entities",
+                    column=order_column,
+                    parameters={"entity_column": entity_column, "method": "distinct_count", "top_n": 10, "sort": "desc", "intent_type": "aggregation"},
+                    justification=reason,
+                    trace=_trace(reason, 0.86, ["segment_ranking", "volume_metric"]),
+                )
+            )
+            return ComputationPlanModel(steps=steps, confidence_score=0.86, justification="Built a category sales-volume ranking plan.", deferred=False)
+
+    if _contains_any(question, ["product categories", "categories"]) and _contains_any(question, ["generate the most revenue", "most revenue"]):
+        entity_column = category_column
+        if entity_column and primary_metric:
+            reason = f"Rank {entity_column} by total {primary_metric[0]} to identify the highest-revenue categories."
+            add_step(
+                ComputationStep(
+                    operation="rank_entities",
+                    column=primary_metric[0],
+                    parameters={"entity_column": entity_column, "method": "sum", "top_n": 10, "sort": "desc", "intent_type": "aggregation"},
+                    justification=reason,
+                    trace=_trace(reason, 0.86, ["segment_ranking", "revenue_metric"]),
+                )
+            )
+            return ComputationPlanModel(steps=steps, confidence_score=0.86, justification="Built a category revenue ranking plan.", deferred=False)
+
+    if category_column and time_column and _contains_any(question, ["categories are growing fastest", "categories are declining"]):
+        direction = "desc" if _contains_any(question, ["growing fastest"]) else "asc"
+        growth_metric = order_column if not primary_metric else primary_metric[0]
+        growth_method = "distinct_count" if growth_metric == order_column else "sum"
+        reason = f"Measure period-over-period growth by category and rank categories by the requested direction."
+        add_step(
+            ComputationStep(
+                operation="segment_growth_rank",
+                column=growth_metric,
+                parameters={
+                    "entity_column": category_column,
+                    "time_column": time_column,
+                    "bucket": "month",
+                    "method": growth_method,
+                    "sort": direction,
+                    "top_n": 10,
+                    "intent_type": "temporal",
+                },
+                justification=reason,
+                trace=_trace(reason, 0.8, ["segment_growth", "temporal_breakdown"]),
+            )
+        )
+        return ComputationPlanModel(steps=steps, confidence_score=0.8, justification="Built a category growth ranking plan.", deferred=False)
+
+    if category_column and time_column and _contains_any(question, ["categories are seasonal", "seasonality"]):
+        seasonal_metric = order_column if order_column else (primary_metric[0] if primary_metric else None)
+        if seasonal_metric:
+            reason = f"Measure how unevenly each category performs across months to estimate seasonality."
+            add_step(
+                ComputationStep(
+                    operation="segment_seasonality",
+                    column=seasonal_metric,
+                    parameters={
+                        "entity_column": category_column,
+                        "time_column": time_column,
+                        "bucket": "month",
+                        "method": "distinct_count" if seasonal_metric == order_column else "sum",
+                        "top_n": 10,
+                        "intent_type": "temporal",
+                    },
+                    justification=reason,
+                    trace=_trace(reason, 0.76, ["segment_seasonality", "temporal_breakdown"]),
+                )
+            )
+            return ComputationPlanModel(steps=steps, confidence_score=0.76, justification="Built a category seasonality scoring plan.", deferred=False)
+
+    if product_column and _contains_any(question, ["products are best sellers", "best sellers"]):
+        rank_metric = order_column or product_column
+        reason = f"Rank {product_column} by distinct {rank_metric} to identify best-selling products."
+        add_step(
+            ComputationStep(
+                operation="rank_entities",
+                column=rank_metric,
+                parameters={"entity_column": product_column, "method": "distinct_count", "top_n": 10, "sort": "desc", "intent_type": "aggregation"},
+                justification=reason,
+                trace=_trace(reason, 0.84, ["segment_ranking", "product_volume"]),
+            )
+        )
+        return ComputationPlanModel(steps=steps, confidence_score=0.84, justification="Built a best-seller product ranking plan.", deferred=False)
+
+    if product_column and _contains_any(question, ["products are rarely sold", "rarely sold"]):
+        rank_metric = order_column or product_column
+        reason = f"Rank {product_column} by distinct {rank_metric} in ascending order to surface rarely sold products."
+        add_step(
+            ComputationStep(
+                operation="rank_entities",
+                column=rank_metric,
+                parameters={"entity_column": product_column, "method": "distinct_count", "top_n": 10, "sort": "asc", "intent_type": "aggregation"},
+                justification=reason,
+                trace=_trace(reason, 0.82, ["segment_ranking", "long_tail_products"]),
+            )
+        )
+        return ComputationPlanModel(steps=steps, confidence_score=0.82, justification="Built a rarely sold product ranking plan.", deferred=False)
+
+    if category_column and product_column and _contains_any(question, ["overdependent on a few products", "overdependent"]):
+        concentration_metric = primary_metric[0] if primary_metric else (order_column or product_column)
+        concentration_method = "sum" if primary_metric else "distinct_count"
+        reason = f"Measure concentration within each {category_column} to identify dependence on a small number of products."
+        add_step(
+            ComputationStep(
+                operation="concentration_score",
+                column=concentration_metric,
+                parameters={
+                    "parent_column": category_column,
+                    "child_column": product_column,
+                    "method": concentration_method,
+                    "top_n": 10,
+                    "intent_type": "composition",
+                },
+                justification=reason,
+                trace=_trace(reason, 0.78, ["concentration_analysis", "mix_dependency"]),
+            )
+        )
+        return ComputationPlanModel(steps=steps, confidence_score=0.78, justification="Built a category concentration plan to detect overdependence on a few products.", deferred=False)
+
+    if _contains_any(question, ["product mix drives total revenue", "product mix"]) and primary_metric:
+        entity_column = category_column or product_column
+        if entity_column:
+            reason = f"Measure contribution by {entity_column} to identify which mix components drive total revenue."
+            add_step(
+                ComputationStep(
+                    operation="rank_entities",
+                    column=primary_metric[0],
+                    parameters={"entity_column": entity_column, "method": "sum", "top_n": 10, "sort": "desc", "intent_type": "composition"},
+                    justification=reason,
+                    trace=_trace(reason, 0.8, ["mix_contribution", "revenue_metric"]),
+                )
+            )
+            return ComputationPlanModel(steps=steps, confidence_score=0.8, justification="Built a product-mix contribution ranking plan.", deferred=False)
 
     for strategy in strategies:
         group_columns = _select_group_columns(
@@ -737,7 +1530,23 @@ def build_analysis_plan(
 
     direct_steps = [
         step for step in computation_plan.steps
-        if step.operation in {"aggregate", "frequency_distribution", "numeric_distribution"}
+        if step.operation in {
+            "group_by",
+            "aggregate",
+            "frequency_distribution",
+            "numeric_distribution",
+            "distinct_count",
+            "row_expression",
+            "share_of_total",
+            "repeat_rate",
+            "growth_rate",
+            "trend_classification",
+            "rank_entities",
+            "segment_contrast",
+            "segment_growth_rank",
+            "segment_seasonality",
+            "concentration_score",
+        }
     ]
     if direct_steps:
         columns = []
@@ -747,6 +1556,10 @@ def build_analysis_plan(
             if step.column:
                 columns.append(step.column)
             columns.extend(step.columns)
+            for param_key in ("group_by", "within", "entity_column", "subtract_column", "parent_column", "child_column", "time_column", "primary_metric", "secondary_metric"):
+                param_value = (step.parameters or {}).get(param_key)
+                if isinstance(param_value, str):
+                    columns.append(param_value)
         columns = list(dict.fromkeys([col for col in columns if col]))
         reason = "Direct deterministic computation is sufficient and preferable to statistical testing for this part of the request."
         operations.append(
