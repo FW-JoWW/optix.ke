@@ -45,6 +45,12 @@ def column_selection_node(state: AnalystState) -> AnalystState:
     question = state.get("business_question", "")
     intent = state.get("intent", {})
     parser_selected_columns = intent.get("selected_columns", []) or state.get("selected_columns", [])
+    resolved_role_columns = [
+        value
+        for key, value in (intent.get("resolved_role_columns") or {}).items()
+        if key.endswith("_column") or key.endswith("_metric") or key == "focus_dimension"
+        if isinstance(value, str)
+    ]
 
     candidate_columns = list(column_registry.keys())
 
@@ -73,7 +79,7 @@ def column_selection_node(state: AnalystState) -> AnalystState:
     if intent.get("aggregate_column"):
         intent_columns.append(intent["aggregate_column"])
 
-    selected_columns = dedupe_preserve_order(parser_selected_columns + intent_columns + matched_columns)
+    selected_columns = dedupe_preserve_order(parser_selected_columns + resolved_role_columns + intent_columns + matched_columns)
 
     if not selected_columns and intent_columns:
         selected_columns = dedupe_preserve_order(intent_columns + matched_columns)

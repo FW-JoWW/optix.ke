@@ -1,7 +1,7 @@
 import re
 from typing import Dict, List
 
-from decision_engine import run_decision_engine
+from decision_engine import _step_parameter_columns, run_decision_engine
 from intent_alignment import validate_analysis_plan_against_intent
 from state.state import AnalystState
 
@@ -73,7 +73,43 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
     print("\n=== OUTPUT MODE ===")
     print(state["output_mode"])
 
+    prior_decision = state.get("decision_output") or {}
+    prior_plan = prior_decision.get("analysis_plan") or {}
+    prior_operations = [
+        {
+            "tool": item.get("tool"),
+            "columns": item.get("columns", []),
+            "parameters": item.get("parameters", {}),
+            "computation_refs": item.get("computation_refs", []),
+        }
+        for item in prior_plan.get("operations", [])
+        if item.get("valid", True)
+    ]
+    if intent.get("wants_analysis") and prior_operations:
+        state["output_mode"] = "analysis"
+
     if state["output_mode"] in ["raw_filter", "grouped_summary"]:
+        prior_decision = state.get("decision_output") or {}
+        prior_plan = prior_decision.get("analysis_plan") or {}
+        prior_operations = [
+            {
+                "tool": item.get("tool"),
+                "columns": item.get("columns", []),
+                "parameters": item.get("parameters", {}),
+                "computation_refs": item.get("computation_refs", []),
+            }
+            for item in prior_plan.get("operations", [])
+            if item.get("valid", True)
+        ]
+        if intent.get("wants_analysis") and prior_operations:
+            state["output_mode"] = "analysis"
+            state["analysis_plan"] = prior_operations
+            evidence["analysis_plan"] = prior_operations
+            evidence["analysis_decisions"] = prior_plan
+            evidence["computation_plan"] = prior_decision.get("computation_plan", {})
+            print("\n=== ANALYSIS PLAN ===")
+            print("Preserved prior validated decision-engine operations.")
+            return state
         evidence["analysis_plan"] = []
         print("\n=== ANALYSIS PLAN ===")
         print("No statistical analysis required.")
@@ -271,6 +307,7 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
         selected_columns=selected_columns,
     )
     state["decision_output"] = decision_output.model_dump()
+    evidence["analysis_abstraction"] = decision_output.analysis_abstraction.model_dump()
     evidence["computation_plan"] = decision_output.computation_plan.model_dump()
     unique_plan = [
         {
@@ -298,6 +335,7 @@ def analysis_planner_node(state: AnalystState) -> AnalystState:
             required_columns.append(group_by)
         if within:
             required_columns.append(within)
+        required_columns.extend(_step_parameter_columns(step.parameters))
     for item in unique_plan:
         required_columns.extend(item.get("columns", []))
 

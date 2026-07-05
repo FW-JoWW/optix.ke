@@ -3,6 +3,20 @@ import re
 from state.state import AnalystState
 from nodes.llm_reasoning_node import llm_reasoning_node
 from utils.semantic_mapper import map_semantic_filters
+from core.analytic_capability import infer_capability_signals
+from decision_engine import (
+    _best_text_match,
+    _best_value_metric,
+    _business_customer_segment_column,
+    _business_entity_column,
+    _business_entity_metric,
+    _business_geography_column,
+    _business_installments_metric,
+    _business_review_metric,
+    _business_segment_column,
+    _business_time_column,
+    _preferred_business_metrics,
+)
 
 # --- NUMERIC SYNONYMS ---
 NUMERIC_SYNONYMS = {
@@ -50,6 +64,236 @@ def _combine_analytic_intents(primary_intent, detected_intents):
         if intent_type and intent_type != "unknown" and intent_type not in ordered:
             ordered.append(intent_type)
     return ordered
+
+
+def _resolve_intent_role_columns(query: str, state: AnalystState, df):
+    query = (query or "").lower()
+    profile = state.get("dataset_profile", {}) or {}
+    context = state.get("column_registry", {}) or {}
+    signals = infer_capability_signals(query)
+
+    time_column = _business_time_column(query, profile, context, list(df.columns) if df is not None else [])
+    order_column = _business_entity_column(query, profile, context, "order")
+    customer_column = _business_entity_column(query, profile, context, "customer")
+    seller_column = _business_entity_metric(profile, context, "seller")
+    category_column = _business_segment_column(profile, context, "category")
+    product_column = _business_segment_column(profile, context, "product")
+    customer_segment_column = _business_customer_segment_column(profile, context)
+    customer_geo_column = _business_geography_column(profile, context, signals.get("geography_level"), owner="customer")
+    seller_geo_column = _business_geography_column(profile, context, signals.get("geography_level"), owner="seller")
+    geography_column = customer_geo_column or seller_geo_column or _business_geography_column(profile, context, None, owner=None)
+    review_metric = _business_review_metric(profile, context)
+    business_metrics = _preferred_business_metrics(query, profile, context, state.get("relationship_signals", {}) or {})
+    revenue_metric = _best_value_metric(profile, context, state.get("relationship_signals", {}) or {}) or (business_metrics[0] if business_metrics else None)
+    price_metric = _best_text_match(query + " price pricing premium", list(df.columns) if df is not None else [], ["price"]) if df is not None else None
+    freight_metric = _best_text_match(query + " freight shipping cost", list(df.columns) if df is not None else [], ["freight", "shipping"]) if df is not None else None
+    payment_type_column = None
+    if df is not None:
+        payment_type_column = next(
+            (
+                col for col in df.columns
+                if any(token in str(col).lower() for token in ["payment_type", "payment_types"])
+            ),
+            None,
+        )
+        if payment_type_column is None:
+            payment_type_column = _best_text_match(query + " payment type method credit card boleto voucher debit", list(df.columns), ["payment", "types"])
+    installments_metric = _business_installments_metric(profile, context) or (
+        _best_text_match(
+            query + " installment installments payment installments",
+            list(df.columns) if df is not None else [],
+            ["installment"],
+        )
+        if df is not None
+        else None
+    )
+    size_metrics = []
+    for col in (profile.get("numeric_columns", []) or list(df.columns) if df is not None else []):
+        lower = str(col).lower()
+        if any(token in lower for token in ["weight", "height", "width", "length", "size", "dimension", "volume", "_cm", "_g"]):
+            size_metrics.append(col)
+
+    delivered_candidates = []
+    estimated_delivery_column = None
+    purchase_candidates = []
+    status_column = None
+    for col in (profile.get("datetime_columns", []) or list(df.columns) if df is not None else []):
+        lower = str(col).lower()
+        if any(token in lower for token in ["delivered_customer", "delivered", "delivery"]):
+            delivered_candidates.append(col)
+        if estimated_delivery_column is None and "estimated" in lower:
+            estimated_delivery_column = col
+        if any(token in lower for token in ["purchase", "approved", "created"]):
+            purchase_candidates.append(col)
+    delivered_column = None
+    if delivered_candidates:
+        delivered_candidates.sort(key=lambda col: ("customer" in str(col).lower(), "carrier" not in str(col).lower()), reverse=True)
+        delivered_column = delivered_candidates[0]
+    purchase_column = None
+    if purchase_candidates:
+        purchase_candidates.sort(key=lambda col: ("purchase" in str(col).lower(), "approved" in str(col).lower()), reverse=True)
+        purchase_column = purchase_candidates[0]
+    for col in (profile.get("categorical_columns", []) or list(df.columns) if df is not None else []):
+        if "status" in str(col).lower():
+            status_column = col
+            break
+
+    owner = None
+    focus_dimension = None
+    owner_candidates = [
+        ("geography", geography_column, bool(signals.get("asks_geography"))),
+        (
+            "customer_segment",
+            customer_segment_column,
+            any(token in query for token in ["segment", "segments"]),
+        ),
+        ("seller", seller_column, "seller" in query),
+        ("customer", customer_column, "customer" in query),
+        ("payment", payment_type_column, any(token in query for token in ["payment method", "payment methods", "payment type", "payment types"])),
+        ("category", category_column, "categor" in query),
+        ("product", product_column, any(token in query for token in ["product", "products", "sku", "item", "items"])),
+    ]
+    for candidate_owner, candidate_dimension, matched in owner_candidates:
+        if matched and candidate_dimension:
+            owner = candidate_owner
+            focus_dimension = candidate_dimension
+            break
+
+    resolved = {
+        "owner": owner,
+        "focus_dimension": focus_dimension,
+        "time_column": time_column,
+        "order_column": order_column,
+        "customer_column": customer_column,
+        "seller_column": seller_column,
+        "category_column": category_column,
+        "product_column": product_column,
+        "customer_segment_column": customer_segment_column,
+        "customer_geo_column": customer_geo_column,
+        "seller_geo_column": seller_geo_column,
+        "geography_column": geography_column,
+        "review_metric": review_metric,
+        "revenue_metric": revenue_metric,
+        "price_metric": price_metric,
+        "freight_metric": freight_metric,
+        "payment_type_column": payment_type_column,
+        "installments_metric": installments_metric,
+        "size_metrics": size_metrics,
+        "purchase_column": purchase_column,
+        "delivered_column": delivered_column,
+        "estimated_delivery_column": estimated_delivery_column,
+        "status_column": status_column,
+    }
+
+    role_selected = []
+    if focus_dimension:
+        role_selected.append(focus_dimension)
+    if signals.get("asks_growth") and time_column:
+        role_selected.append(time_column)
+    if signals.get("asks_demand"):
+        role_selected.extend([col for col in [order_column, customer_column] if col])
+    if signals.get("asks_price"):
+        if price_metric or revenue_metric:
+            role_selected.append(price_metric or revenue_metric)
+    if signals.get("asks_revenue"):
+        if revenue_metric:
+            role_selected.append(revenue_metric)
+    if signals.get("asks_payment"):
+        role_selected.extend([
+            col
+            for col in [
+                payment_type_column,
+                installments_metric,
+                revenue_metric,
+                price_metric,
+                order_column,
+                customer_column,
+                customer_geo_column or geography_column,
+                category_column,
+                status_column,
+            ]
+            if col
+        ])
+    if any(term in query for term in ["credit card", "boleto", "voucher", "debit card"]):
+        role_selected.extend([col for col in [payment_type_column, customer_column, customer_geo_column or geography_column] if col])
+    if "installment" in query:
+        role_selected.extend([col for col in [installments_metric, revenue_metric or price_metric, category_column, payment_type_column] if col])
+    if "intervention" in query or "need intervention" in query:
+        if revenue_metric:
+            role_selected.append(revenue_metric)
+    if signals.get("asks_quality") and review_metric:
+        role_selected.append(review_metric)
+    if signals.get("asks_delivery"):
+        role_selected.extend([col for col in [purchase_column, delivered_column, estimated_delivery_column, geography_column, seller_column, category_column, review_metric] if col])
+    if "freight" in query or "shipping" in query or "cost relative to price" in query or ("cost" in query and "serve" in query) or "expensive to serve" in query or "cost to deliver" in query:
+        role_selected.extend([
+            col
+            for col in [
+                freight_metric,
+                price_metric or revenue_metric,
+                revenue_metric,
+                review_metric,
+                order_column,
+                customer_column,
+                time_column,
+                geography_column,
+                seller_column,
+                category_column,
+                product_column,
+            ]
+            if col
+        ])
+    if any(term in query for term in ["larger", "heavier", "delays", "delay"]):
+        role_selected.extend(size_metrics[:4])
+        role_selected.extend([col for col in [purchase_column, delivered_column, estimated_delivery_column, review_metric] if col])
+    if any(term in query for term in ["late", "early", "estimated", "actual delivery", "delivery gap", "delivery time"]):
+        role_selected.extend([col for col in [purchase_column, delivered_column, estimated_delivery_column, order_column, geography_column, seller_column, category_column, review_metric] if col])
+    if "distance" in query:
+        role_selected.extend([col for col in [seller_geo_column, customer_geo_column, status_column, order_column] if col])
+    if any(term in query for term in ["delivered", "canceled", "cancelled", "unavailable", "invoiced", "failure rate", "operational issues", "cancellations increasing"]):
+        role_selected.extend([col for col in [status_column, order_column, category_column, seller_column, time_column] if col])
+    if "cancel" in query and status_column:
+        role_selected.append(status_column)
+    if "return" in query and status_column:
+        role_selected.append(status_column)
+    if "dominate" in query or "dependent" in query or "dependency" in query or "dependence" in query or "overdependent" in query:
+        role_selected.extend([col for col in [seller_column, category_column, product_column, order_column, revenue_metric] if col])
+    if "poor reviews" in query or "high revenue but poor reviews" in query:
+        role_selected.extend([col for col in [revenue_metric, review_metric] if col])
+    if any(term in query for term in ["basket", "baskets", "bundle", "bundles", "bundled", "bought together", "commonly bundled", "cross-sell", "cross sell", "same order", "recommend", "recommended"]):
+        role_selected.extend([col for col in [order_column, product_column or focus_dimension, category_column, revenue_metric or price_metric] if col])
+    if any(term in query for term in ["cohort", "cohorts", "acquired", "acquisition", "retain", "retains", "retention", "bought again", "buy again", "churn", "long term"]):
+        role_selected.extend([col for col in [customer_column, order_column, time_column, revenue_metric or price_metric, customer_geo_column or geography_column, customer_segment_column] if col])
+    if any(term in query for term in ["anomaly", "anomalies", "unusual", "suspicious", "fraud", "fake", "duplicate", "duplicates", "rapid", "rapidly", "excessive", "spike", "spikes"]):
+        role_selected.extend([col for col in [
+            order_column,
+            customer_column,
+            seller_column,
+            time_column,
+            revenue_metric or price_metric,
+            price_metric,
+            installments_metric,
+            review_metric,
+            customer_geo_column or geography_column,
+            customer_segment_column,
+            category_column,
+            payment_type_column,
+        ] if col])
+    if any(term in query for term in ["missing", "null", "duplicate rows", "inconsistent", "invalid", "negative", "impossible", "broken", "data quality"]):
+        role_selected.extend(list(df.columns))
+    if "underperform" in query:
+        role_selected.extend([col for col in [geography_column, order_column, revenue_metric, review_metric, freight_metric, purchase_column, delivered_column] if col])
+    if any(term in query for term in ["crisis", "crises", "brand trust", "damage brand", "trust"]):
+        role_selected.extend([col for col in [seller_column, geography_column, review_metric, order_column, status_column, purchase_column, delivered_column] if col])
+    if "cluster" in query or "clustered" in query:
+        role_selected.extend([col for col in [time_column, order_column, delivered_column, estimated_delivery_column] if col])
+    if "premium pricing" in query:
+        role_selected.extend([col for col in [price_metric or revenue_metric, review_metric, order_column] if col])
+    if any(term in query for term in ["overpriced", "elasticity", "price increases", "price increase", "price wars", "discount", "convert best", "conversion"]):
+        role_selected.extend([col for col in [price_metric or revenue_metric, review_metric, order_column, time_column, category_column, seller_column] if col])
+
+    resolved["selected_columns"] = _dedupe_preserve_order(role_selected)
+    return resolved
 
 def extract_mentioned_columns(query: str, columns: list[str]):
     normalized_query = normalize(query)
@@ -112,14 +356,15 @@ def classify_analytic_intent(query: str):
     query = query.lower()
 
     intent_map = {
-        "comparison": ["compare", "vs", "versus", "difference", "against"],
-        "temporal": ["trend", "over time", "per day", "per month", "growth", "decline", "monthly", "quarterly", "month-over-month", "quarter-over-quarter", "seasonal", "seasonality", "growing fastest"],
-        "composition": ["breakdown", "distribution", "percentage", "share", "portion", "repeat purchases", "top customers", "product mix", "overdependent"],
-        "relationship": ["correlation", "relationship", "impact", "effect", "influence", "affect", "cause", "causal", "drive"],
+        "comparison": ["compare", "vs", "versus", "difference", "against", "return more often", "spend most", "cheap items", "expensive ones", "overpriced", "relative to", "price war", "price wars", "spend more", "underperform", "underperformance", "affect cancellation rates", "prefer credit card vs boleto"],
+        "temporal": ["trend", "pattern", "patterns", "over time", "per day", "daily", "per week", "weekly", "per month", "growth", "decline", "monthly", "quarterly", "holiday", "holidays", "black friday", "weekend", "weekday", "seasonal", "seasonality", "month-over-month", "quarter-over-quarter", "growing fastest", "first and second purchase", "between first and second purchase", "loyal over time", "becoming more loyal", "dormant customers", "acquisition month"],
+        "composition": ["breakdown", "distribution", "percentage", "share", "portion", "repeat purchases", "repeat purchase rate", "buy once", "only buy once", "buy again", "bought again", "retain", "retains", "retention", "cohort", "cohorts", "acquired", "acquisition", "top customers", "product mix", "overdependent", "dependent", "dependency", "dependence", "few categories", "basket", "baskets", "bundle", "bundles", "bundled", "bought together", "commonly bundled", "cross-sell", "cross sell", "same order", "specific payment types", "payment methods are most used"],
+        "relationship": ["correlation", "correlate", "relationship", "impact", "effect", "influence", "affect", "cause", "causal", "drive", "drives", "driver", "drivers", "reduce", "reduces", "lower", "lowers", "harsher", "harsh", "elasticity", "correlate with premium categories"],
         "extremes": ["top", "bottom", "highest", "lowest", "max", "min", "best", "worst", "best sellers", "rarely sold", "sell the most"],
-        "profiling": ["average", "mean", "median", "summary", "stats", "statistics", "total", "how many", "count", "revenue", "orders", "customers", "profit proxy", "sell", "sold", "pricing", "volume"],
-        "outliers": ["outlier", "outliers", "unusual", "anomaly", "anomalies"],
-        "investigative": ["why", "drill down", "details", "explain", "scaling efficiently", "lower quality"],
+        "profiling": ["average", "mean", "median", "summary", "stats", "statistics", "total", "how many", "count", "revenue", "orders", "customers", "profit proxy", "lifetime value", "lifetime value proxy", "repeat behavior", "sell", "sold", "pricing", "volume", "discount", "convert", "recommend", "recommended"],
+        "outliers": ["outlier", "outliers", "unusual", "anomaly", "anomalies", "suspicious", "fraud", "fake", "duplicate", "duplicates", "rapid", "rapidly", "excessive"],
+        "data_quality": ["missing", "null", "duplicate rows", "inconsistent", "invalid", "negative", "impossible", "broken", "data quality"],
+        "investigative": ["why", "drill down", "details", "explain", "scaling efficiently", "lower quality", "crisis", "crises", "brand trust", "damage brand", "clustered"],
         "predictive": ["forecast", "predict", "what if", "estimate"]
     }
 
@@ -303,9 +548,35 @@ def build_categorical_conditions(query: str, df):
         "from", "how", "in", "is", "it", "of", "on", "or", "the", "to",
         "what", "when", "where", "which", "who", "why", "with",
     }
+    contrast_query = any(
+        re.search(rf"(?<!\w){re.escape(term)}(?!\w)", query_lower)
+        for term in ["vs", "versus", "compare", "compared", "prefer", "prefers", "preference", "difference"]
+    )
+
+    def value_matches_query(value_str: str) -> bool:
+        value_tokens = [token for token in re.split(r"[_\W]+", value_str) if token]
+        if not value_tokens:
+            return False
+        compact_value = re.sub(r"[\W_]+", "", value_str)
+        compact_query = re.sub(r"[\W_]+", "", query_lower)
+        phrase_value = re.sub(r"[_\-]+", " ", value_str).strip()
+
+        if len(value_tokens) == 1:
+            token = value_tokens[0]
+            if token in stopwords or len(token) < 3:
+                return False
+            return token in query_tokens or bool(compact_value and compact_value in compact_query)
+
+        phrase_pattern = rf"(?<!\w){re.escape(phrase_value)}(?!\w)"
+        return bool(re.search(phrase_pattern, query_lower)) or bool(compact_value and compact_value in compact_query)
 
     for col in categorical_columns:
-        values = df[col].dropna().unique()
+        non_null = df[col].dropna()
+        unique_count = int(non_null.nunique(dropna=True))
+        column_mentioned = normalize(col) in normalize(query_lower)
+        if unique_count > 1000 and not column_mentioned:
+            continue
+        values = non_null.unique()
         matched_vals = []
         for value in values:
             value_str = str(value).strip().lower()
@@ -316,22 +587,12 @@ def build_categorical_conditions(query: str, df):
             if value_str in stopwords:
                 continue
 
-            value_tokens = re.findall(r"[a-zA-Z0-9_]+", value_str)
-            if not value_tokens:
-                continue
-
-            if len(value_tokens) == 1:
-                token = value_tokens[0]
-                if token in stopwords or len(token) < 3:
-                    continue
-                if token in query_tokens:
-                    matched_vals.append(value)
-            else:
-                pattern = rf"(?<!\w){re.escape(value_str)}(?!\w)"
-                if re.search(pattern, query_lower):
-                    matched_vals.append(value)
+            if value_matches_query(value_str):
+                matched_vals.append(value)
 
         if matched_vals:
+            if contrast_query and len(matched_vals) >= 2:
+                continue
             if len(matched_vals) == 1:
                 conditions.append({
                     "type": "condition",
@@ -770,11 +1031,13 @@ def detect_intents(query: str):
     intents = []
 
     # --- COMPARISON ---
-    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["compare", "vs", "versus", "difference", "affect"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["compare", "vs", "versus", "difference", "affect", "overpriced", "relative to", "price war", "price wars"]):
         intents.append({"type": "comparison", "confidence": 0.8})
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["correlation", "correlate", "relationship", "elasticity", "drive", "drives", "driver", "drivers", "reduce", "reduces", "lower", "lowers", "harsher", "harsh"]):
+        intents.append({"type": "relationship", "confidence": 0.8})
 
     # --- TEMPORAL ---
-    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["over time", "trend", "monthly", "yearly", "daily", "growth", "month-over-month", "quarter-over-quarter", "seasonal", "seasonality", "declining", "growing fastest"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["over time", "trend", "pattern", "patterns", "monthly", "weekly", "yearly", "daily", "growth", "month-over-month", "quarter-over-quarter", "holiday", "holidays", "black friday", "weekend", "weekday", "seasonal", "seasonality", "declining", "growing fastest", "first and second purchase", "between first and second purchase", "loyal over time", "becoming more loyal", "dormant customers"]):
         intents.append({"type": "temporal", "confidence": 0.75})
 
     # --- EXTREMES ---
@@ -782,16 +1045,18 @@ def detect_intents(query: str):
         intents.append({"type": "extremes", "confidence": 0.8})
 
     # --- COMPOSITION ---
-    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["percentage", "ratio", "breakdown", "share", "repeat purchases", "product mix", "overdependent"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["percentage", "ratio", "breakdown", "share", "repeat purchases", "repeat purchase rate", "buy once", "only buy once", "buy again", "bought again", "retain", "retains", "retention", "cohort", "cohorts", "acquired", "acquisition", "product mix", "overdependent", "basket", "baskets", "bundle", "bundles", "bundled", "bought together", "commonly bundled", "cross-sell", "cross sell", "same order"]):
         intents.append({"type": "composition", "confidence": 0.75})
 
     # --- PROFILING ---
-    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["average", "mean", "distribution", "median", "summary", "statistics", "total", "count", "how many", "revenue", "orders", "customers", "profit proxy", "sell", "sold", "volume", "pricing"]):
+    if any(re.search(rf"(?<!\\w){re.escape(word)}(?!\\w)", query) for word in ["average", "mean", "distribution", "median", "summary", "statistics", "total", "count", "how many", "revenue", "orders", "customers", "profit proxy", "lifetime value", "lifetime value proxy", "repeat behavior", "sell", "sold", "volume", "pricing", "discount", "convert"]):
         intents.append({"type": "profiling", "confidence": 0.7})
 
     # --- OUTLIER DETECTION ---
-    if any(word in query for word in ["outlier", "outliers", "unusual", "anomaly", "anomalies"]):
+    if any(word in query for word in ["outlier", "outliers", "unusual", "anomaly", "anomalies", "suspicious", "fraud", "fake", "duplicate", "duplicates", "rapid", "rapidly", "excessive"]):
         intents.append({"type": "outliers", "confidence": 0.8})
+    if any(word in query for word in ["missing", "null", "duplicate rows", "inconsistent", "invalid", "negative", "impossible", "broken", "data quality"]):
+        intents.append({"type": "data_quality", "confidence": 0.85})
 
     return intents
 # ------------------------
@@ -849,6 +1114,15 @@ def _has_analysis_request(analytic_intent: str, query: str) -> bool:
         "cause",
         "causal",
         "drive",
+        "drives",
+        "driver",
+        "drivers",
+        "reduce",
+        "reduces",
+        "lower",
+        "lowers",
+        "harsher",
+        "harsh",
         "compare",
         "difference",
         "distribution",
@@ -858,6 +1132,27 @@ def _has_analysis_request(analytic_intent: str, query: str) -> bool:
         "mean",
         "median",
         "outlier",
+        "outliers",
+        "unusual",
+        "anomaly",
+        "anomalies",
+        "suspicious",
+        "fraud",
+        "fake",
+        "duplicate",
+        "duplicates",
+        "rapid",
+        "rapidly",
+        "excessive",
+        "missing",
+        "null",
+        "duplicate rows",
+        "inconsistent",
+        "invalid",
+        "negative",
+        "impossible",
+        "broken",
+        "data quality",
         "trend",
         "total",
         "count",
@@ -872,6 +1167,16 @@ def _has_analysis_request(analytic_intent: str, query: str) -> bool:
         "share",
         "profit proxy",
         "repeat purchases",
+        "repeat purchase rate",
+        "buy again",
+        "buy once",
+        "only buy once",
+        "lifetime value",
+        "lifetime value proxy",
+        "dormant customers",
+        "loyal over time",
+        "return more often",
+        "repeat behavior",
         "sell",
         "sold",
         "volume",
@@ -909,10 +1214,13 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
     selected_columns = []
     mentioned_numeric = []
     mentioned_categorical = []
+    resolved_role_columns = {}
 
     if df is not None:
         all_columns = list(df.columns)
         selected_columns = extract_mentioned_columns(query, all_columns)
+        resolved_role_columns = _resolve_intent_role_columns(query, state, df)
+        selected_columns = _dedupe_preserve_order(selected_columns + resolved_role_columns.get("selected_columns", []))
         numeric_columns = state.get("dataset_profile", {}).get("numeric_columns", [])
         categorical_columns = state.get("dataset_profile", {}).get("categorical_columns", [])
         mentioned_numeric = [col for col in selected_columns if col in numeric_columns]
@@ -933,7 +1241,9 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
 
     if df is not None:
         numeric_cols = state.get("dataset_profile", {}).get("numeric_columns", [])
-        semantic_filters = map_semantic_filters(query, df, numeric_cols)
+        semantic_filters = []
+        if analytic_intent not in {"relationship", "comparison"}:
+            semantic_filters = map_semantic_filters(query, df, numeric_cols)
         if semantic_filters:
             semantic_ast = {
                 "type": "logic",
@@ -969,6 +1279,7 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
         "confidence": None,
         "low_confidence": low_confidence,
         "selected_columns": selected_columns,
+        "resolved_role_columns": resolved_role_columns,
     }
     # ------------------------
     # AGGREGATION 
@@ -1006,6 +1317,9 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
                 if mentioned_numeric:
                     intent["aggregate_column"] = mentioned_numeric[0]
                     intent["aggregate_columns"] = mentioned_numeric
+                elif resolved_role_columns.get("revenue_metric"):
+                    intent["aggregate_column"] = resolved_role_columns["revenue_metric"]
+                    intent["aggregate_columns"] = [resolved_role_columns["revenue_metric"]]
                 elif numeric_columns:
                     intent["aggregate_column"] = numeric_columns[0]
                     intent["aggregate_columns"] = [numeric_columns[0]]
@@ -1015,6 +1329,9 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
                 if mentioned_numeric:
                     intent["aggregate_column"] = mentioned_numeric[0]
                     intent["aggregate_columns"] = mentioned_numeric
+                elif resolved_role_columns.get("revenue_metric"):
+                    intent["aggregate_column"] = resolved_role_columns["revenue_metric"]
+                    intent["aggregate_columns"] = [resolved_role_columns["revenue_metric"]]
                 elif numeric_columns:
                     intent["aggregate_column"] = numeric_columns[0]
                     intent["aggregate_columns"] = [numeric_columns[0]]
@@ -1038,9 +1355,23 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
         # If no group_by detected, infer from analytic intent
         if not intent["group_by"]:
             if intent_type in ["comparison", "composition"]:
+                if resolved_role_columns.get("focus_dimension"):
+                    intent["group_by"] = resolved_role_columns["focus_dimension"]
+                    intent["group_by_columns"] = [resolved_role_columns["focus_dimension"]]
+                elif resolved_role_columns.get("geography_column"):
+                    intent["group_by"] = resolved_role_columns["geography_column"]
+                    intent["group_by_columns"] = [resolved_role_columns["geography_column"]]
                 if categorical_columns:
-                    intent["group_by"] = categorical_columns[0]
-                    intent["group_by_columns"] = [categorical_columns[0]]
+                    if not intent["group_by"]:
+                        intent["group_by"] = categorical_columns[0]
+                        intent["group_by_columns"] = [categorical_columns[0]]
+
+    if resolved_role_columns.get("revenue_metric") and (
+        any(term in query for term in ["revenue", "sales", "spend", "value"])
+        and not intent.get("aggregate_column")
+    ):
+        intent["aggregate_column"] = resolved_role_columns["revenue_metric"]
+        intent["aggregate_columns"] = [resolved_role_columns["revenue_metric"]]
     
     '''# --- ENSURE NEGATION APPLIED TO FILTERS ---
     if filters:
@@ -1083,12 +1414,12 @@ def intent_parser_node(state: AnalystState) -> AnalystState:
             "relationship": extract_columns_from_intent_clause(
                 query,
                 all_columns,
-                ["relationship", "correlation", "cause", "causal", "drive"],
+                ["relationship", "correlation", "correlate", "cause", "causal", "drive", "drives", "driver", "drivers", "reduce", "reduces", "lower", "lowers", "harsher", "harsh", "elasticity"],
             ),
             "comparison": extract_columns_from_intent_clause(
                 query,
                 all_columns,
-                ["compare", "difference", "affect", "impact", "effect"],
+                ["compare", "difference", "affect", "impact", "effect", "overpriced", "discount", "price wars", "price increases", "convert"],
             ),
             "distribution": extract_columns_from_intent_clause(
                 query,

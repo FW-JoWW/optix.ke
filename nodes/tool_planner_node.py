@@ -19,7 +19,8 @@ def tool_planner_node(state: AnalystState) -> AnalystState:
             "ttest",
             "detect_outliers",
             "regression",
-            "summary_statistics"
+            "summary_statistics",
+            "direct_computation",
         ]:
 
             tool_plan.append({

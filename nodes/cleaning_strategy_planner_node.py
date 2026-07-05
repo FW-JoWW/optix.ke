@@ -18,12 +18,16 @@ def cleaning_strategy_planner_node(state: AnalystState) -> AnalystState:
         max_row_loss_ratio=0.1,
     )
 
+    user_intent = dict(state.get("intent", {}) or {})
+    user_intent.setdefault("query", state.get("business_question", ""))
+    user_intent.setdefault("business_question", state.get("business_question", ""))
+
     decision_output = run_decision_engine(
         dataset_profile=state.get("analysis_evidence", {}).get("preclean_profile_json", {}),
         structural_signals=state.get("structural_signals", {}),
         inferred_context=context,
         relationship_signals=state.get("relationship_signals", {}),
-        user_intent=state.get("intent", {}),
+        user_intent=user_intent,
         constraint_rules=constraints,
         candidate_plan=[],
         selected_columns=state.get("selected_columns", []),

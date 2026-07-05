@@ -44,6 +44,19 @@ class ComputationPlanModel(BaseModel):
     deferred: bool = False
 
 
+class AnalysisAbstractionModel(BaseModel):
+    capability_family: str = "unknown"
+    dimensions: List[str] = Field(default_factory=list)
+    measures: List[str] = Field(default_factory=list)
+    aggregation: Optional[str] = None
+    comparison_type: Optional[str] = None
+    temporal_behavior: Optional[str] = None
+    statistical_operation: Optional[str] = None
+    presentation_strategy: Optional[str] = None
+    confidence_score: float = Field(ge=0.0, le=1.0, default=0.0)
+    justification: str = ""
+
+
 class AnalysisOperation(BaseModel):
     tool: str
     columns: List[str] = Field(default_factory=list)
@@ -61,6 +74,8 @@ class AnalysisPlanModel(BaseModel):
         "comparison",
         "relationship",
         "distribution",
+        "outliers",
+        "data_quality",
         "predictive",
         "unknown",
     ]
@@ -72,6 +87,7 @@ class AnalysisPlanModel(BaseModel):
 
 class DecisionEngineOutput(BaseModel):
     cleaning_decisions: List[CleaningDecision] = Field(default_factory=list)
+    analysis_abstraction: AnalysisAbstractionModel
     computation_plan: ComputationPlanModel
     analysis_plan: AnalysisPlanModel
     decision_notes: List[str] = Field(default_factory=list)
