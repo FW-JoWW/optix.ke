@@ -9,6 +9,7 @@ class AnalystState(TypedDict):
 
     # dataset
     dataset_path: Optional[str]
+    dataset: Optional[pd.DataFrame]
     dataframe: Optional[pd.DataFrame]
     data_quality_issues: Optional[Dict[str, Any]]
     cleaning_plan: Optional[List[Dict[str, Any]]]
@@ -44,6 +45,7 @@ class AnalystState(TypedDict):
     eda_results: Optional[Dict[str, Any]]
     statistical_results: Optional[Dict[str, Any]]
     stat_test: Optional[str]
+    cleaning_validation: Optional[Dict[str, Any]]
 
     # tools result
     tool_plan: Optional[List[Dict[str, Any]]]
@@ -65,6 +67,7 @@ class AnalystState(TypedDict):
     # analysis evidence container
     analysis_evidence: Optional[Dict[str, Any]]
     human_in_loop: Optional[Dict[str, Any]]
+    analytical_reasoning: Optional[Dict[str, Any]]
 
     # dataset normalization pipeline
     normalization_schema: Optional[Any]
@@ -79,4 +82,7 @@ class AnalystState(TypedDict):
 
     # final report
     final_report: Optional[str]
+    master_report: Optional[str]
+    executive_report: Optional[str]
+    report_package: Optional[Dict[str, Any]]
     decision_context: Optional[Any]
