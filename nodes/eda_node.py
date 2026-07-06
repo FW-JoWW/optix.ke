@@ -8,7 +8,13 @@ def eda_node(state: AnalystState) -> AnalystState:
     Stores all results under state["analysis_evidence"].
     """
 
-    df = state.get("analysis_dataset") or state.get("cleaned_data")
+    df = state.get("analysis_dataset")
+    if df is None:
+        df = state.get("cleaned_data")
+    if df is None:
+        df = state.get("dataset")
+    if df is None:
+        df = state.get("dataframe")
     if df is None:
         raise ValueError("No dataset available for EDA")
 
@@ -18,11 +24,13 @@ def eda_node(state: AnalystState) -> AnalystState:
     state.setdefault("analysis_evidence", {})
 
     # Dataset overview
-    state["analysis_evidence"]["dataset_overview"] = {
+    dataset_overview = {
         "shape": df.shape,
         "dtypes": df.dtypes.astype(str).to_dict(),
         "missing_values": df.isnull().sum().to_dict()
     }
+    state["analysis_evidence"]["dataset_overview"] = dataset_overview
+    state["eda_results"] = dataset_overview
 
     # Numeric summary
     numeric_cols = df.select_dtypes(include=["int64", "float64"])
@@ -31,13 +39,20 @@ def eda_node(state: AnalystState) -> AnalystState:
     )
 
     # Categorical summary
-    categorical_cols = df.select_dtypes(include=["object", "category"])
+    categorical_cols = df.select_dtypes(include=["str", "category"])
     cat_summary = {col: df[col].value_counts().to_dict() for col in categorical_cols.columns}
     state["analysis_evidence"]["categorical_summary"] = cat_summary
 
     # Correlations
     if len(numeric_cols.columns) >= 2:
         state["analysis_evidence"]["correlations"] = numeric_cols.corr().to_dict()
+
+    state["eda_results"] = {
+        "dataset_overview": dataset_overview,
+        "numeric_summary": state["analysis_evidence"].get("numeric_summary", {}),
+        "categorical_summary": cat_summary,
+        "correlations": state["analysis_evidence"].get("correlations", {}),
+    }
 
     print("EDA Completed")
     return state

@@ -1,6 +1,22 @@
 # nodes/column_selection_node.py
 from state.state import AnalystState
 
+
+def _build_fallback_registry(df):
+    registry = {}
+    for col in df.columns:
+        dtype = df[col].dtype
+        if str(dtype) in {"object", "category"}:
+            role = "categorical_feature"
+        elif str(dtype).startswith(("datetime64", "datetime")):
+            role = "datetime"
+        elif str(dtype) in {"bool"}:
+            role = "categorical_feature"
+        else:
+            role = "numeric_measure"
+        registry[col] = {"semantic_role": role}
+    return registry
+
 def extract_intent_columns(filters):
     columns = []
 
@@ -35,6 +51,14 @@ def column_selection_node(state: AnalystState) -> AnalystState:
 
     column_registry = state.get("column_registry")
     df = state.get("analysis_dataset")
+    if df is None:
+        df = state.get("cleaned_data")
+    if df is None:
+        df = state.get("dataframe")
+
+    if column_registry is None and df is not None:
+        column_registry = _build_fallback_registry(df)
+        state["column_registry"] = column_registry
 
     if column_registry is None:
         raise ValueError("Column registry missing")

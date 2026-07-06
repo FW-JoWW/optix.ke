@@ -12,12 +12,17 @@ def statistical_analysis_node(state: AnalystState) -> AnalystState:
 
     df: pd.DataFrame = state.get("analysis_dataset")
     if df is None:
+        df = state.get("dataset")
+    if df is None:
+        df = state.get("dataframe")
+    if df is None:
         state.setdefault("analysis_evidence", {})
         state["analysis_evidence"]["statistical_tests"] = {"error": "No dataset provided."}
+        state["statistical_results"] = state["analysis_evidence"]["statistical_tests"]
         return state
 
     numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    categorical_cols = df.select_dtypes(include='object').columns.tolist()
+    categorical_cols = df.select_dtypes(include=['str']).columns.tolist()
 
     results: Dict[str, Any] = {}
 
@@ -62,6 +67,7 @@ def statistical_analysis_node(state: AnalystState) -> AnalystState:
     # Store results in analysis_evidence
     state.setdefault("analysis_evidence", {})
     state["analysis_evidence"]["statistical_tests"] = results
+    state["statistical_results"] = results
 
     print("Statistical Analysis Completed")
     return state
@@ -89,7 +95,7 @@ def statistical_analysis_node(state: AnalystState) -> AnalystState:
 
     # Identify numeric and categorical columns
     numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-    categorical_cols = df.select_dtypes(include='object').columns.tolist()
+    categorical_cols = df.select_dtypes(include=['str']).columns.tolist()
 
     # Determine relationships based on business question
     # For simplicity, assume we analyze numeric vs numeric correlations

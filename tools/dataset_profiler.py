@@ -7,6 +7,8 @@ def profile_dataset(state: AnalystState) -> AnalystState:
     """
 
     df = state.get("dataframe")
+    if df is None:
+        df = state.get("dataset")
 
     if df is None:
         raise ValueError("No dataframe found in state.")
@@ -22,10 +24,12 @@ def profile_dataset(state: AnalystState) -> AnalystState:
 
     # numeric vs categorical
     numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
-    categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    categorical_cols = df.select_dtypes(include=["str", "category"]).columns.tolist()
 
     profile["numeric_columns"] = numeric_cols
     profile["categorical_columns"] = categorical_cols
+    profile["row_count"] = profile["rows"]
+    profile["column_count"] = profile["columns"]
 
     # missing values
     profile["missing_values"] = df.isnull().sum().to_dict()
@@ -35,6 +39,8 @@ def profile_dataset(state: AnalystState) -> AnalystState:
         profile["summary_stats"] = df[numeric_cols].describe().to_dict()
 
     state["dataset_profile"] = profile
+    state["analysis_evidence"] = state.get("analysis_evidence", {})
+    state["analysis_evidence"]["dataset_profile_json"] = profile
 
     return state
 

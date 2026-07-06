@@ -6,10 +6,16 @@ from validation import validate_cleaning
 
 def data_validation_node(state: AnalystState) -> AnalystState:
     before_df = state.get("dataframe")
+    if before_df is None:
+        before_df = state.get("dataset")
     after_df = state.get("cleaned_data")
+    if after_df is None:
+        after_df = state.get("analysis_dataset")
 
     if before_df is None and after_df is None:
         state["data_validation"] = {"error": "No dataset provided."}
+        state["cleaning_validation"] = state["data_validation"]
+        state["clarification_questions"] = []
         return state
 
     if before_df is None:

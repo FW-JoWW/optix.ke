@@ -170,10 +170,14 @@ def row_filter_node(state: AnalystState) -> AnalystState:
 
     if "cleaned_data" in state and state["cleaned_data"] is not None:
         state["active_dataset"] = "cleaned_data"
+    elif state.get("analysis_dataset") is not None:
+        state["active_dataset"] = "analysis_dataset"
     else:
         state["active_dataset"] = "dataframe"
     
     df = state.get(state.get("active_dataset"))
+    if df is None and state.get("dataset") is not None:
+        df = state.get("dataset")
         
     
     if df is None:
@@ -208,6 +212,11 @@ def row_filter_node(state: AnalystState) -> AnalystState:
     if not ast:
         print("[INFO] No AST found - skipping filtering")
         state["analysis_dataset"] = df
+        state["analysis_evidence"]["row_filtering"] = {
+            "filters_applied": filters_applied,
+            "remaining_rows": len(df),
+            "skipped": True,
+        }
         return state
     
     # --------------------
@@ -217,6 +226,11 @@ def row_filter_node(state: AnalystState) -> AnalystState:
     if not ast:
         print("[INFO] No AST found - skipping filtering")
         state["analysis_dataset"] = df
+        state["analysis_evidence"]["row_filtering"] = {
+            "filters_applied": filters_applied,
+            "remaining_rows": len(df),
+            "skipped": True,
+        }
         return state
     
     # -------------------------
