@@ -10,6 +10,13 @@ import pandas as pd
 from graph.analyst_graph import graph
 from state.state import AnalystState
 from utils.openai_runtime import get_openai_runtime_info
+from scripts.guided_mode_harness import (
+    build_guided_sample_dataframe,
+    default_guided_responses,
+    run_guided_workflow,
+    scenario_responses,
+    summarize_guided_result,
+)
 
 
 def load_default_dataframe(dataset_path: str) -> pd.DataFrame:
@@ -23,6 +30,33 @@ def main() -> None:
 
     question = input("Enter your business question:\n> ").strip()
     mode = input("\nChoose mode (autonomous / guided / collaborative):\n> ").strip().lower() or "autonomous"
+
+    workflow_mode = os.getenv("WORKFLOW_TEST_MODE", "").strip().lower()
+    guided_scenario = os.getenv("GUIDED_TEST_SCENARIO", "").strip().lower()
+    guided_responses_env = os.getenv("GUIDED_TEST_RESPONSES", "").strip()
+
+    if mode == "guided" and workflow_mode in {"guided", "guided-test"}:
+        responses = default_guided_responses()
+        if guided_scenario:
+            responses = scenario_responses(guided_scenario)
+        elif guided_responses_env:
+            responses = [item.strip() for item in guided_responses_env.split("|") if item.strip()]
+        print("\n[Agent] Running guided workflow in scripted test mode.")
+        result = run_guided_workflow(
+            question=question,
+            responses=responses,
+            dataframe=build_guided_sample_dataframe(),
+        )
+        summary = summarize_guided_result(result)
+        print("\n===== GUIDED TEST SUMMARY =====")
+        pprint.pprint(summary)
+        if summary.get("final_report_available"):
+            print("\n===== FINAL REPORT =====\n")
+            print(result.final_state.get("final_report", "No report generated"))
+        else:
+            print("\n===== FINAL OUTPUT =====\n")
+            pprint.pprint(summary.get("final_output"))
+        return
 
     dataset_path = "data/olist_merged_dataset.csv"  # "data/Car Dataset 1945-2020.csv"
     df = load_default_dataframe(dataset_path)
@@ -55,6 +89,8 @@ def main() -> None:
     print("\n[Agent] Starting analysis...\n")
 
     show_trace = os.getenv("SHOW_WORKFLOW_TRACE", "").strip().lower() in {"1", "true", "yes"}
+    if mode == "guided" and workflow_mode not in {"guided", "guided-test"}:
+        show_trace = True
     trace_buffer = io.StringIO()
 
     with warnings.catch_warnings():

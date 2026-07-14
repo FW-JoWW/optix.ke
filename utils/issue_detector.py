@@ -9,6 +9,9 @@ from utils.numeric_parsing import normalize_numeric_token
 
 PROFILE_SAMPLE_SIZE = 1000
 
+_DATETIME_NAME_HINTS = ("date", "time", "timestamp", "month", "year", "day", "dob")
+_DATETIME_TOKEN_PATTERN = r"(\d{4}[-/]\d{1,2}([-/]\d{1,2})?|(?:\d{1,2}[-/]){2}\d{2,4}|\d{1,2}:\d{2}(:\d{2})?|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4})"
+
 
 def _sample_non_null(series: pd.Series, max_non_null: int = PROFILE_SAMPLE_SIZE) -> pd.Series:
     non_null = series.dropna()
@@ -22,6 +25,14 @@ def _parse_ratio_on_non_null(parsed: pd.Series, original: pd.Series) -> float:
     if non_null == 0:
         return 0.0
     return float(parsed.notna().sum() / non_null)
+
+
+def _datetime_signal_ratio(series: pd.Series) -> float:
+    sample = _sample_non_null(series).astype(str)
+    if sample.empty:
+        return 0.0
+    token_signal = sample.str.contains(_DATETIME_TOKEN_PATTERN, case=False, regex=True, na=False)
+    return float(token_signal.mean())
 
 
 def detect_issues(df: pd.DataFrame) -> dict:
@@ -97,7 +108,7 @@ def detect_issues(df: pd.DataFrame) -> dict:
                 }
             )
 
-    categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    categorical_cols = df.select_dtypes(include=["str", "category"]).columns.tolist()
     for col in categorical_cols:
         if total_rows == 0:
             continue
@@ -130,7 +141,10 @@ def detect_issues(df: pd.DataFrame) -> dict:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             parsed = pd.to_datetime(sample, errors="coerce")
-        if float(parsed.notna().mean()) >= 0.8:
+        parse_ratio = float(parsed.notna().mean())
+        token_ratio = _datetime_signal_ratio(df[col])
+        name_hint = any(hint in col.lower() for hint in _DATETIME_NAME_HINTS)
+        if parse_ratio >= 0.9 and (token_ratio >= 0.3 or name_hint):
             issues.append(
                 {
                     "column": col,

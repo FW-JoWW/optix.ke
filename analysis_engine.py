@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 import math
+import warnings
 import pandas as pd
 
 from inferential_engine import run_inferential_analysis
@@ -46,7 +47,9 @@ def _coerce_datetime_like(series: pd.Series) -> pd.Series:
     if pd.api.types.is_datetime64_any_dtype(series):
         return series
 
-    parsed = pd.to_datetime(series, errors="coerce")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        parsed = pd.to_datetime(series, errors="coerce")
     non_null = int(series.notna().sum())
     ratio = float(parsed.notna().sum() / non_null) if non_null else 0.0
     return parsed if ratio >= 0.5 else series

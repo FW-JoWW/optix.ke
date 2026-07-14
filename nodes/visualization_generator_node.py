@@ -252,8 +252,17 @@ def generate_prediction_fit_plot(df, story):
 # Story → Chart Mapper
 # ------------------------------
 
-def map_story_to_chart(story, df):
+def map_story_to_chart(story, df, chart_override=None):
     mapping = {
+        "histogram": generate_histogram,
+        "boxplot": generate_boxplot,
+        "scatter": generate_scatter,
+        "bar": generate_category_bar,
+        "grouped_bar": generate_grouped_bar,
+        "heatmap": generate_heatmap,
+        "regression": generate_regression_plot,
+        "predictive_drivers": generate_predictive_driver_bar,
+        "prediction_fit": generate_prediction_fit_plot,
         "group_difference": generate_boxplot,
         "inferential_group_difference": generate_boxplot,
         "outliers": generate_histogram,
@@ -269,7 +278,10 @@ def map_story_to_chart(story, df):
         "inferential_categorical_association": generate_heatmap,
         "predictive_model": generate_predictive_driver_bar,
     }
-    chart_func = mapping.get(story.get("type"))
+    preferred_type = chart_override or story.get("chart_override")
+    chart_func = mapping.get(preferred_type) if preferred_type else mapping.get(story.get("type"))
+    if chart_func is None and story.get("type") == "predictive_model":
+        chart_func = generate_prediction_fit_plot
     if chart_func:
         primary = chart_func(df, story)
         if primary or story.get("type") != "predictive_model":
@@ -338,6 +350,8 @@ def visualization_generator_node(state: AnalystState) -> AnalystState:
 
     top_stories = state.get("analysis_evidence", {}).get("top_stories", [])
     llm_insights = state.get("analysis_evidence", {}).get("llm_insight_details", [])
+    guided_preferences = state.get("guided_visualization_preferences", {}) or {}
+    chart_overrides = guided_preferences.get("chart_overrides", {}) or {}
     if not top_stories:
         print("No top stories available for visualization.")
         return state
@@ -352,7 +366,7 @@ def visualization_generator_node(state: AnalystState) -> AnalystState:
     for story in top_stories[:3]:
         if story.get("score", 0) < 0.7:
             continue
-        chart = map_story_to_chart(story, df)
+        chart = map_story_to_chart(story, df, chart_override=chart_overrides.get(story.get("type")))
         if chart:
             chart["caption"] = story.get("insight")
             charts.append(chart)

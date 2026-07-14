@@ -268,16 +268,198 @@ def _format_judgment_summary(judgment: Dict[str, Any]) -> str:
 
 
 def _executive_summary(evidence: Dict[str, Any], judgment: Dict[str, Any]) -> str:
+    details = evidence.get("llm_insight_details") or []
+    first_detail = details[0] if details else {}
     first_decision = evidence.get("decision_recommended_first") or {}
     top_story = (evidence.get("top_stories") or [{}])[0]
     return "\n".join(
         [
-            f"- Best action: {first_decision.get('recommended_action', 'None')}",
-            f"- Expected upside: {((first_decision.get('impact_assessment') or {}).get('impact_level', 'unknown'))}",
-            f"- Confidence level: {judgment.get('global_confidence', 'unknown')}",
-            f"- Core evidence: {top_story.get('insight', 'No strong story identified')}",
+            f"Business objective: {evidence.get('business_question') or 'Not stated'}",
+            f"Bottom line: {first_detail.get('plain_english') or top_story.get('insight') or 'No strong story identified'}",
+            f"Why it matters: {first_detail.get('business_implication') or 'The finding informs the decision, but the business implication was not explicitly extracted.'}",
+            f"Best action: {first_decision.get('recommended_action', first_detail.get('recommended_action', 'None'))}",
+            f"Confidence level: {judgment.get('global_confidence', 'unknown')}",
         ]
     )
+
+
+def _validated_ranked_items(
+    decision_ranking: List[Dict[str, Any]],
+    top_stories: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    ranked: List[Dict[str, Any]] = []
+    for index, item in enumerate(decision_ranking):
+        story = top_stories[index] if index < len(top_stories) else {}
+        validity = (story.get("insight_validity") or {}).get("valid", True) if story else True
+        if validity is False:
+            continue
+        ranked.append({"decision": item, "story": story, "rank": len(ranked) + 1})
+    return ranked
+
+
+def _ranked_analysis_area_lines(
+    decision_ranking: List[Dict[str, Any]],
+    top_stories: List[Dict[str, Any]],
+    reasoning: Dict[str, Any] | None = None,
+) -> List[str]:
+    ranked = _validated_ranked_items(decision_ranking, top_stories)
+    if not ranked:
+        return ["No validated ranking was available."]
+
+    lines: List[str] = []
+    for item in ranked[:5]:
+        decision = item["decision"]
+        story = item["story"]
+        impact = decision.get("impact_assessment") or {}
+        priority = decision.get("priority") or {}
+        detail_strength = _story_confidence(story) if story else "unknown"
+        insight = story.get("insight") or decision.get("decision_summary") or "No detailed insight was available."
+        implication = (
+            ((story.get("analysis_implication") or story.get("business_implication")) or "")
+            or decision.get("decision_summary")
+            or "Implication not explicitly captured."
+        )
+        if reasoning:
+            implication_reasoning = _reasoning_section_lines(reasoning, "findings")
+            if implication_reasoning and item["rank"] == 1:
+                lines.append(f"Validation note: {implication_reasoning[0]}")
+        lines.append(
+            f"{item['rank']}. {decision.get('recommended_action') or insight} | finding: {insight} | implication: {implication} | priority: {priority.get('priority_level', 'unknown')} ({priority.get('priority_score', 'unknown')}) | impact: {impact.get('impact_level', 'unknown')} | confidence: {detail_strength}"
+        )
+        if story.get("columns"):
+            lines.append(f"   areas analysed: {_format_value(story.get('columns'))}")
+        if story.get("semantic_reasoning"):
+            lines.append(f"   interpretation: {_format_value(story.get('semantic_reasoning'))}")
+    return lines
+
+
+def _build_business_report(
+    master_sections: Dict[str, str],
+    evidence: Dict[str, Any],
+    judgment: Dict[str, Any],
+    predictive_sections: Dict[str, str],
+    decision_ranking: List[Dict[str, Any]],
+    recommended_first: Dict[str, Any] | None,
+    business_question: str,
+    reasoning: Dict[str, Any] | None = None,
+) -> Dict[str, str]:
+    details = evidence.get("llm_insight_details") or []
+    ranked = _validated_ranked_items(decision_ranking, evidence.get("top_stories", []) or [])
+    first_rank = ranked[0] if ranked else {}
+    first_decision = first_rank.get("decision") or (recommended_first or {})
+    first_story = first_rank.get("story") or ((evidence.get("top_stories") or [{}])[0] if evidence.get("top_stories") else {})
+
+    context_lines = [
+        f"Business question: {business_question}",
+        f"Current position: {judgment.get('dominant_reasoning', 'No dominant business position was identified.')}",
+        f"Decision confidence: {_confidence_label(judgment.get('global_confidence'))}",
+        f"Primary action: {first_decision.get('recommended_action') or judgment.get('recommended_first_action') or 'None'}",
+    ]
+
+    if first_story.get("insight"):
+        context_lines.append(f"Lead finding: {first_story.get('insight')}")
+    if details:
+        context_lines.append(f"Business interpretation: {(details[0] or {}).get('business_implication') or 'Not stated'}")
+
+    area_lines = _ranked_analysis_area_lines(decision_ranking, evidence.get("top_stories", []) or [], reasoning)
+
+    implications_lines: List[str] = []
+    for item in ranked[:5]:
+        decision = item["decision"]
+        story = item["story"]
+        impact = decision.get("impact_assessment") or {}
+        business_implication = (
+            (story.get("business_implication") if story else None)
+            or (story.get("analysis_implication") if story else None)
+            or decision.get("decision_summary")
+            or "No business implication was explicitly captured."
+        )
+        affected_scope = _format_value(story.get("columns") or decision.get("columns") or [])
+        implications_lines.append(
+            f"{item['rank']}. {decision.get('recommended_action') or story.get('insight') or 'Unnamed area'} affects {affected_scope}. {business_implication}"
+        )
+        if impact.get("impact_level") or impact.get("estimated_direction"):
+            implications_lines.append(
+                f"   expected effect: {impact.get('impact_level', 'uncertain')} impact with {impact.get('estimated_direction', 'unclear')} direction"
+            )
+        if decision.get("monitoring_kpis"):
+            implications_lines.append(f"   who should watch it: {', '.join(_as_text_list(decision.get('monitoring_kpis'), limit=4))}")
+
+    recommendation_lines: List[str] = []
+    if first_decision.get("recommended_action"):
+        recommendation_lines.append(f"Recommended solution: {first_decision.get('recommended_action')}")
+    if reasoning:
+        recommendation_lines.extend(_reasoning_section_lines(reasoning, "recommendations")[:4])
+    if not recommendation_lines and predictive_sections.get("monitoring_plan"):
+        recommendation_lines.append(f"Monitoring approach: {predictive_sections['monitoring_plan']}")
+
+    rollout_lines: List[str] = []
+    if reasoning:
+        rollout_lines.extend(_reasoning_section_lines(reasoning, "implementation")[:5])
+    if not rollout_lines:
+        rollout_lines.extend(_as_text_list(predictive_sections.get("constraints"), limit=4))
+        rollout_lines.extend(_as_text_list(predictive_sections.get("experiment_design"), limit=4))
+    if first_decision.get("monitoring_kpis"):
+        rollout_lines.append(f"Rollout signals: {', '.join(_as_text_list(first_decision.get('monitoring_kpis'), limit=4))}")
+
+    position_lines: List[str] = [
+        f"Business position: {judgment.get('actionability', 'unknown')}",
+        f"Positioning note: the current evidence supports a targeted response rather than a broad unqualified change.",
+    ]
+    if predictive_sections.get("confidence") and predictive_sections["confidence"] != "None":
+        position_lines.append(f"Confidence context: {predictive_sections['confidence']}")
+    if reasoning:
+        position_lines.extend(_reasoning_section_lines(reasoning, "risks")[:4])
+
+    summary_sections = _section_map(
+        ("BUSINESS SUMMARY", context_lines),
+        ("RANKED AREAS ANALYSED", area_lines),
+        ("BUSINESS IMPACT BY AREA", implications_lines),
+        ("SOLUTION RECOMMENDATION", recommendation_lines),
+        ("ROLLOUT PLAN", rollout_lines),
+        ("CURRENT BUSINESS POSITION", position_lines),
+    )
+    return summary_sections
+
+
+def _guided_checkpoint_consolidation_lines(state: AnalystState, evidence: Dict[str, Any]) -> List[str]:
+    if state.get("mode") != "guided":
+        return []
+
+    summaries = evidence.get("guided_checkpoint_summaries") or state.get("guided_checkpoint_summaries") or {}
+    if not isinstance(summaries, dict) or not summaries:
+        return []
+
+    stage_specs = [
+        ("Data preparation", "data_preparation", ["What happened", "Why this happened", "Recommendation"]),
+        ("Business understanding", "business_understanding", ["Primary variables", "Why these variables", "Recommendation"]),
+        ("Analysis strategy", "analysis_strategy", ["What happened", "Why this method was selected", "Recommendation"]),
+        ("Result review", "result_review", ["What happened", "Why this happened", "What I recommend"]),
+    ]
+
+    lines: List[str] = []
+    for label, stage_key, fields in stage_specs:
+        summary = summaries.get(stage_key) or {}
+        if not isinstance(summary, dict) or not summary:
+            continue
+        collected: List[str] = []
+        for field in fields:
+            value = summary.get(field)
+            if value:
+                collected.extend(_as_text_list(value, limit=2))
+        if not collected:
+            fallback = ", ".join(
+                f"{key}: {value}"
+                for key, value in summary.items()
+                if key in fields and value
+            )
+            if fallback:
+                collected.append(fallback)
+        if collected:
+            lines.append(f"{label}: {collected[0]}")
+            if len(collected) > 1:
+                lines.append(f"{label} detail: {collected[1]}")
+    return lines
 
 
 def _first_tool_result(tool_results: Dict[str, Any], tool_name: str) -> Dict[str, Any] | None:
@@ -1078,6 +1260,10 @@ def _conclusion_lines(
 
 def _appendix_lines(state: AnalystState, evidence: Dict[str, Any], top_stories: List[Dict[str, Any]]) -> List[str]:
     reasoning = evidence.get("analytical_reasoning") or state.get("analytical_reasoning") or {}
+    reasoning_layer = evidence.get("reasoning_layer") or state.get("reasoning_layer") or {}
+    reasoning_sections = reasoning_layer.get("rendered_sections") or {}
+    guided_versions = evidence.get("guided_version_snapshots") or state.get("guided_version_snapshots") or {}
+    current_versions = state.get("guided_checkpoint_versions") or {}
     lines = [
         f"Traceability chain: dataset -> preparation -> analysis -> stories -> decisions -> judgment",
         f"Dataset source: {state.get('dataset_path') or 'N/A'}",
@@ -1086,9 +1272,49 @@ def _appendix_lines(state: AnalystState, evidence: Dict[str, Any], top_stories: 
         f"Top story signatures: {_format_value([story.get('type') for story in top_stories[:5]])}",
         f"Primary evidence: {_format_value(top_stories[0].get('insight') if top_stories else None)}",
         f"Analytical reasoning traceability: {_format_value((reasoning or {}).get('traceability'))}",
+        f"Reasoning layer stages: {_format_value(list(reasoning_sections.keys()))}",
+        f"Workflow supervision: current versions {_format_value(current_versions)}; snapshot stages {_format_value(list(guided_versions.keys()))}",
         f"Human-in-the-loop: {_format_value(evidence.get('human_in_loop'))}",
+        f"Decision log: {_format_value(evidence.get('guided_decision_log') or state.get('guided_decision_log'))}",
         f"Clarification questions: {_format_value(evidence.get('clarification_questions'))}",
     ]
+    return [line for line in lines if _normalize_text(line) and _normalize_text(line) != "None"]
+
+
+def _collaborative_lines(state: AnalystState, evidence: Dict[str, Any]) -> List[str]:
+    session = evidence.get("collaborative_session") or state.get("collaborative_session") or {}
+    if not session:
+        return []
+
+    tasks = session.get("tasks") or {}
+    evidence_store = session.get("evidence_store") or {}
+    hypotheses = session.get("hypotheses") or {}
+    task_graph = session.get("task_graph") or {}
+    memory = session.get("investigation_memory") or state.get("collaborative_memory") or {}
+    decision_log = session.get("decision_log") or state.get("collaborative_decision_log") or []
+    narrative = session.get("progressive_narrative") or state.get("collaborative_progressive_narrative") or []
+    comparisons = session.get("task_comparisons") or state.get("collaborative_task_comparisons") or []
+    suggestions = session.get("ai_suggestions") or state.get("collaborative_suggestions") or []
+
+    lines = [
+        f"Investigation ID: {session.get('investigation_id') or 'N/A'}",
+        f"Original question: {session.get('original_question') or state.get('business_question') or 'N/A'}",
+        f"Current status: {session.get('current_status') or 'active'}",
+        f"Task count: {len(tasks)}",
+        f"Completed tasks: {_format_value(session.get('completed_tasks') or state.get('collaborative_completed_tasks') or [])}",
+        f"Running tasks: {_format_value(session.get('running_tasks') or [])}",
+        f"Queued tasks: {_format_value(session.get('queued_tasks') or state.get('collaborative_queue') or [])}",
+        f"Task graph: {_format_value(task_graph)}",
+        f"Evidence store: {len(evidence_store)} evidence items",
+        f"Hypotheses: {_format_value(list(hypotheses.keys()) or list(hypotheses.values()))}",
+        f"Investigation memory: {_format_value(memory)}",
+        f"Decision log: {_format_value(decision_log)}",
+        f"Progressive narrative: {_format_value(narrative)}",
+        f"Task comparisons: {_format_value(comparisons)}",
+        f"AI suggested next investigations: {_format_value(suggestions)}",
+    ]
+    if session.get("final_executive_report"):
+        lines.append("Final executive report is available in the standard report sections.")
     return [line for line in lines if _normalize_text(line) and _normalize_text(line) != "None"]
 
 
@@ -1138,7 +1364,10 @@ def _build_master_report(
         ("IMPLEMENTATION CONSIDERATIONS", _implementation_lines(predictive_sections, decision_ranking, top_stories, reasoning)),
         ("MONITORING AND SUCCESS METRICS", _monitoring_lines(predictive_sections, decision_ranking, top_stories, reasoning)),
         ("LIMITATIONS AND ASSUMPTIONS", _limitations_lines(state, evidence, predictive_sections, top_stories, reasoning)),
+        ("RANKED ANALYSIS AREAS", _ranked_analysis_area_lines(decision_ranking, top_stories, reasoning)),
         ("OVERALL CONCLUSION", _conclusion_lines(business_question, judgment, recommended_first, predictive_sections, evidence, top_stories, reasoning)),
+        ("COLLABORATIVE INVESTIGATION", _collaborative_lines(state, evidence)),
+        ("GUIDED ANALYST CONSOLIDATION", _guided_checkpoint_consolidation_lines(state, evidence)),
         ("APPENDIX", _appendix_lines(state, evidence, top_stories)),
     )
 
@@ -1159,7 +1388,10 @@ def _build_master_report(
         "IMPLEMENTATION CONSIDERATIONS",
         "MONITORING AND SUCCESS METRICS",
         "LIMITATIONS AND ASSUMPTIONS",
+        "RANKED ANALYSIS AREAS",
         "OVERALL CONCLUSION",
+        "COLLABORATIVE INVESTIGATION",
+        "GUIDED ANALYST CONSOLIDATION",
         "APPENDIX",
     ]
     return {key: sections[key] for key in ordered_keys if key in sections}
@@ -1173,64 +1405,56 @@ def _build_executive_report(
     decision_ranking: List[Dict[str, Any]],
     recommended_first: Dict[str, Any] | None,
     business_question: str,
+    reasoning: Dict[str, Any] | None = None,
 ) -> Dict[str, str]:
-    overall_health = judgment.get("dominant_reasoning", "No judgment available.")
-    top_findings = master_sections.get("KEY FINDINGS AND INSIGHTS", "None")
-    top_risks = master_sections.get("RISK ASSESSMENT", "None")
-    top_opportunities = master_sections.get("OPPORTUNITY ASSESSMENT", "None")
-    action_plan = master_sections.get("IMPLEMENTATION CONSIDERATIONS", "None")
-    monitoring = master_sections.get("MONITORING AND SUCCESS METRICS", "None")
-    validation = master_sections.get("STATISTICAL AND ANALYTICAL VALIDATION", "None")
-    monitoring_items = _section_items(monitoring, limit=1)
-    action_plan_items = _section_items(action_plan, limit=1)
-    top_finding_items = _section_items(top_findings, limit=1)
-    top_risk_items = _section_items(top_risks, limit=1)
-    top_opportunity_items = _section_items(top_opportunities, limit=1)
-    confidence_items = _section_items(validation, limit=5)
-    conclusion_confidence = predictive_sections.get("confidence")
-    if not conclusion_confidence or conclusion_confidence == "None":
-        conclusion_confidence = _confidence_label(judgment.get("global_confidence"))
-    business_analysis_sections = _section_map(
-        ("BUSINESS CONTEXT", [
-            f"Business question: {business_question}",
-            f"Dataset source: {evidence.get('dataset_path') or 'N/A'}",
-            f"Judgment confidence: {judgment.get('global_confidence', 'unknown')}",
-            f"Actionability: {judgment.get('actionability', 'unknown')}",
-        ]),
-        ("KEY FINDINGS", _section_items(top_findings, limit=6)),
-        ("ROOT CAUSE", _section_items(master_sections.get("ROOT CAUSE ANALYSIS", "None"), limit=6)),
-        ("OPPORTUNITIES", _section_items(top_opportunities, limit=6)),
-        ("RISKS", _section_items(top_risks, limit=6)),
-        ("RECOMMENDATIONS", _section_items(master_sections.get("RECOMMENDATION ENGINE", "None"), limit=6)),
-        ("DECISION MATRIX", _section_items(master_sections.get("DECISION SUPPORT MATRIX", "None"), limit=6)),
-        ("IMPLEMENTATION ROADMAP", _section_items(action_plan, limit=6)),
-        ("MONITORING FRAMEWORK", _section_items(monitoring, limit=6)),
-        ("LIMITATIONS", _section_items(master_sections.get("LIMITATIONS AND ASSUMPTIONS", "None"), limit=6)),
-        ("FINAL BUSINESS CONCLUSION", [
-            f"Dominant reasoning: {overall_health}",
-            f"Recommended first action: {recommended_first.get('recommended_action') if recommended_first else judgment.get('recommended_first_action') or 'None'}",
-            f"Confidence level: {conclusion_confidence}",
-            f"Confidence rationale: {confidence_items[0] if confidence_items else 'Not enough evidence to explain confidence.'}",
-        ]),
-    )
-    business_analysis_body = "\n\n".join(business_analysis_sections.values()) if business_analysis_sections else "None"
+    details = evidence.get("llm_insight_details") or []
+    summary_lines = _as_text_list(_executive_summary(evidence, judgment).splitlines(), limit=8)
+    summary_lines = [line for line in summary_lines if line]
+
+    key_findings: List[str] = []
+    for detail in details[:3]:
+        headline = detail.get("headline") or detail.get("plain_english")
+        implication = detail.get("business_implication")
+        recommended_action = detail.get("recommended_action")
+        if headline:
+            key_findings.append(str(headline))
+        if implication:
+            key_findings.append(f"Why it matters: {implication}")
+        if recommended_action:
+            key_findings.append(f"Recommended response: {recommended_action}")
+    if not key_findings:
+        for story in evidence.get("top_stories", [])[:3]:
+            if story.get("insight"):
+                key_findings.append(str(story.get("insight")))
+
+    business_effect_lines: List[str] = []
+    if reasoning:
+        business_effect_lines.extend(_reasoning_section_lines(reasoning, "opportunities")[:4])
+        business_effect_lines.extend(_reasoning_section_lines(reasoning, "risks")[:4])
+    if not business_effect_lines:
+        business_effect_lines.extend(_as_text_list(predictive_sections.get("risks"), limit=3))
+        business_effect_lines.extend(_as_text_list(predictive_sections.get("what_could_go_wrong"), limit=3))
+    if not business_effect_lines and judgment.get("contradictions_found"):
+        business_effect_lines.append(f"Conflicts to watch: {_format_value(judgment.get('contradictions_found'))}")
+
+    action_lines: List[str] = []
+    recommended_action = recommended_first.get("recommended_action") if recommended_first else judgment.get("recommended_first_action")
+    if recommended_action:
+        action_lines.append(f"Recommended action: {recommended_action}")
+    if judgment.get("actionability") is not None:
+        action_lines.append(f"Actionability: {judgment.get('actionability')}")
+    confidence_line = _confidence_label(judgment.get("global_confidence"))
+    action_lines.append(f"Confidence level: {confidence_line}")
+    if predictive_sections.get("monitoring_plan") and predictive_sections["monitoring_plan"] != "None":
+        action_lines.append(f"Monitoring: {predictive_sections['monitoring_plan']}")
+
     summary_sections = _section_map(
-        ("EXECUTIVE SUMMARY", [
-            f"Business objective: {business_question}",
-            f"Overall business health: {overall_health}",
-            f"Most important findings: {top_finding_items[0] if top_finding_items else 'None'}",
-            f"Key risks: {top_risk_items[0] if top_risk_items else 'None'}",
-            f"Major opportunities: {top_opportunity_items[0] if top_opportunity_items else 'None'}",
-            f"Executive decision: {recommended_first.get('recommended_action') if recommended_first else judgment.get('recommended_first_action') or 'None'}",
-            f"Immediate action plan: {action_plan_items[0] if action_plan_items else 'None'}",
-            f"KPIs to monitor: {monitoring_items[0].replace('KPIs to monitor: ', '') if monitoring_items and monitoring_items[0].startswith('KPIs to monitor: ') else (monitoring_items[0] if monitoring_items else 'None')}",
-            f"Confidence rationale: {confidence_items[0] if confidence_items else 'Not enough evidence to explain confidence.'}",
-        ]),
+        ("EXECUTIVE SUMMARY", summary_lines),
+        ("KEY BUSINESS FINDINGS", key_findings),
+        ("BUSINESS IMPACT AND RISKS", business_effect_lines),
+        ("RECOMMENDED ACTION", action_lines),
     )
-    return {
-        **summary_sections,
-        "BUSINESS ANALYSIS REPORT": f"BUSINESS ANALYSIS REPORT\n\n{business_analysis_body}",
-    }
+    return summary_sections
 
 
 def report_node(state: AnalystState) -> AnalystState:
@@ -1239,6 +1463,7 @@ def report_node(state: AnalystState) -> AnalystState:
     """
     evidence = state.setdefault("analysis_evidence", {})
     business_question = state.get("business_question", "N/A")
+    evidence["business_question"] = business_question
     llm_insights = state.get("llm_insights") or evidence.get("llm_insights") or "None"
     clarification_questions: List[str] = (
         state.get("clarification_questions")
@@ -1260,6 +1485,7 @@ def report_node(state: AnalystState) -> AnalystState:
         decision_context = derive_decision_from_top_stories(top_stories)
     human_in_loop = evidence.get("human_in_loop")
     decision_notes = evidence.get("decision_notes", [])
+    decision_log = evidence.get("guided_decision_log") or state.get("guided_decision_log") or []
     predictive_sections = _predictive_sections(tool_results)
     selected_columns = state.get("selected_columns", []) or []
     reasoning = evidence.get("analytical_reasoning") or state.get("analytical_reasoning") or {}
@@ -1287,6 +1513,17 @@ def report_node(state: AnalystState) -> AnalystState:
         reasoning=reasoning,
     )
 
+    business_sections = _build_business_report(
+        master_sections=master_sections,
+        evidence=evidence,
+        judgment=judgment,
+        predictive_sections=predictive_sections,
+        decision_ranking=decision_ranking,
+        recommended_first=recommended_first,
+        business_question=business_question,
+        reasoning=reasoning,
+    )
+
     executive_sections = _build_executive_report(
         master_sections=master_sections,
         evidence=evidence,
@@ -1295,17 +1532,21 @@ def report_node(state: AnalystState) -> AnalystState:
         decision_ranking=decision_ranking,
         recommended_first=recommended_first,
         business_question=business_question,
+        reasoning=reasoning,
     )
 
     master_report = _render_report("================ MASTER REPORT ================", master_sections)
+    business_report = _render_report("================ BUSINESS REPORT ================", business_sections)
     executive_report = _render_report("================ EXECUTIVE REPORT ================", executive_sections)
-    combined_report = executive_report + "\n" + master_report
+    combined_report = master_report + "\n" + business_report + "\n" + executive_report
 
     report_package = {
         "master_report": master_report,
+        "business_report": business_report,
         "executive_report": executive_report,
         "sections": {
             "master": master_sections,
+            "business": business_sections,
             "executive": executive_sections,
         },
         "analytical_reasoning": reasoning,
@@ -1315,6 +1556,7 @@ def report_node(state: AnalystState) -> AnalystState:
             "decision_context": decision_context,
             "judgment_summary": judgment,
             "human_in_loop": human_in_loop,
+            "decision_log": decision_log,
             "clarification_questions": clarification_questions,
         },
         "confidence": {
@@ -1326,10 +1568,12 @@ def report_node(state: AnalystState) -> AnalystState:
     }
 
     evidence["master_report"] = master_report
+    evidence["business_report"] = business_report
     evidence["executive_report"] = executive_report
     evidence["report_package"] = report_package
 
     state["master_report"] = master_report
+    state["business_report"] = business_report
     state["executive_report"] = executive_report
     state["final_report"] = combined_report
 

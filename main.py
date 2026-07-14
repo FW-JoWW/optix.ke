@@ -1,63 +1,219 @@
+from __future__ import annotations
+
+import io
+import os
+import pprint
+import warnings
+from contextlib import redirect_stdout
+from time import perf_counter
+
+import pandas as pd
+
+from collaborative_mode.orchestrator import run_collaborative_investigation
 from graph.analyst_graph import graph
-
-
-# Ask user question
-question = input("Enter your business question: ")
-
-# Choose execution mode
-mode = input("Choose mode (autonomous / guided / collaborative): ")
-
-
-state = {
-    "business_question": question,
-    "dataset_path": "data/marketing.csv",
-    "mode": mode
-}
-
-
-result = graph.invoke(state)
-
-print("\n===== FINAL REPORT =====\n")
-
-print(result.get("final_report", "No report generated"))
-
-'''from tools.load_data import load_csv
-from tools.dataset_profiler import profile_dataset
-from tools.data_validation import validate_data
-from tools.eda_tools import eda_summary
-from tools.stats_tools import correlation_test
-from agents.analyst_agent import generate_insights
-from graph.analyst_graph import graph # <- this line needs checking
-
-question = "Is advertising spend correlated with revenue?"
-
-df = load_csv("data/marketing.csv")
-
-profile = profile_dataset(df)
-
-validation = validate_data(df)
-
-eda = eda_summary(df)
-
-stats = correlation_test(df, "ad_spend", "revenue")
-
-state = {
-
-    "business_question": "Why did revenue change this quarter?",
-    "dataset_path": "data/sales.csv"
-
-}
-
-result = graph.invoke(state) # <- the mentioned line above works with this part so check it too 
-
-print(result["final_report"])
-
-insights = generate_insights(
-    question,
-    profile,
-    validation,
-    eda,
-    stats
+from scripts.collaborative_mode_harness import build_guided_sample_dataframe
+from scripts.guided_mode_harness import (
+    default_guided_responses,
+    run_guided_workflow,
+    scenario_responses,
+    summarize_guided_result,
 )
+from state.state import AnalystState
+from utils.openai_runtime import get_openai_runtime_info
 
-print(insights)'''
+
+def load_default_dataframe(dataset_path: str) -> pd.DataFrame:
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+    return pd.read_csv(dataset_path, low_memory=False)
+
+
+def _run_autonomous_or_guided(question: str, mode: str, workflow_mode: str, dataset_path: str, df: pd.DataFrame) -> None:
+    guided_scenario = os.getenv("GUIDED_TEST_SCENARIO", "").strip().lower()
+    guided_responses_env = os.getenv("GUIDED_TEST_RESPONSES", "").strip()
+
+    if mode == "guided" and workflow_mode in {"guided", "guided-test"}:
+        responses = default_guided_responses()
+        if guided_scenario:
+            responses = scenario_responses(guided_scenario)
+        elif guided_responses_env:
+            responses = [item.strip() for item in guided_responses_env.split("|") if item.strip()]
+        print("\n[Agent] Running guided workflow in scripted test mode.")
+        result = run_guided_workflow(
+            question=question,
+            responses=responses,
+            dataframe=build_guided_sample_dataframe(),
+        )
+        summary = summarize_guided_result(result)
+        print("\n===== GUIDED TEST SUMMARY =====")
+        pprint.pprint(summary)
+        if summary.get("final_report_available"):
+            print("\n===== FINAL REPORT =====\n")
+            print(result.final_state.get("final_report", "No report generated"))
+        else:
+            print("\n===== FINAL OUTPUT =====\n")
+            pprint.pprint(summary.get("final_output"))
+        return
+
+    runtime_info = get_openai_runtime_info()
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    semantic_matcher_disabled = os.getenv("DISABLE_SEMANTIC_MATCHER", "").strip().lower() in {"1", "true", "yes"}
+
+    if not openai_api_key:
+        print("[WARN] OPENAI_API_KEY is not set. LLM nodes may fall back or skip.")
+
+    state: AnalystState = {
+        "business_question": question,
+        "dataset_path": dataset_path,
+        "dataframe": df,
+        "mode": mode,
+        "enable_llm_reasoning": True,
+        "disable_llm_reasoning": False,
+        "disable_semantic_matcher": semantic_matcher_disabled,
+        "analysis_evidence": {},
+    }
+
+    print("\n[Agent] Workflow configuration:")
+    print(f"- LLM requested: {state['enable_llm_reasoning'] and not state['disable_llm_reasoning']}")
+    print(f"- Semantic matcher requested: {not state['disable_semantic_matcher']}")
+    print(f"- OPENAI_API_KEY configured: {bool(openai_api_key)}")
+    print(f"- OpenAI proxy env detected: {runtime_info['proxy_env_present']}")
+    print(f"- OpenAI client ignores proxy env: {runtime_info['trust_env_for_openai'] is False}")
+
+    print("\n[Agent] Starting analysis...\n")
+
+    show_trace = os.getenv("SHOW_WORKFLOW_TRACE", "").strip().lower() in {"1", "true", "yes"}
+    if mode == "guided" and workflow_mode not in {"guided", "guided-test"}:
+        show_trace = True
+    trace_buffer = io.StringIO()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        started_at = perf_counter()
+        if show_trace:
+            final_state = graph.invoke(state)
+        else:
+            with redirect_stdout(trace_buffer):
+                final_state = graph.invoke(state)
+        elapsed_seconds = round(perf_counter() - started_at, 2)
+
+    evidence = final_state.get("analysis_evidence", {})
+
+    if show_trace:
+        print("\n===== INTERNAL TRACE =====")
+    else:
+        trace_output = trace_buffer.getvalue()
+        if trace_output.strip():
+            trace_lines = [line for line in trace_output.splitlines() if line.strip()]
+            tail = trace_lines[-20:]
+            if tail:
+                print("\n===== INTERNAL TRACE TAIL =====")
+                print("\n".join(tail))
+
+    print("\n===== HUMAN IN LOOP =====")
+    pprint.pprint(evidence.get("human_in_loop"))
+    print(f"\n===== ELAPSED SECONDS =====\n{elapsed_seconds}")
+
+    if final_state.get("awaiting_user") or evidence.get("final_output") is not None:
+        print("\n===== FINAL OUTPUT =====")
+        pprint.pprint(evidence.get("final_output"))
+        raise SystemExit(0)
+
+    print("\n===== LLM STATUS =====")
+    print(f"Reasoning: {final_state.get('llm_reasoning_status', 'unknown')}")
+    print(f"Synthesis: {evidence.get('llm_synthesis_status', 'unknown')}")
+
+    print("\n===== ANALYSIS PLAN =====")
+    pprint.pprint(evidence.get("analysis_plan"))
+
+    print("\n===== DECISION ENGINE =====")
+    pprint.pprint(evidence.get("analysis_decisions") or final_state.get("decision_output"))
+
+    print("\n===== COMPUTATION PLAN =====")
+    pprint.pprint(evidence.get("computation_plan"))
+
+    print("\n===== TOOL RESULTS =====")
+    pprint.pprint(evidence.get("tool_results"))
+
+    print("\n===== STORY CANDIDATES =====")
+    pprint.pprint(evidence.get("story_candidates"))
+
+    print("\n===== TOP STORIES =====")
+    pprint.pprint(evidence.get("top_stories"))
+
+    print("\n===== DECISION PRIORITIES =====")
+    pprint.pprint(evidence.get("decision_priority_ranking"))
+
+    print("\n===== ALL DECISION RECORDS =====")
+    pprint.pprint(evidence.get("decision_recommendations"))
+
+    print("\n===== JUDGMENT SUMMARY =====")
+    pprint.pprint(evidence.get("judgment_summary"))
+
+    print("\n===== RECOMMENDED FIRST ACTION =====")
+    pprint.pprint(evidence.get("decision_recommended_first"))
+
+    print("\n===== CLARIFICATION QUESTIONS =====")
+    pprint.pprint(final_state.get("clarification_questions") or evidence.get("clarification_questions"))
+
+    print("\n===== LLM INSIGHTS =====")
+    pprint.pprint(final_state.get("llm_insights") or evidence.get("llm_insights"))
+
+    print("\n===== FINAL REPORT =====")
+    print(final_state.get("final_report", "No report generated"))
+
+
+def _run_collaborative(question: str, dataset_path: str, df: pd.DataFrame, workflow_mode: str) -> None:
+    print("\n[Agent] Starting collaborative investigation...\n")
+    result = run_collaborative_investigation(
+        question=question,
+        dataset_path=dataset_path,
+        dataframe=df,
+    )
+    evidence = result.final_state.get("analysis_evidence", {})
+
+    print("\n===== INVESTIGATION DESK =====")
+    pprint.pprint(result.desk)
+
+    print("\n===== COLLABORATIVE SUMMARY =====")
+    pprint.pprint(
+        {
+            "investigation_id": result.session.get("investigation_id"),
+            "current_status": result.session.get("current_status"),
+            "completed_tasks": result.session.get("completed_tasks", []),
+            "evidence_count": len(result.session.get("evidence_store", {})),
+            "hypothesis_count": len(result.session.get("hypotheses", {})),
+            "current_understanding": result.session.get("investigation_memory", {}).get("current_understanding"),
+        }
+    )
+
+    print("\n===== HUMAN IN LOOP =====")
+    pprint.pprint(evidence.get("human_in_loop"))
+
+    print("\n===== FINAL REPORT =====")
+    print(result.final_state.get("final_report", "No report generated"))
+
+
+def main() -> None:
+    print("\n===== DATA ANALYST AGENT =====\n")
+
+    question = input("Enter your business question:\n> ").strip()
+    mode = input("\nChoose mode (autonomous / guided / collaborative):\n> ").strip().lower() or "autonomous"
+
+    workflow_mode = os.getenv("WORKFLOW_TEST_MODE", "").strip().lower()
+
+    dataset_path = "data/olist_merged_dataset.csv"
+    df = load_default_dataframe(dataset_path)
+
+    if mode == "collaborative":
+        if workflow_mode in {"collaborative", "collaborative-test"}:
+            df = build_guided_sample_dataframe()
+            dataset_path = "data/collaborative_test_dataset.csv"
+        _run_collaborative(question, dataset_path, df, workflow_mode)
+        return
+
+    _run_autonomous_or_guided(question, mode, workflow_mode, dataset_path, df)
+
+
+if __name__ == "__main__":
+    main()

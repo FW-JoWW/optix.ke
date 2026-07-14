@@ -4,6 +4,7 @@ import re
 from typing import Any, Dict, List
 
 from state.state import AnalystState
+from nodes.guided_mode_node import guided_analysis_strategy_checkpoint
 
 
 PLAN_TOOL_ALIASES = {
@@ -106,100 +107,36 @@ def interaction_node(state: AnalystState) -> AnalystState:
         return state
 
     if mode == "guided":
-        print("\n[Agent] Proposed Analysis Plan:")
-        for line in plan_lines:
-            print(f" - {line}")
-
-        user_input = input(
-            "\nApprove plan? (yes / modify / stop): "
-        ).strip().lower()
-
-        if user_input == "yes":
-            _record_human_loop(state, mode, "approved_plan", {"plan_preview": plan_lines})
-            return state
-
-        if user_input == "modify":
-            new_plan = input(
-                "Enter the revised plan using entries like correlation(price, mileage); summary_statistics(price):\n> "
-            ).strip()
-            parsed_plan = _parse_plan_text(new_plan, valid_columns)
-            if parsed_plan:
-                evidence["analysis_plan"] = parsed_plan
-                state["analysis_plan"] = parsed_plan
-                _record_human_loop(
-                    state,
-                    mode,
-                    "modified_plan",
-                    {
-                        "original_plan": plan_lines,
-                        "updated_plan": _stringify_plan(parsed_plan),
-                    },
-                )
-                print("\n[Agent] Updated plan:")
-                for line in _stringify_plan(parsed_plan):
-                    print(f" - {line}")
-                return state
-
-            print("\n[Agent] Could not parse the revised plan. Keeping the original proposed plan.")
-            _record_human_loop(state, mode, "invalid_modification_kept_original", {"user_input": new_plan, "plan_preview": plan_lines})
-            return state
-
-        if user_input == "stop":
-            print("\n[Agent] Execution stopped by user before analysis execution.")
-            state["awaiting_user"] = True
-            state["question_for_user"] = "Guided mode stopped before tool execution."
-            evidence["final_output"] = ["Execution paused in guided mode before tool execution."]
-            _record_human_loop(state, mode, "stopped", {"plan_preview": plan_lines})
-            return state
-
-        print("\n[Agent] Response not recognized. Keeping the original plan.")
-        _record_human_loop(state, mode, "unrecognized_response_kept_original", {"user_input": user_input, "plan_preview": plan_lines})
-        return state
+        return guided_analysis_strategy_checkpoint(state)
 
     if mode == "collaborative":
-        print("\n[Agent] Current proposed plan:")
-        for line in plan_lines:
-            print(f" - {line}")
-
-        instruction = input(
-            "\nTell the system exactly what to do.\nExamples: run correlation(price, mileage); run only summary_statistics(price, quantity); stop\n> "
-        ).strip()
-        state["user_response"] = instruction
-        lowered = instruction.lower()
-
-        if lowered in {"stop", "pause", "cancel"}:
-            print("\n[Agent] Execution stopped by user before analysis execution.")
-            state["awaiting_user"] = True
-            state["question_for_user"] = "Collaborative mode stopped before tool execution."
-            evidence["final_output"] = ["Execution paused in collaborative mode before tool execution."]
-            _record_human_loop(state, mode, "stopped", {"instruction": instruction, "plan_preview": plan_lines})
-            return state
-
-        cleaned_instruction = re.sub(r"^\s*(run|do|analyze)\s+(only\s+)?", "", instruction, flags=re.IGNORECASE)
-        if cleaned_instruction.lower() in {"continue", "continue as is", "run plan", "run proposed plan"}:
-            _record_human_loop(state, mode, "accepted_proposed_plan", {"instruction": instruction, "plan_preview": plan_lines})
-            return state
-
-        parsed_plan = _parse_plan_text(cleaned_instruction, valid_columns)
-        if parsed_plan:
-            evidence["analysis_plan"] = parsed_plan
-            state["analysis_plan"] = parsed_plan
-            _record_human_loop(
-                state,
-                mode,
-                "directed_plan",
-                {
-                    "instruction": instruction,
-                    "updated_plan": _stringify_plan(parsed_plan),
-                },
-            )
-            print("\n[Agent] Using collaborative user-directed plan:")
-            for line in _stringify_plan(parsed_plan):
-                print(f" - {line}")
-            return state
-
-        print("\n[Agent] Could not parse the instruction into an executable plan. Keeping the proposed plan.")
-        _record_human_loop(state, mode, "instruction_not_parsed_kept_original", {"instruction": instruction, "plan_preview": plan_lines})
+        state["awaiting_user"] = True
+        state["question_for_user"] = "Collaborative mode is managed by the investigation desk orchestration layer."
+        evidence["final_output"] = [
+            "Collaborative Mode now runs as an investigation orchestration layer.",
+            "Use the collaborative session manager to queue, refine, compare, or challenge tasks.",
+        ]
+        evidence["collaborative_desk"] = {
+            "current_proposed_plan": plan_lines,
+            "valid_columns": valid_columns,
+            "human_actions": [
+                "new investigation",
+                "refine task",
+                "compare results",
+                "challenge finding",
+                "accept AI suggestion",
+                "finish investigation",
+            ],
+        }
+        _record_human_loop(
+            state,
+            mode,
+            "desk_initialized",
+            {
+                "plan_preview": plan_lines,
+                "valid_columns": valid_columns,
+            },
+        )
         return state
 
     _record_human_loop(state, mode, "unknown_mode_defaulted", {"plan_preview": plan_lines})

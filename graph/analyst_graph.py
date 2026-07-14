@@ -9,6 +9,11 @@ from nodes.cleaning_strategy_planner_node import cleaning_strategy_planner_node
 from nodes.cleaning_execution_node import cleaning_execution_node
 from nodes.cleaning_audit_node import cleaning_audit_node
 from nodes.data_validation_node import data_validation_node
+from nodes.guided_mode_node import (
+    guided_business_understanding_checkpoint_node,
+    guided_data_preparation_checkpoint_node,
+    guided_result_review_checkpoint_node,
+)
 from nodes.dataset_profiler_node import dataset_profiler_node
 from nodes.column_semantic_classifier_node import column_semantic_classifier_node
 from nodes.relationship_detector_node import relationship_detector_node
@@ -29,6 +34,7 @@ from nodes.llm_insight_synthesizer_node import llm_insight_synthesizer_node
 from nodes.decision_engine_node import decision_engine_node
 from nodes.judgment_orchestrator_node import judgment_orchestrator_node
 from nodes.analytical_reasoning_node import analytical_reasoning_node
+from nodes.reasoning_layer_node import reasoning_layer_node
 from nodes.report_node import report_node
 
 # Build graph
@@ -41,6 +47,7 @@ builder.add_node("cleaning_strategy_planner", cleaning_strategy_planner_node)
 builder.add_node("cleaning_execution", cleaning_execution_node)
 builder.add_node("cleaning_audit", cleaning_audit_node)
 builder.add_node("data_validation", data_validation_node)
+builder.add_node("guided_data_preparation_checkpoint", guided_data_preparation_checkpoint_node)
 
 builder.add_node("dataset_profiler", dataset_profiler_node)
 builder.add_node("column_semantic_classifier", column_semantic_classifier_node)
@@ -49,6 +56,7 @@ builder.add_node("relationship_detector", relationship_detector_node)
 builder.add_node("intent_parser", intent_parser_node)
 builder.add_node("row_filter", row_filter_node)
 builder.add_node("column_selection", column_selection_node)
+builder.add_node("guided_business_understanding_checkpoint", guided_business_understanding_checkpoint_node)
 builder.add_node("initialize_analysis_evidence", initialize_analysis_evidence_node)
 builder.add_node("categorical_analysis", categorical_analysis_node)
 
@@ -61,6 +69,7 @@ builder.add_node("tool_executor", tool_executor_node)
 builder.add_node("evidence_interpreter", evidence_interpreter_node)
 builder.add_node("story_scoring", story_scoring_engine_node)
 builder.add_node("visualization", visualization_generator_node)
+builder.add_node("guided_result_review_checkpoint", guided_result_review_checkpoint_node)
 builder.add_node("llm_insight_synthesizer", llm_insight_synthesizer_node)
 builder.add_node("decision_engine", decision_engine_node)
 builder.add_node("judgment_orchestrator", judgment_orchestrator_node)
@@ -76,15 +85,46 @@ builder.add_edge("data_quality_diagnosis", "cleaning_strategy_planner")
 builder.add_edge("cleaning_strategy_planner", "cleaning_execution")
 builder.add_edge("cleaning_execution", "cleaning_audit")
 builder.add_edge("cleaning_audit", "data_validation")
+builder.add_edge("data_validation", "guided_data_preparation_checkpoint")
 
-builder.add_edge("data_validation", "dataset_profiler")
+def route_after_data_preparation(state: AnalystState):
+    if state.get("awaiting_user"):
+        return "end"
+    return "dataset_profiler"
+
+
+builder.add_conditional_edges(
+    "guided_data_preparation_checkpoint",
+    route_after_data_preparation,
+    {
+        "dataset_profiler": "dataset_profiler",
+        "end": END,
+    },
+)
+
 builder.add_edge("dataset_profiler", "column_semantic_classifier")
 builder.add_edge("column_semantic_classifier", "relationship_detector")
 builder.add_edge("relationship_detector", "intent_parser")
 
 builder.add_edge("intent_parser", "row_filter")
 builder.add_edge("row_filter", "column_selection")
-builder.add_edge("column_selection", "initialize_analysis_evidence")
+builder.add_edge("column_selection", "guided_business_understanding_checkpoint")
+
+
+def route_after_business_understanding(state: AnalystState):
+    if state.get("awaiting_user"):
+        return "end"
+    return "initialize_analysis_evidence"
+
+
+builder.add_conditional_edges(
+    "guided_business_understanding_checkpoint",
+    route_after_business_understanding,
+    {
+        "initialize_analysis_evidence": "initialize_analysis_evidence",
+        "end": END,
+    },
+)
 
 def route_after_intent(state: AnalystState):
     intent = state.get("intent", {})
@@ -140,11 +180,30 @@ builder.add_conditional_edges(
 builder.add_edge("tool_executor", "evidence_interpreter")
 builder.add_edge("evidence_interpreter", "story_scoring")
 builder.add_edge("story_scoring", "visualization")
-builder.add_edge("visualization", "llm_insight_synthesizer")
+builder.add_edge("visualization", "guided_result_review_checkpoint")
+
+
+def route_after_result_review(state: AnalystState):
+    if state.get("awaiting_user"):
+        return "end"
+    return "llm_insight_synthesizer"
+
+
+builder.add_conditional_edges(
+    "guided_result_review_checkpoint",
+    route_after_result_review,
+    {
+        "llm_insight_synthesizer": "llm_insight_synthesizer",
+        "end": END,
+    },
+)
+
 builder.add_edge("llm_insight_synthesizer", "decision_engine")
 builder.add_edge("decision_engine", "judgment_orchestrator")
 builder.add_edge("judgment_orchestrator", "analytical_reasoning")
-builder.add_edge("analytical_reasoning", "report")
+builder.add_node("reasoning_layer", reasoning_layer_node)
+builder.add_edge("analytical_reasoning", "reasoning_layer")
+builder.add_edge("reasoning_layer", "report")
 builder.add_edge("report", END)
 
 # Compile graph

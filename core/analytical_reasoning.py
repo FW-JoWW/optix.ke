@@ -25,7 +25,7 @@ def _to_lines(items: Any, limit: int | None = None) -> List[str]:
             text = ", ".join(
                 f"{key}: {value}"
                 for key, value in item.items()
-                if value not in {None, "", [], {}}
+                if value not in (None, "") and value != [] and value != {}
             )
         else:
             text = str(item).strip()

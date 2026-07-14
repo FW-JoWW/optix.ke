@@ -167,8 +167,6 @@ def _deterministic_action(issue: Dict[str, Any], profile: Dict[str, Any]) -> tup
     missing_ratio = profile.get("missing_ratio", 0.0)
     unique_ratio = profile.get("unique_ratio", 0.0)
     numeric_like_ratio = profile.get("numeric_like_ratio", 0.0)
-    datetime_like_ratio = profile.get("datetime_like_ratio", 0.0)
-    missing_pattern = profile.get("missing_pattern", {})
     label_quality = profile.get("label_quality", {})
 
     if issue_type == "duplicate_rows":
@@ -189,17 +187,75 @@ def _deterministic_action(issue: Dict[str, Any], profile: Dict[str, Any]) -> tup
     if issue_type == "missing_values":
         if missing_ratio >= 0.75 and unique_ratio >= 0.75:
             return "drop_column", "The column is mostly missing and mostly unique, so dropping is safer than filling."
-        if missing_pattern.get("prev_next_same_ratio", 0.0) >= 0.6 and missing_ratio <= 0.4:
-            return "forward_fill", "Neighboring values are stable around gaps, so forward fill is appropriate."
-        if datetime_like_ratio >= 0.8 and missing_ratio <= 0.3:
-            return "forward_fill", "Datetime-like columns with short gaps are often best forward-filled to preserve sequence context."
         if numeric_like_ratio >= 0.8:
             return "impute_median", "Numeric columns should use median imputation to reduce sensitivity to skew."
+        if numeric_like_ratio <= 0.35 and unique_ratio <= 0.5:
+            return "impute_mode", "Categorical columns usually impute missing values with the most frequent label."
         if label_quality.get("whitespace_issues") or label_quality.get("case_inconsistency"):
             return "standardize_categories", "Standardize labels before imputing or grouping categorical values."
-        return "impute_mode", "Categorical columns default to mode imputation when no safer sequence signal exists."
+        return "review_only", "Missing values should be reviewed because no safe automatic fill is clearly justified."
 
     return "review_only", "No safe automatic cleaning action was inferred."
+
+
+def _issue_rank(issue: Dict[str, Any], action: str) -> int:
+    severity = str(issue.get("severity", "medium")).lower()
+    base = {"critical": 40, "high": 30, "medium": 20, "low": 10}.get(severity, 10)
+    action_bonus = {
+        "drop_column": 8,
+        "remove_duplicates": 8,
+        "investigate_or_cap": 7,
+        "impute_median": 6,
+        "impute_mode": 5,
+        "impute_mean": 5,
+        "convert_to_numeric": 5,
+        "convert_to_datetime": 5,
+        "standardize_categories": 4,
+        "review_only": 1,
+    }.get(action, 2)
+    return base + action_bonus
+
+
+def _alternative_actions(issue: Dict[str, Any], profile: Dict[str, Any], recommended_action: str) -> List[Dict[str, str]]:
+    issue_type = issue.get("issue_type")
+    missing_ratio = profile.get("missing_ratio", 0.0)
+    numeric_like_ratio = profile.get("numeric_like_ratio", 0.0)
+    alternatives: List[Dict[str, str]] = []
+
+    def _add(action: str, reason: str) -> None:
+        if action == recommended_action:
+            return
+        if any(item["action"] == action for item in alternatives):
+            return
+        alternatives.append({"action": action, "reason": reason})
+
+    if issue_type == "missing_values":
+        if numeric_like_ratio >= 0.8:
+            _add("impute_mean", "Useful if the values are approximately symmetric and not dominated by outliers.")
+            _add("review_only", "Preserves the original record when you want analyst review instead of automatic filling.")
+        else:
+            _add("impute_mode", "A practical fallback for label-like or categorical data.")
+            _add("review_only", "Best when the safest choice is to avoid automatic filling.")
+    elif issue_type == "outliers":
+        _add("investigate_or_cap", "Lets you reduce influence while keeping the record.")
+        _add("review_only", "Use when domain review is needed before changing values.")
+    elif issue_type == "duplicate_rows":
+        _add("review_only", "Useful when duplicates might represent valid repeated events.")
+    elif issue_type in {"numeric_as_object", "datetime_as_object"}:
+        _add("convert_to_numeric" if issue_type == "numeric_as_object" else "convert_to_datetime", "Normalizes the storage type for downstream analysis.")
+        _add("review_only", "Useful when values may encode special cases that should be inspected first.")
+    elif issue_type == "inconsistent_labels":
+        _add("standardize_categories", "Aligns equivalent labels so grouping and reporting are consistent.")
+        _add("review_only", "Preferred when label harmonization might be too aggressive.")
+    elif issue_type == "high_cardinality":
+        _add("review_only", "High-cardinality fields usually need analyst judgment.")
+    else:
+        if missing_ratio or numeric_like_ratio:
+            _add("review_only", "Retains the current data when the issue is not clearly actionable.")
+        else:
+            _add("review_only", "No safer automatic alternative was identified.")
+
+    return alternatives[:3]
 
 
 def _needs_llm(issue: Dict[str, Any], profile: Dict[str, Any]) -> bool:
@@ -208,14 +264,10 @@ def _needs_llm(issue: Dict[str, Any], profile: Dict[str, Any]) -> bool:
 
     missing_ratio = profile.get("missing_ratio", 0.0)
     numeric_like_ratio = profile.get("numeric_like_ratio", 0.0)
-    datetime_like_ratio = profile.get("datetime_like_ratio", 0.0)
-    prev_next_same_ratio = profile.get("missing_pattern", {}).get("prev_next_same_ratio", 0.0)
     return (
         0.05 <= missing_ratio <= 0.5
         and (
             0.5 <= numeric_like_ratio < 0.8
-            or 0.5 <= datetime_like_ratio < 0.8
-            or 0.35 <= prev_next_same_ratio < 0.6
         )
     )
 
@@ -305,6 +357,7 @@ def recommend_cleaning_issues(
         col = issue.get("column")
         profile = column_profiles.get(col, {}) if col is not None else {}
         action, explanation = _deterministic_action(issue, profile)
+        alternatives = _alternative_actions(issue, profile, action)
         source = "rules"
 
         if (
@@ -320,14 +373,24 @@ def recommend_cleaning_issues(
                 source = "llm_validated"
                 llm_used = True
 
+        impact_score = _issue_rank(issue, action)
+        affected_columns = [col] if col is not None else ["dataset"]
         recommendations.append({
             "column": col,
+            "affected_columns": affected_columns,
             "issue_type": issue.get("issue_type"),
             "severity": issue.get("severity", "medium"),
+            "impact_score": impact_score,
+            "impact": explanation,
+            "reason": explanation,
+            "suggested_action": action,
+            "alternatives": alternatives,
             "explanation": explanation,
             "recommended_action": action,
             "reasoning_source": source,
         })
+
+    recommendations.sort(key=lambda item: item.get("impact_score", 0), reverse=True)
 
     return {
         "issues": recommendations,
