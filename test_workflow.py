@@ -7,11 +7,13 @@ from time import perf_counter
 
 import pandas as pd
 
+from collaborative_mode.session_runner import run_interactive_collaborative_session
+from collaborative_mode.presentation import render_collaborative_analyst_view, render_debug_collaborative_view
 from graph.analyst_graph import graph
 from state.state import AnalystState
 from utils.openai_runtime import get_openai_runtime_info
+from scripts.collaborative_mode_harness import build_guided_sample_dataframe
 from scripts.guided_mode_harness import (
-    build_guided_sample_dataframe,
     default_guided_responses,
     run_guided_workflow,
     scenario_responses,
@@ -25,6 +27,37 @@ def load_default_dataframe(dataset_path: str) -> pd.DataFrame:
     return pd.read_csv(dataset_path, low_memory=False)
 
 
+def _run_collaborative(question: str, workflow_mode: str, dataset_path: str, df: pd.DataFrame) -> None:
+    collab_responses_env = os.getenv("COLLABORATIVE_TEST_RESPONSES", "").strip()
+    collab_report_mode = os.getenv("COLLABORATIVE_REPORT_MODE", "").strip().lower()
+    responses = [item.strip() for item in collab_responses_env.split("|") if item.strip()] if collab_responses_env else None
+    build_final_report = collab_report_mode != "preview"
+
+    print("\n[Agent] Running collaborative workflow in scripted test mode.")
+    initial_tasks = [
+        {
+            "title": "Primary investigation",
+            "request": question,
+        }
+    ]
+    result = run_interactive_collaborative_session(
+        question=question,
+        responses=responses,
+        dataset_path=dataset_path,
+        dataframe=df,
+        initial_tasks=initial_tasks,
+        build_final_report=build_final_report,
+    )
+    print("\n===== COLLABORATIVE TEST SUMMARY =====")
+    if collab_report_mode == "debug":
+        print(render_debug_collaborative_view(result))
+    else:
+        print(render_collaborative_analyst_view(result))
+    if result.final_state.get("final_report"):
+        print("\n===== COLLABORATIVE FINAL REPORT =====")
+        print(result.final_state.get("final_report"))
+
+
 def main() -> None:
     print("\n===== DATA ANALYST AGENT =====\n")
 
@@ -34,6 +67,15 @@ def main() -> None:
     workflow_mode = os.getenv("WORKFLOW_TEST_MODE", "").strip().lower()
     guided_scenario = os.getenv("GUIDED_TEST_SCENARIO", "").strip().lower()
     guided_responses_env = os.getenv("GUIDED_TEST_RESPONSES", "").strip()
+
+    if mode == "collaborative":
+        dataset_path = "data/olist_merged_dataset.csv"
+        df = load_default_dataframe(dataset_path)
+        if workflow_mode in {"collaborative-smoke", "collaborative-preview"}:
+            df = build_guided_sample_dataframe()
+            dataset_path = "data/collaborative_test_dataset.csv"
+        _run_collaborative(question, workflow_mode, dataset_path, df)
+        return
 
     if mode == "guided" and workflow_mode in {"guided", "guided-test"}:
         responses = default_guided_responses()

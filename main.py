@@ -9,7 +9,8 @@ from time import perf_counter
 
 import pandas as pd
 
-from collaborative_mode.orchestrator import run_collaborative_investigation
+from collaborative_mode.session_runner import run_interactive_collaborative_session
+from collaborative_mode.presentation import render_collaborative_analyst_view, render_debug_collaborative_view
 from graph.analyst_graph import graph
 from scripts.collaborative_mode_harness import build_guided_sample_dataframe
 from scripts.guided_mode_harness import (
@@ -165,33 +166,23 @@ def _run_autonomous_or_guided(question: str, mode: str, workflow_mode: str, data
 
 def _run_collaborative(question: str, dataset_path: str, df: pd.DataFrame, workflow_mode: str) -> None:
     print("\n[Agent] Starting collaborative investigation...\n")
-    result = run_collaborative_investigation(
+    responses_env = os.getenv("COLLABORATIVE_TEST_RESPONSES", "").strip()
+    report_mode = os.getenv("COLLABORATIVE_REPORT_MODE", "").strip().lower()
+    responses = [item.strip() for item in responses_env.split("|") if item.strip()] if responses_env else None
+    result = run_interactive_collaborative_session(
         question=question,
         dataset_path=dataset_path,
         dataframe=df,
+        responses=responses,
     )
-    evidence = result.final_state.get("analysis_evidence", {})
-
-    print("\n===== INVESTIGATION DESK =====")
-    pprint.pprint(result.desk)
-
-    print("\n===== COLLABORATIVE SUMMARY =====")
-    pprint.pprint(
-        {
-            "investigation_id": result.session.get("investigation_id"),
-            "current_status": result.session.get("current_status"),
-            "completed_tasks": result.session.get("completed_tasks", []),
-            "evidence_count": len(result.session.get("evidence_store", {})),
-            "hypothesis_count": len(result.session.get("hypotheses", {})),
-            "current_understanding": result.session.get("investigation_memory", {}).get("current_understanding"),
-        }
-    )
-
-    print("\n===== HUMAN IN LOOP =====")
-    pprint.pprint(evidence.get("human_in_loop"))
-
-    print("\n===== FINAL REPORT =====")
-    print(result.final_state.get("final_report", "No report generated"))
+    print("\n===== COLLABORATIVE ANALYST VIEW =====")
+    if report_mode == "debug":
+        print(render_debug_collaborative_view(result))
+    else:
+        print(render_collaborative_analyst_view(result))
+    if result.final_state.get("final_report"):
+        print("\n===== COLLABORATIVE FINAL REPORT =====")
+        print(result.final_state.get("final_report"))
 
 
 def main() -> None:
@@ -206,7 +197,7 @@ def main() -> None:
     df = load_default_dataframe(dataset_path)
 
     if mode == "collaborative":
-        if workflow_mode in {"collaborative", "collaborative-test"}:
+        if workflow_mode in {"collaborative-smoke", "collaborative-preview"}:
             df = build_guided_sample_dataframe()
             dataset_path = "data/collaborative_test_dataset.csv"
         _run_collaborative(question, dataset_path, df, workflow_mode)

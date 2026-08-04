@@ -105,12 +105,17 @@ class HypothesisRecord:
 class InvestigationSession:
     investigation_id: str
     original_question: str
+    investigation_title: Optional[str] = None
+    objective: Optional[str] = None
     current_status: str = "active"
+    closed_at: Optional[str] = None
+    archived_at: Optional[str] = None
     task_graph: Dict[str, Any] = field(default_factory=dict)
     evidence_store: Dict[str, EvidenceRecord] = field(default_factory=dict)
     investigation_memory: Dict[str, Any] = field(default_factory=dict)
     decision_log: List[Dict[str, Any]] = field(default_factory=list)
     progressive_narrative: List[str] = field(default_factory=list)
+    checkpoint_summaries: List[Dict[str, Any]] = field(default_factory=list)
     final_executive_report: Optional[str] = None
     tasks: Dict[str, CollaborativeTask] = field(default_factory=dict)
     queued_tasks: List[str] = field(default_factory=list)
@@ -126,12 +131,17 @@ class InvestigationSession:
         return {
             "investigation_id": self.investigation_id,
             "original_question": self.original_question,
+            "investigation_title": self.investigation_title,
+            "objective": self.objective,
             "current_status": self.current_status,
+            "closed_at": self.closed_at,
+            "archived_at": self.archived_at,
             "task_graph": dict(self.task_graph),
             "evidence_store": {key: value.to_dict() for key, value in self.evidence_store.items()},
             "investigation_memory": dict(self.investigation_memory),
             "decision_log": list(self.decision_log),
             "progressive_narrative": list(self.progressive_narrative),
+            "checkpoint_summaries": list(self.checkpoint_summaries),
             "final_executive_report": self.final_executive_report,
             "tasks": {key: value.to_dict() for key, value in self.tasks.items()},
             "queued_tasks": list(self.queued_tasks),

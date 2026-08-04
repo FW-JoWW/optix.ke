@@ -12,7 +12,10 @@ from graph.analyst_graph import graph
 from nodes.report_node import report_node
 from state.state import AnalystState
 
+from .answer_synthesis import synthesize_answer
 from .models import EvidenceRecord, HypothesisRecord, InvestigationSession
+from .integrity import build_traceability_record, evaluate_investigation_integrity
+from .narration import humanize_columns, humanize_text, suggestion_impact_percent
 from .task_manager import TaskManager
 
 
@@ -34,6 +37,8 @@ def create_investigation_session(question: str) -> InvestigationSession:
     return InvestigationSession(
         investigation_id=_utc_session_id(),
         original_question=question,
+        investigation_title=question,
+        objective=question,
         current_status="active",
         investigation_memory={
             "original_question": question,
@@ -63,6 +68,7 @@ def _build_task_state(base_state: AnalystState, session: InvestigationSession, t
     state["collaborative_hypotheses"] = [hypothesis.to_dict() for hypothesis in session.hypotheses.values()]
     state["collaborative_decision_log"] = list(session.decision_log)
     state["collaborative_progressive_narrative"] = list(session.progressive_narrative)
+    state["collaborative_checkpoint_summaries"] = list(session.checkpoint_summaries)
     state["collaborative_suggestions"] = list(session.ai_suggestions)
     state["collaborative_task_comparisons"] = list(session.task_comparisons)
     state.setdefault("analysis_evidence", {})
@@ -74,6 +80,106 @@ def _short_text(value: Any, limit: int = 220) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+def _format_analysis_step(step: Any) -> str:
+    if isinstance(step, dict):
+        parts: List[str] = []
+        tool = step.get("tool") or step.get("analysis") or step.get("method") or step.get("type")
+        if tool:
+            parts.append(str(tool))
+        columns = step.get("columns") or step.get("selected_columns") or step.get("features") or []
+        if columns:
+            parts.append(f"columns={list(columns)}")
+        target = step.get("target") or step.get("target_column")
+        if target:
+            parts.append(f"target={target}")
+        description = step.get("description") or step.get("purpose") or step.get("reason")
+        if description:
+            parts.append(str(description))
+        return "; ".join(parts) if parts else _short_text(step)
+    return _short_text(step)
+
+
+def _analysis_story(task_request: str, final_state: AnalystState, summary: Dict[str, Any]) -> tuple[str, List[str], List[str]]:
+    evidence = final_state.get("analysis_evidence", {}) or {}
+    judgment = evidence.get("judgment_summary", {}) or {}
+    top_story = _first_story(evidence)
+    plan = list(summary.get("analysis_plan") or evidence.get("analysis_plan") or final_state.get("analysis_plan") or [])
+    tool_results = evidence.get("tool_results") or {}
+    dataframe = final_state.get("dataframe")
+    selected_columns = humanize_columns(summary.get("selected_columns") or final_state.get("selected_columns") or [], dataframe=dataframe)
+
+    analysis_steps = [humanize_text(_format_analysis_step(step), dataframe=dataframe) for step in plan[:5]]
+    if not analysis_steps:
+        analysis_steps = ["No explicit analysis steps were recorded, but the task still ran through the analytical pipeline."]
+
+    tool_notes: List[str] = []
+    if isinstance(tool_results, dict):
+        for key, value in list(tool_results.items())[:5]:
+            if isinstance(value, dict):
+                note_parts = [str(value.get("tool") or value.get("type") or key)]
+                if value.get("summary"):
+                    note_parts.append(humanize_text(_short_text(value.get("summary"), 120), dataframe=dataframe))
+                elif value.get("insight"):
+                    note_parts.append(humanize_text(_short_text(value.get("insight"), 120), dataframe=dataframe))
+                elif value.get("message"):
+                    note_parts.append(humanize_text(_short_text(value.get("message"), 120), dataframe=dataframe))
+                tool_notes.append(": ".join(note_parts))
+            else:
+                tool_notes.append(humanize_text(f"{key}: {type(value).__name__}", dataframe=dataframe))
+    elif tool_results:
+        tool_notes.append(humanize_text(_short_text(tool_results, 180), dataframe=dataframe))
+    if not tool_notes:
+        tool_notes = ["No tool result summary was available."]
+
+    conclusion = humanize_text(top_story.get("insight") or judgment.get("summary") or summary.get("current_understanding") or task_request, dataframe=dataframe)
+    confidence = summary.get("confidence")
+    confidence_label = "unknown"
+    if isinstance(confidence, (int, float)):
+        if float(confidence) >= 70:
+            confidence_label = "strong"
+        elif float(confidence) >= 45:
+            confidence_label = "moderate"
+        else:
+            confidence_label = "weak"
+    elif confidence is not None:
+        confidence_label = str(confidence)
+
+    story_lines = []
+    readable_request = humanize_text(task_request, dataframe=dataframe)
+    if selected_columns:
+        focus_text = ", ".join(selected_columns)
+        story_lines.append(
+            f"We centered the analysis on {focus_text} because the request was really asking how {readable_request} behaves when these fields change, and these are the most direct places to look for the pattern."
+        )
+    else:
+        story_lines.append(
+            f"We started with the full analytical context because {readable_request} was broad enough that the strongest signal could come from more than one part of the dataset, so narrowing too early could have missed the real driver."
+        )
+    story_lines.append(
+        f"We then moved through these analysis steps: {' -> '.join(analysis_steps)}. Each step was used to test a different angle of the same question, so the conclusion came from a sequence of checks rather than a single glance."
+    )
+    story_lines.append(
+        f"Those steps produced these signals and intermediate results: {'; '.join(tool_notes)}. This is the evidence trail that tells us what the data actually supported."
+    )
+    story_lines.append(
+        f"Taken together, that evidence supports this conclusion: {conclusion}. In practical terms, this is the part of the answer that is most worth carrying forward into the next decision or follow-up investigation."
+    )
+    if judgment.get("contradictions_found"):
+        story_lines.append("We also checked for contradictions, so the conclusion was tested against competing evidence instead of being accepted at face value.")
+    if confidence is not None:
+        story_lines.append(
+            f"That puts the result at {confidence_label} confidence, which means it is useful for decision-making but still should be treated as evidence rather than a final verdict."
+        )
+    else:
+        story_lines.append("Confidence was not explicitly quantified, so the result should be treated as provisional evidence that deserves follow-up.")
+    if selected_columns:
+        story_lines.append(
+            "Why these fields matter: they are the strongest levers available in the current dataset for explaining the pattern, so they help separate a real signal from a coincidence."
+        )
+
+    return " ".join(story_lines), analysis_steps, tool_notes
 
 
 def _first_story(evidence: Dict[str, Any]) -> Dict[str, Any]:
@@ -101,12 +207,22 @@ def _summarize_task_result(task_request: str, final_state: AnalystState, task_id
     report = final_state.get("final_report") or ""
     narrative = top_story.get("insight") or judgment.get("summary") or _short_text(report.splitlines()[0] if report else task_request)
     confidence = _confidence_from_state(final_state)
+    analysis_story, analysis_steps, tool_notes = _analysis_story(task_request, final_state, {
+        "current_understanding": top_story.get("insight") or judgment.get("summary") or task_request,
+        "confidence": confidence,
+        "analysis_plan": list(evidence.get("analysis_plan") or final_state.get("analysis_plan") or []),
+        "selected_columns": list(final_state.get("selected_columns") or []),
+    })
     summary = {
         "task_id": task_id,
         "version": version,
         "request": task_request,
+        "task_finding": top_story.get("insight") or judgment.get("summary") or task_request,
         "current_understanding": top_story.get("insight") or judgment.get("summary") or task_request,
         "narrative": narrative,
+        "analysis_story": analysis_story,
+        "analysis_steps": analysis_steps,
+        "analysis_signals": tool_notes,
         "confidence": confidence,
         "selected_columns": list(final_state.get("selected_columns") or []),
         "analysis_plan": list(evidence.get("analysis_plan") or final_state.get("analysis_plan") or []),
@@ -191,10 +307,115 @@ def _derive_hypothesis(task_request: str, final_state: AnalystState, evidence_re
 
 
 def _suggest_next_investigations(session: InvestigationSession, final_state: AnalystState, task_id: str) -> List[Dict[str, Any]]:
-    question = (final_state.get("business_question") or session.original_question or "").lower()
+    original_question = final_state.get("business_question") or session.original_question or ""
+    question = original_question.lower()
     suggestions: List[Dict[str, Any]] = []
     evidence = final_state.get("analysis_evidence", {}) or {}
     top_story = _first_story(evidence)
+    confidence = _confidence_from_state(final_state)
+    previous_next = []
+    if session.checkpoint_summaries:
+        previous_next = list(session.checkpoint_summaries[-1].get("next_investigations") or [])
+
+    def _signature(item: Dict[str, Any]) -> tuple[str, str]:
+        return (
+            str(item.get("title") or "").strip().lower(),
+            str(item.get("request") or item.get("description") or "").strip().lower(),
+        )
+
+    def _confidence_score(value: Any) -> int:
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            return int(numeric * 100 if numeric <= 1 else numeric)
+        if isinstance(value, dict):
+            score = value.get("score")
+            if isinstance(score, (int, float)):
+                numeric = float(score)
+                return int(numeric * 100 if numeric <= 1 else numeric)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"high", "strong", "very high"}:
+                return 85
+            if lowered in {"moderate", "medium"}:
+                return 60
+            if lowered in {"low", "weak"}:
+                return 35
+        return 50
+
+    def _term_overlap_score(*texts: Any) -> int:
+        tokens: set[str] = set()
+        for value in texts:
+            for token in str(value or "").lower().split():
+                token = token.strip(".,:;!?()[]{}<>\"'")
+                if len(token) >= 4:
+                    tokens.add(token)
+        question_tokens = {
+            token.strip(".,:;!?()[]{}<>\"'")
+            for token in question.split()
+            if len(token.strip(".,:;!?()[]{}<>\"'")) >= 4
+        }
+        return len(tokens & question_tokens)
+
+    def _rank_suggestion(item: Dict[str, Any]) -> Dict[str, Any]:
+        candidate = dict(item)
+        title = str(candidate.get("title") or "")
+        request = str(candidate.get("request") or candidate.get("description") or "")
+        reason = str(candidate.get("reason") or candidate.get("justification") or "")
+        relevance = min(100, 20 + _term_overlap_score(title, request, reason) * 18)
+        if any(term in (title + " " + request + " " + reason).lower() for term in ["challenge", "falsify", "test", "verify"]):
+            uncertainty_reduction = 85
+        elif any(term in (title + " " + request + " " + reason).lower() for term in ["compare", "contrast"]):
+            uncertainty_reduction = 75
+        elif any(term in (title + " " + request + " " + reason).lower() for term in ["refine", "rerun", "re-run", "repeat"]):
+            uncertainty_reduction = 70
+        else:
+            uncertainty_reduction = 60
+        business_value = min(100, 35 + relevance // 2 + (10 if top_story.get("insight") else 0))
+        analytical_confidence = _confidence_score(candidate.get("confidence", confidence))
+        recommendation_score = round(
+            (0.40 * relevance)
+            + (0.25 * uncertainty_reduction)
+            + (0.20 * business_value)
+            + (0.15 * analytical_confidence)
+        )
+        candidate["question_relevance"] = relevance
+        candidate["uncertainty_reduction"] = uncertainty_reduction
+        candidate["business_value"] = business_value
+        candidate["analytical_confidence"] = analytical_confidence
+        candidate["recommendation_score"] = max(0, min(100, recommendation_score))
+        return candidate
+
+    def _apply_impact(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        base_impact = suggestion_impact_percent({"confidence": confidence}) or 50
+        impact_offsets = [0, -10, -20]
+        enriched: List[Dict[str, Any]] = []
+        for index, item in enumerate(items[:3]):
+            candidate = _rank_suggestion(item)
+            candidate["impact_percent"] = max(
+                0,
+                min(
+                    100,
+                    round(
+                        0.35 * base_impact
+                        + 0.30 * candidate["question_relevance"]
+                        + 0.20 * candidate["uncertainty_reduction"]
+                        + 0.15 * candidate["business_value"]
+                        + impact_offsets[index],
+                    ),
+                ),
+            )
+            candidate["confidence"] = candidate.get("confidence", confidence)
+            enriched.append(candidate)
+        enriched.sort(
+            key=lambda item: (
+                item.get("recommendation_score", 0),
+                item.get("impact_percent", 0),
+                item.get("question_relevance", 0),
+                item.get("uncertainty_reduction", 0),
+            ),
+            reverse=True,
+        )
+        return enriched
 
     if any(term in question for term in ["region", "geo", "geographic", "location"]):
         suggestions.append(
@@ -202,6 +423,8 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
                 "title": "Investigate regional differences",
                 "request": "Compare the outcome by region and test whether regional segmentation changes the conclusion.",
                 "depends_on": [task_id],
+                "confidence": confidence,
+                "source_task_id": task_id,
             }
         )
 
@@ -211,6 +434,8 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
                 "title": "Compare customer segments",
                 "request": "Compare the most important customer segments and inspect whether the main driver changes across groups.",
                 "depends_on": [task_id],
+                "confidence": confidence,
+                "source_task_id": task_id,
             }
         )
 
@@ -220,6 +445,8 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
                 "title": "Challenge the leading finding",
                 "request": f"Challenge this finding: {top_story.get('insight')}",
                 "depends_on": [task_id],
+                "confidence": confidence,
+                "source_task_id": task_id,
             }
         )
 
@@ -229,8 +456,27 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
                 "title": "Refine the current task",
                 "request": "Re-run the current task with a narrower scope or an alternative hypothesis.",
                 "depends_on": [task_id],
+                "confidence": confidence,
+                "source_task_id": task_id,
             }
         )
+
+    suggestions = _apply_impact(suggestions)
+
+    current_signatures = {_signature(item) for item in suggestions}
+    previous_signatures = {_signature(item) for item in previous_next}
+    if current_signatures and previous_signatures and current_signatures.issubset(previous_signatures):
+        return [
+            {
+                "title": "No further distinct investigation",
+                "request": "The strongest follow-up from the previous checkpoint is still the right one, so there is no new distinct next step to add. Consolidate the result or finish the investigation before starting a new question.",
+                "depends_on": [task_id],
+                "confidence": confidence,
+                "impact_percent": 0,
+                "source_task_id": task_id,
+                "terminal": True,
+            }
+        ]
 
     return suggestions[:3]
 
@@ -239,6 +485,8 @@ def _build_desk_view(session: InvestigationSession) -> Dict[str, Any]:
     completed = [session.tasks[task_id].to_dict() for task_id in session.completed_tasks if task_id in session.tasks]
     running = [session.tasks[task_id].to_dict() for task_id in session.running_tasks if task_id in session.tasks]
     queued = [session.tasks[task_id].to_dict() for task_id in session.queued_tasks if task_id in session.tasks]
+    failed = [session.tasks[task_id].to_dict() for task_id in session.failed_tasks if task_id in session.tasks]
+    decision = session.investigation_memory.get("investigation_decision") or {}
     return {
         "investigation_id": session.investigation_id,
         "original_question": session.original_question,
@@ -246,7 +494,9 @@ def _build_desk_view(session: InvestigationSession) -> Dict[str, Any]:
         "completed_tasks": completed,
         "running_tasks": running,
         "queued_tasks": queued,
+        "failed_tasks": failed,
         "current_understanding": session.investigation_memory.get("current_understanding"),
+        "last_failure": session.investigation_memory.get("last_failure"),
         "evidence_summary": [record.statement for record in session.evidence_store.values()],
         "current_hypotheses": [hypothesis.to_dict() for hypothesis in session.hypotheses.values()],
         "ai_suggested_next_investigations": list(session.ai_suggestions),
@@ -262,6 +512,9 @@ def _build_desk_view(session: InvestigationSession) -> Dict[str, Any]:
         "task_graph": deepcopy(session.task_graph),
         "decision_log": list(session.decision_log),
         "investigation_memory": deepcopy(session.investigation_memory),
+        "current_decision": decision.get("decision"),
+        "investigation_decision": decision,
+        "question_for_user": session.investigation_memory.get("question_for_user"),
     }
 
 
@@ -277,9 +530,29 @@ def _inject_collaborative_context(state: AnalystState, session: InvestigationSes
     state["collaborative_hypotheses"] = [hypothesis.to_dict() for hypothesis in session.hypotheses.values()]
     state["collaborative_decision_log"] = list(session.decision_log)
     state["collaborative_progressive_narrative"] = list(session.progressive_narrative)
+    state["collaborative_checkpoint_summaries"] = list(session.checkpoint_summaries)
     state["collaborative_suggestions"] = list(session.ai_suggestions)
     state["collaborative_task_comparisons"] = list(session.task_comparisons)
     return state
+
+
+def _default_initial_tasks(question: str) -> List[Dict[str, Any]]:
+    challenge_request = f"Challenge the leading conclusion for: {question}"
+    comparison_request = f"Compare the current conclusion against an alternative explanation for: {question}"
+    return [
+        {
+            "title": "Primary investigation",
+            "request": question,
+        },
+        {
+            "title": "Challenge finding",
+            "request": challenge_request,
+        },
+        {
+            "title": "Comparison task",
+            "request": comparison_request,
+        },
+    ]
 
 
 def run_collaborative_investigation(
@@ -288,6 +561,7 @@ def run_collaborative_investigation(
     dataset_path: str | None = None,
     dataframe: Any | None = None,
     initial_tasks: Sequence[Dict[str, Any] | str] | None = None,
+    build_final_report: bool = True,
 ) -> CollaborativeRunResult:
     """
     Run an investigation by dispatching each task through the existing analytical pipeline.
@@ -320,12 +594,7 @@ def run_collaborative_investigation(
     manager = TaskManager(session)
 
     if not initial_tasks:
-        initial_tasks = [
-            {
-                "title": "Primary investigation",
-                "request": question,
-            }
-        ]
+        initial_tasks = _default_initial_tasks(question)
 
     for task_spec in initial_tasks:
         if isinstance(task_spec, str):
@@ -360,12 +629,90 @@ def run_collaborative_investigation(
         evidence = _build_evidence_record(task.task_id, final_state, summary)
         manager.mark_completed(task.task_id, final_state, evidence, summary)
         hypothesis = _derive_hypothesis(task.request, final_state, evidence)
+        current_hypothesis = session.investigation_memory.get("current_understanding") or session.original_question
+        answer_synthesis = synthesize_answer(
+            business_question=task.request,
+            evidence=final_state.get("analysis_evidence", {}) or {},
+            hypotheses=[hypothesis.to_dict()],
+            current_understanding=summary.get("current_understanding") or summary.get("task_finding") or task.request,
+            confidence=summary.get("confidence"),
+            knowledge_gaps=session.investigation_memory.get("knowledge_gaps") or [],
+            investigation_memory=session.investigation_memory,
+            dataframe=base_state.get("dataframe"),
+        )
+        decision = (
+            final_state.get("investigation_decision")
+            or final_state.get("analysis_evidence", {}).get("investigation_decision")
+            or answer_synthesis.get("investigation_decision")
+            or {}
+        )
+        integrity = evaluate_investigation_integrity(
+            original_question=session.original_question,
+            task_request=task.request,
+            summary=summary,
+            current_hypothesis=current_hypothesis,
+            prior_findings=session.investigation_memory.get("previous_findings") or [],
+            dataframe=base_state.get("dataframe"),
+        )
+        summary["integrity"] = integrity
+        summary["traceability"] = build_traceability_record(integrity)
+        summary["investigation_decision"] = decision
+        summary["current_understanding"] = integrity["promoted_understanding"] if integrity["should_promote"] else (session.investigation_memory.get("current_understanding") or session.original_question)
+        summary["task_finding"] = summary.get("task_finding") or summary["current_understanding"]
+        summary["integrity_status"] = integrity["overall"]["level"]
+        hypothesis.notes.append(
+            f"Integrity: question relevance={integrity['question_relevance']['level']}, continuity={integrity['continuity']['level']}, information gain={integrity['information_gain']['level']}, validity={integrity['analytical_validity']['level']}."
+        )
+        if not integrity["should_promote"]:
+            hypothesis.status = "inconclusive"
         session.hypotheses[f"{task.task_id}:v{task.version}"] = hypothesis
         session.progressive_narrative.append(summary["narrative"])
-        session.investigation_memory["current_understanding"] = summary["current_understanding"]
-        session.investigation_memory.setdefault("previous_findings", []).append(summary["current_understanding"])
+        session.investigation_memory["last_integrity"] = integrity
+        session.investigation_memory["last_traceability"] = summary["traceability"]
+        session.investigation_memory["investigation_decision"] = decision
+        session.investigation_memory["current_decision"] = decision.get("decision")
+        session.investigation_memory["question_for_user"] = decision.get("question_for_user") or session.investigation_memory.get("question_for_user")
+        session.investigation_memory.setdefault("integrity_history", []).append(
+            {
+                "task_id": task.task_id,
+                "task_request": task.request,
+                "traceability": summary["traceability"],
+                "integrity": integrity,
+                "decision": decision,
+            }
+        )
+        if integrity["should_promote"]:
+            session.investigation_memory["current_understanding"] = summary["current_understanding"]
+        else:
+            session.investigation_memory.setdefault("supporting_findings", []).append(summary["task_finding"])
+            if "current_understanding" not in session.investigation_memory:
+                session.investigation_memory["current_understanding"] = session.original_question
+        session.investigation_memory.setdefault("previous_findings", []).append(summary["task_finding"])
         session.investigation_memory.setdefault("task_references", []).append(task.task_id)
-        session.ai_suggestions = _suggest_next_investigations(session, final_state, task.task_id)
+        next_suggestions = _suggest_next_investigations(session, final_state, task.task_id)
+        session.ai_suggestions = next_suggestions
+        session.checkpoint_summaries.append(
+            {
+                "checkpoint_id": f"checkpoint-{len(session.checkpoint_summaries) + 1}",
+                "task_id": task.task_id,
+                "task_title": task.title,
+                "task_request": task.request,
+                "version": task.version,
+                "status": summary.get("status", "completed"),
+                "current_understanding": summary.get("current_understanding"),
+                "narrative": summary.get("narrative"),
+                "confidence": summary.get("confidence"),
+                "integrity": integrity,
+                "traceability": summary["traceability"],
+                "selected_columns": list(summary.get("selected_columns") or []),
+                "analysis_plan": list(summary.get("analysis_plan") or []),
+                "tool_results": list(summary.get("tool_results") or []),
+                "visualizations": summary.get("visualizations"),
+                "report_excerpt": summary.get("report_excerpt"),
+                "timestamp": summary.get("timestamp"),
+                "next_investigations": list(next_suggestions),
+            }
+        )
         if len(session.completed_tasks) >= 2:
             comparison = manager.compare_tasks(session.completed_tasks[-2], session.completed_tasks[-1])
             session.investigation_memory.setdefault("comparison_history", []).append(comparison)
@@ -398,8 +745,37 @@ def run_collaborative_investigation(
     final_state["analysis_evidence"]["collaborative_session"] = session.to_dict()
     final_state["analysis_evidence"]["collaborative_task_outputs"] = dict(task_outputs)
     final_state["analysis_evidence"]["collaborative_desk"] = _build_desk_view(session)
-    final_state = report_node(final_state)
-    session.final_executive_report = final_state.get("final_report")
+    final_state["analysis_evidence"]["investigation_decision"] = session.investigation_memory.get("investigation_decision") or {}
+    final_state["investigation_decision"] = session.investigation_memory.get("investigation_decision") or {}
+
+    if build_final_report:
+        final_state = report_node(final_state)
+        session.final_executive_report = final_state.get("final_report")
+    else:
+        report_lines = [
+            "================ COLLABORATIVE INVESTIGATION ================",
+            f"Investigation ID: {session.investigation_id}",
+            f"Original question: {session.original_question}",
+            f"Completed tasks: {', '.join(session.completed_tasks) if session.completed_tasks else 'None'}",
+            f"Current understanding: {session.investigation_memory.get('current_understanding') or 'None'}",
+            "Task findings:",
+        ]
+        for task_id in session.completed_tasks:
+            task_summary = task_outputs.get(task_id, {})
+            report_lines.append(
+                f"- {task_id}: {task_summary.get('current_understanding') or task_summary.get('narrative') or 'Task completed.'}"
+            )
+        report_lines.extend(
+            [
+                "Evidence store:",
+                f"- {len(session.evidence_store)} evidence items",
+                "Hypotheses:",
+                f"- {len(session.hypotheses)} hypotheses tracked",
+            ]
+        )
+        final_state["final_report"] = "\n".join(report_lines)
+        session.final_executive_report = final_state["final_report"]
+
     final_state["collaborative_final_report"] = final_state.get("final_report")
 
     return CollaborativeRunResult(

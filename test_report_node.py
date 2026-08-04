@@ -211,11 +211,12 @@ def test_report_node_guided_mode_keeps_analyst_facing_consolidation() -> None:
     final_state = report_node(state)
 
     assert "GUIDED ANALYST CONSOLIDATION" in final_state["master_report"]
-    assert final_state["final_report"].startswith("================ MASTER REPORT ================")
-    assert "================ BUSINESS REPORT ================" in final_state["final_report"]
-    assert "================ EXECUTIVE REPORT ================" in final_state["final_report"]
-    assert final_state["final_report"].index("================ MASTER REPORT ================") < final_state["final_report"].index("================ EXECUTIVE REPORT ================")
-    assert final_state["final_report"].index("================ BUSINESS REPORT ================") < final_state["final_report"].index("================ EXECUTIVE REPORT ================")
+    assert final_state["final_report"].startswith("================ EXECUTIVE ANSWER ================")
+    assert "Business Question" in final_state["final_report"]
+    assert "Final Conclusion" in final_state["final_report"]
+    assert "Recommended Future Investigations" in final_state["final_report"]
+    assert final_state["analyst_report"].startswith("================ EXECUTIVE ANSWER ================")
+    assert "analyst" in final_state["analysis_evidence"]["report_package"]["sections"]
 
 
 if __name__ == "__main__":

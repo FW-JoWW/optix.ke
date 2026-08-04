@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Sequence, Tuple
 
 from state.state import AnalystState
+from collaborative_mode.answer_synthesis import render_answer_synthesis_report, synthesize_answer
+from collaborative_mode.confidence_diagnostics import render_investigation_decision_report
+from collaborative_mode.narrative_composer import compose_analyst_sections, render_analyst_report
+from collaborative_mode.narration import format_suggestion_line, humanize_columns, humanize_text, suggestion_impact_percent
 from nodes.visualization_generator_node import derive_decision_from_top_stories
 
 
@@ -268,19 +272,85 @@ def _format_judgment_summary(judgment: Dict[str, Any]) -> str:
 
 
 def _executive_summary(evidence: Dict[str, Any], judgment: Dict[str, Any]) -> str:
+    answer_synthesis = evidence.get("answer_synthesis") or {}
     details = evidence.get("llm_insight_details") or []
     first_detail = details[0] if details else {}
     first_decision = evidence.get("decision_recommended_first") or {}
     top_story = (evidence.get("top_stories") or [{}])[0]
+    bottom_line = answer_synthesis.get("direct_answer") or answer_synthesis.get("best_available_answer") or first_detail.get("plain_english") or top_story.get("insight") or "No strong story identified"
+    business_implication = answer_synthesis.get("business_interpretation") or first_detail.get("business_implication") or "The finding informs the decision, but the business implication was not explicitly extracted."
+    confidence_value = answer_synthesis.get("confidence", {}).get("business", {}).get("label") or judgment.get("global_confidence", "unknown")
     return "\n".join(
         [
             f"Business objective: {evidence.get('business_question') or 'Not stated'}",
-            f"Bottom line: {first_detail.get('plain_english') or top_story.get('insight') or 'No strong story identified'}",
-            f"Why it matters: {first_detail.get('business_implication') or 'The finding informs the decision, but the business implication was not explicitly extracted.'}",
+            f"Bottom line: {bottom_line}",
+            f"Why it matters: {business_implication}",
             f"Best action: {first_decision.get('recommended_action', first_detail.get('recommended_action', 'None'))}",
-            f"Confidence level: {judgment.get('global_confidence', 'unknown')}",
+            f"Confidence level: {confidence_value}",
         ]
     )
+
+
+def _story_signature(story: Dict[str, Any]) -> str:
+    columns = story.get("columns") or []
+    if story.get("column"):
+        columns = [story["column"], *columns]
+    if story.get("group_column"):
+        columns = [*columns, story["group_column"]]
+    return f"{story.get('type', 'story')}|{'|'.join(str(col) for col in columns if col)}"
+
+
+def _insight_detail_map(evidence: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    details = evidence.get("llm_insight_details", []) or []
+    return {
+        str(item.get("related_story_signature")): item
+        for item in details
+        if isinstance(item, dict) and item.get("related_story_signature")
+    }
+
+
+def _unique_lines(lines: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    unique: List[str] = []
+    for line in lines:
+        normalized = _normalize_text(line)
+        if not normalized or normalized in seen:
+            continue
+        unique.append(normalized)
+        seen.add(normalized)
+    return unique
+
+
+def _analysis_story_bundle(
+    story: Dict[str, Any],
+    detail_map: Dict[str, Dict[str, Any]],
+    decision: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    detail = detail_map.get(_story_signature(story), {}) if story else {}
+    decision = decision or {}
+    finding = detail.get("headline") or detail.get("plain_english") or story.get("insight") or decision.get("decision_summary") or "No detailed insight was available."
+    meaning = detail.get("plain_english") or detail.get("business_implication") or story.get("insight") or "The finding is useful, but the plain-language explanation was not explicitly captured."
+    implication = detail.get("business_implication") or decision.get("decision_summary") or "The business implication was not explicitly captured."
+    action = detail.get("recommended_action") or decision.get("recommended_action") or "No specific action was captured."
+    scope = _format_value(story.get("columns") or decision.get("columns") or [])
+    confidence = _story_confidence(story) if story else "unknown"
+    impact = decision.get("impact_assessment") or {}
+    priority = decision.get("priority") or {}
+    return {
+        "signature": _story_signature(story) if story else None,
+        "rank": None,
+        "finding": finding,
+        "meaning": meaning,
+        "implication": implication,
+        "action": action,
+        "scope": scope,
+        "confidence": confidence,
+        "impact_level": impact.get("impact_level", "unknown"),
+        "impact_direction": impact.get("estimated_direction", "unclear"),
+        "priority_level": priority.get("priority_level", "unknown"),
+        "priority_score": priority.get("priority_score", "unknown"),
+        "semantic": _format_value(story.get("semantic_reasoning")) if story.get("semantic_reasoning") else "None",
+    }
 
 
 def _validated_ranked_items(
@@ -300,37 +370,33 @@ def _validated_ranked_items(
 def _ranked_analysis_area_lines(
     decision_ranking: List[Dict[str, Any]],
     top_stories: List[Dict[str, Any]],
+    evidence: Dict[str, Any],
     reasoning: Dict[str, Any] | None = None,
 ) -> List[str]:
     ranked = _validated_ranked_items(decision_ranking, top_stories)
     if not ranked:
         return ["No validated ranking was available."]
 
+    detail_map = _insight_detail_map(evidence)
     lines: List[str] = []
     for item in ranked[:5]:
         decision = item["decision"]
         story = item["story"]
-        impact = decision.get("impact_assessment") or {}
-        priority = decision.get("priority") or {}
-        detail_strength = _story_confidence(story) if story else "unknown"
-        insight = story.get("insight") or decision.get("decision_summary") or "No detailed insight was available."
-        implication = (
-            ((story.get("analysis_implication") or story.get("business_implication")) or "")
-            or decision.get("decision_summary")
-            or "Implication not explicitly captured."
-        )
+        bundle = _analysis_story_bundle(story, detail_map, decision)
+        bundle["rank"] = item["rank"]
         if reasoning:
             implication_reasoning = _reasoning_section_lines(reasoning, "findings")
             if implication_reasoning and item["rank"] == 1:
                 lines.append(f"Validation note: {implication_reasoning[0]}")
         lines.append(
-            f"{item['rank']}. {decision.get('recommended_action') or insight} | finding: {insight} | implication: {implication} | priority: {priority.get('priority_level', 'unknown')} ({priority.get('priority_score', 'unknown')}) | impact: {impact.get('impact_level', 'unknown')} | confidence: {detail_strength}"
+            f"{item['rank']}. {bundle['action']} | finding: {bundle['finding']} | meaning: {bundle['meaning']} | implication: {bundle['implication']} | confidence: {bundle['confidence']}"
         )
-        if story.get("columns"):
-            lines.append(f"   areas analysed: {_format_value(story.get('columns'))}")
-        if story.get("semantic_reasoning"):
-            lines.append(f"   interpretation: {_format_value(story.get('semantic_reasoning'))}")
-    return lines
+        lines.append(
+            f"   scope: {bundle['scope']} | priority: {bundle['priority_level']} ({bundle['priority_score']}) | impact: {bundle['impact_level']} / {bundle['impact_direction']}"
+        )
+        if bundle.get("semantic") and bundle["semantic"] != "None":
+            lines.append(f"   interpretation: {bundle['semantic']}")
+    return _unique_lines(lines)
 
 
 def _build_business_report(
@@ -343,51 +409,48 @@ def _build_business_report(
     business_question: str,
     reasoning: Dict[str, Any] | None = None,
 ) -> Dict[str, str]:
+    answer_synthesis = evidence.get("answer_synthesis") or {}
     details = evidence.get("llm_insight_details") or []
     ranked = _validated_ranked_items(decision_ranking, evidence.get("top_stories", []) or [])
+    detail_map = _insight_detail_map(evidence)
     first_rank = ranked[0] if ranked else {}
     first_decision = first_rank.get("decision") or (recommended_first or {})
     first_story = first_rank.get("story") or ((evidence.get("top_stories") or [{}])[0] if evidence.get("top_stories") else {})
+    first_bundle = _analysis_story_bundle(first_story, detail_map, first_decision) if first_story else {}
 
     context_lines = [
         f"Business question: {business_question}",
-        f"Current position: {judgment.get('dominant_reasoning', 'No dominant business position was identified.')}",
-        f"Decision confidence: {_confidence_label(judgment.get('global_confidence'))}",
+        f"Current position: {answer_synthesis.get('business_interpretation') or judgment.get('dominant_reasoning', 'No dominant business position was identified.')}",
+        f"Decision confidence: {_confidence_label((answer_synthesis.get('confidence') or {}).get('business', {}).get('score') or judgment.get('global_confidence'))}",
         f"Primary action: {first_decision.get('recommended_action') or judgment.get('recommended_first_action') or 'None'}",
     ]
 
-    if first_story.get("insight"):
-        context_lines.append(f"Lead finding: {first_story.get('insight')}")
-    if details:
-        context_lines.append(f"Business interpretation: {(details[0] or {}).get('business_implication') or 'Not stated'}")
+    if first_bundle:
+        context_lines.append(f"Lead finding: {first_bundle.get('finding')}")
+        context_lines.append(f"Business interpretation: {first_bundle.get('implication')}")
+        context_lines.append(f"Scope of impact: {first_bundle.get('scope')}")
 
-    area_lines = _ranked_analysis_area_lines(decision_ranking, evidence.get("top_stories", []) or [], reasoning)
+    area_lines = _ranked_analysis_area_lines(decision_ranking, evidence.get("top_stories", []) or [], evidence, reasoning)
 
     implications_lines: List[str] = []
     for item in ranked[:5]:
         decision = item["decision"]
         story = item["story"]
-        impact = decision.get("impact_assessment") or {}
-        business_implication = (
-            (story.get("business_implication") if story else None)
-            or (story.get("analysis_implication") if story else None)
-            or decision.get("decision_summary")
-            or "No business implication was explicitly captured."
-        )
-        affected_scope = _format_value(story.get("columns") or decision.get("columns") or [])
+        bundle = _analysis_story_bundle(story, detail_map, decision)
         implications_lines.append(
-            f"{item['rank']}. {decision.get('recommended_action') or story.get('insight') or 'Unnamed area'} affects {affected_scope}. {business_implication}"
+            f"{item['rank']}. {bundle['finding']} affects {bundle['scope']}. {bundle['implication']}"
         )
-        if impact.get("impact_level") or impact.get("estimated_direction"):
+        if bundle.get("impact_level") or bundle.get("impact_direction"):
             implications_lines.append(
-                f"   expected effect: {impact.get('impact_level', 'uncertain')} impact with {impact.get('estimated_direction', 'unclear')} direction"
+                f"   expected effect: {bundle.get('impact_level', 'uncertain')} impact with {bundle.get('impact_direction', 'unclear')} direction"
             )
         if decision.get("monitoring_kpis"):
             implications_lines.append(f"   who should watch it: {', '.join(_as_text_list(decision.get('monitoring_kpis'), limit=4))}")
 
     recommendation_lines: List[str] = []
-    if first_decision.get("recommended_action"):
-        recommendation_lines.append(f"Recommended solution: {first_decision.get('recommended_action')}")
+    if first_bundle:
+        recommendation_lines.append(f"Recommended solution: {first_bundle.get('action')}")
+        recommendation_lines.append(f"Why this is the right move: {first_bundle.get('meaning')}")
     if reasoning:
         recommendation_lines.extend(_reasoning_section_lines(reasoning, "recommendations")[:4])
     if not recommendation_lines and predictive_sections.get("monitoring_plan"):
@@ -401,23 +464,27 @@ def _build_business_report(
         rollout_lines.extend(_as_text_list(predictive_sections.get("experiment_design"), limit=4))
     if first_decision.get("monitoring_kpis"):
         rollout_lines.append(f"Rollout signals: {', '.join(_as_text_list(first_decision.get('monitoring_kpis'), limit=4))}")
+    if first_bundle:
+        rollout_lines.append(f"Business effect to watch: {first_bundle.get('impact_level')} impact with {first_bundle.get('impact_direction')} direction.")
 
     position_lines: List[str] = [
-        f"Business position: {judgment.get('actionability', 'unknown')}",
+        f"Business position: {'action-ready' if judgment.get('actionability') else 'not yet action-ready' if judgment.get('actionability') is False else 'unknown'}",
         f"Positioning note: the current evidence supports a targeted response rather than a broad unqualified change.",
     ]
     if predictive_sections.get("confidence") and predictive_sections["confidence"] != "None":
         position_lines.append(f"Confidence context: {predictive_sections['confidence']}")
     if reasoning:
         position_lines.extend(_reasoning_section_lines(reasoning, "risks")[:4])
+    if first_bundle:
+        position_lines.append(f"Primary area under management: {first_bundle.get('scope')}")
 
     summary_sections = _section_map(
-        ("BUSINESS SUMMARY", context_lines),
-        ("RANKED AREAS ANALYSED", area_lines),
-        ("BUSINESS IMPACT BY AREA", implications_lines),
-        ("SOLUTION RECOMMENDATION", recommendation_lines),
-        ("ROLLOUT PLAN", rollout_lines),
-        ("CURRENT BUSINESS POSITION", position_lines),
+        ("BUSINESS SUMMARY", _unique_lines(context_lines)),
+        ("RANKED AREAS ANALYSED", _unique_lines(area_lines)),
+        ("BUSINESS IMPACT BY AREA", _unique_lines(implications_lines)),
+        ("SOLUTION RECOMMENDATION", _unique_lines(recommendation_lines)),
+        ("ROLLOUT PLAN", _unique_lines(rollout_lines)),
+        ("CURRENT BUSINESS POSITION", _unique_lines(position_lines)),
     )
     return summary_sections
 
@@ -431,10 +498,10 @@ def _guided_checkpoint_consolidation_lines(state: AnalystState, evidence: Dict[s
         return []
 
     stage_specs = [
-        ("Data preparation", "data_preparation", ["What happened", "Why this happened", "Recommendation"]),
-        ("Business understanding", "business_understanding", ["Primary variables", "Why these variables", "Recommendation"]),
-        ("Analysis strategy", "analysis_strategy", ["What happened", "Why this method was selected", "Recommendation"]),
-        ("Result review", "result_review", ["What happened", "Why this happened", "What I recommend"]),
+        ("Data preparation", "data_preparation", ["Analyst interpretation", "What happened", "Why this happened", "Recommendation"]),
+        ("Business understanding", "business_understanding", ["Analyst interpretation", "Primary variables", "Why these variables", "Recommendation"]),
+        ("Analysis strategy", "analysis_strategy", ["Analyst interpretation", "What happened", "Why this method was selected", "Recommendation"]),
+        ("Result review", "result_review", ["Analyst interpretation", "What happened", "Why this happened", "What I recommend"]),
     ]
 
     lines: List[str] = []
@@ -1239,13 +1306,14 @@ def _conclusion_lines(
     top_stories: List[Dict[str, Any]],
     reasoning: Dict[str, Any] | None = None,
 ) -> List[str]:
+    answer_synthesis = evidence.get("answer_synthesis") or {}
     reasoning_lines = _reasoning_section_lines(reasoning or {}, "conclusion")
     if reasoning_lines:
         return reasoning_lines[:10]
     lines = [
         f"Business question: {business_question}",
-        f"Dominant reasoning: {judgment.get('dominant_reasoning', 'None')}",
-        f"Global confidence: {judgment.get('global_confidence', 'unknown')}",
+        f"Dominant reasoning: {answer_synthesis.get('business_interpretation') or judgment.get('dominant_reasoning', 'None')}",
+        f"Global confidence: {_confidence_label((answer_synthesis.get('confidence') or {}).get('business', {}).get('score') or judgment.get('global_confidence', 'unknown'))}",
     ]
     if recommended_first:
         lines.append(f"Recommended first action: {recommended_first.get('recommended_action')}")
@@ -1281,6 +1349,28 @@ def _appendix_lines(state: AnalystState, evidence: Dict[str, Any], top_stories: 
     return [line for line in lines if _normalize_text(line) and _normalize_text(line) != "None"]
 
 
+def _collaborative_answer_line(state: AnalystState, session: Dict[str, Any], dataframe: Any) -> str:
+    question = session.get("original_question") or state.get("business_question") or "the investigation"
+    answer = (
+        session.get("investigation_memory", {}).get("current_understanding")
+        or state.get("collaborative_memory", {}).get("current_understanding")
+        or "The investigation remains inconclusive."
+    )
+    question_text = humanize_text(question, dataframe=dataframe)
+    answer_text = humanize_text(answer, dataframe=dataframe)
+    return f"Direct answer to '{question_text}': {answer_text}"
+
+
+def _collaborative_section_lines(
+    title: str,
+    body_lines: List[str],
+) -> List[str]:
+    cleaned = [line for line in body_lines if _normalize_text(line)]
+    if not cleaned:
+        return []
+    return [title] + [f"- {line}" for line in cleaned]
+
+
 def _collaborative_lines(state: AnalystState, evidence: Dict[str, Any]) -> List[str]:
     session = evidence.get("collaborative_session") or state.get("collaborative_session") or {}
     if not session:
@@ -1295,27 +1385,153 @@ def _collaborative_lines(state: AnalystState, evidence: Dict[str, Any]) -> List[
     narrative = session.get("progressive_narrative") or state.get("collaborative_progressive_narrative") or []
     comparisons = session.get("task_comparisons") or state.get("collaborative_task_comparisons") or []
     suggestions = session.get("ai_suggestions") or state.get("collaborative_suggestions") or []
+    task_outputs = evidence.get("collaborative_task_outputs") or state.get("collaborative_task_outputs") or {}
+    evidence_items = list(evidence_store.values())
+    checkpoints = session.get("checkpoint_summaries") or state.get("collaborative_checkpoint_summaries") or []
+    last_failure = session.get("last_failure") or state.get("collaborative_last_failure") or memory.get("last_failure") or evidence.get("collaborative_last_failure") or {}
+    completed_task_ids = list(session.get("completed_tasks") or state.get("collaborative_completed_tasks") or [])
+    completed_task_ids = completed_task_ids or list(tasks.keys())
+    dataframe = state.get("dataframe")
+    supported = [item for item in hypotheses.values() if str(item.get("status", "")).lower() == "supported"]
+    rejected = [item for item in hypotheses.values() if str(item.get("status", "")).lower() == "rejected"]
+    inconclusive = [item for item in hypotheses.values() if str(item.get("status", "")).lower() == "inconclusive"]
+    latest_task_id = completed_task_ids[-1] if completed_task_ids else None
+    latest_output = task_outputs.get(latest_task_id, {}) if latest_task_id else {}
+    latest_confidence = latest_output.get("confidence")
+    if latest_confidence is None and latest_task_id:
+        latest_confidence = (tasks.get(latest_task_id) or {}).get("result_summary", {}).get("confidence")
+    confidence_text = _confidence_label(latest_confidence, fallback="unknown")
+    current_understanding = memory.get("current_understanding") or session.get("current_understanding")
+    direct_answer = humanize_text(current_understanding or "The investigation is still inconclusive.", dataframe=dataframe)
+    objective_text = humanize_text(session.get("objective") or state.get("business_question") or "the investigation", dataframe=dataframe)
+    question_text = humanize_text(session.get("original_question") or state.get("business_question") or "the question", dataframe=dataframe)
 
-    lines = [
-        f"Investigation ID: {session.get('investigation_id') or 'N/A'}",
-        f"Original question: {session.get('original_question') or state.get('business_question') or 'N/A'}",
-        f"Current status: {session.get('current_status') or 'active'}",
-        f"Task count: {len(tasks)}",
-        f"Completed tasks: {_format_value(session.get('completed_tasks') or state.get('collaborative_completed_tasks') or [])}",
-        f"Running tasks: {_format_value(session.get('running_tasks') or [])}",
-        f"Queued tasks: {_format_value(session.get('queued_tasks') or state.get('collaborative_queue') or [])}",
-        f"Task graph: {_format_value(task_graph)}",
-        f"Evidence store: {len(evidence_store)} evidence items",
-        f"Hypotheses: {_format_value(list(hypotheses.keys()) or list(hypotheses.values()))}",
-        f"Investigation memory: {_format_value(memory)}",
-        f"Decision log: {_format_value(decision_log)}",
-        f"Progressive narrative: {_format_value(narrative)}",
-        f"Task comparisons: {_format_value(comparisons)}",
-        f"AI suggested next investigations: {_format_value(suggestions)}",
+    objective_lines = _collaborative_section_lines(
+        "Investigation Objective",
+        [
+            f"Question under review: {question_text}",
+            f"Working objective: {objective_text}",
+        ],
+    )
+
+    current_finding_lines = _collaborative_section_lines(
+        "Current Finding",
+        [
+            f"Direct answer: {direct_answer}",
+            f"Current understanding: {humanize_text(current_understanding or 'No stable conclusion yet.', dataframe=dataframe)}",
+            f"Why it matters: {humanize_text((latest_output.get('narrative') or latest_output.get('current_understanding') or current_understanding or 'The result is still developing.'), dataframe=dataframe)}",
+        ],
+    )
+
+    key_evidence_lines = []
+    for item in evidence_items[:4]:
+        statement = humanize_text(item.get("statement") or item.get("finding") or "Evidence recorded.", dataframe=dataframe)
+        confidence = item.get("confidence")
+        if confidence is not None:
+            key_evidence_lines.append(f"{statement} (confidence {_confidence_label(confidence)})")
+        else:
+            key_evidence_lines.append(statement)
+    if not key_evidence_lines:
+        key_evidence_lines = ["No structured evidence was recorded in this checkpoint."]
+    key_evidence_section = _collaborative_section_lines("Key Evidence", key_evidence_lines)
+
+    approach_lines = []
+    for index, checkpoint in enumerate(checkpoints[-3:] if checkpoints else [], start=1):
+        approach_lines.append(
+            humanize_text(
+                checkpoint.get("analysis_story")
+                or checkpoint.get("narrative")
+                or checkpoint.get("task_request")
+                or "Analytical work was completed.",
+                dataframe=dataframe,
+            )
+        )
+    if not approach_lines:
+        approach_lines = [
+            "The investigation followed the standard collaborative review process to test the question against the available data and preserve a clear decision trail.",
+        ]
+    analytical_approach_section = _collaborative_section_lines("Analytical Approach", approach_lines)
+
+    interpretation_lines = [
+        f"The evidence currently supports: {direct_answer}.",
+        "This should still be treated as a working interpretation rather than a final verdict if the evidence is limited, mixed, or based on a narrow slice of the dataset.",
     ]
+    if supported:
+        interpretation_lines.append(f"Supported hypotheses: {len(supported)}.")
+    if rejected:
+        interpretation_lines.append(f"Rejected hypotheses: {len(rejected)}.")
+    if inconclusive:
+        interpretation_lines.append(f"Inconclusive hypotheses: {len(inconclusive)}.")
+    interpretation_section = _collaborative_section_lines("Interpretation", interpretation_lines)
+
+    confidence_lines = [
+        f"Latest confidence: {confidence_text}.",
+        "Confidence reflects how consistent the evidence is, how directly it answers the question, and how many competing explanations have already been checked.",
+    ]
+    if latest_output.get("analysis_story"):
+        confidence_lines.append("The latest checkpoint includes an explicit reasoning trail, which makes the conclusion easier to review and challenge.")
+    if decision_log:
+        confidence_lines.append(f"Decision trail depth: {len(decision_log)} analyst decisions have already been recorded.")
+    confidence_section = _collaborative_section_lines("Confidence Assessment", confidence_lines)
+
+    limitations_lines = [
+        "The result should be treated as provisional if the available evidence is narrow, if the conclusion rests on a single dominant signal, or if the follow-up options have started to converge.",
+    ]
+    if last_failure:
+        limitations_lines.append(
+            f"Recent failure note: {humanize_text(last_failure.get('reason') or last_failure.get('message') or 'A recent step failed.', dataframe=dataframe)}"
+        )
+    if checkpoint_lines := checkpoints[-1:] if checkpoints else []:
+        latest_checkpoint = checkpoint_lines[0]
+        if latest_checkpoint.get("status") == "failed":
+            limitations_lines.append(
+                humanize_text(
+                    latest_checkpoint.get("failure_reason") or latest_checkpoint.get("failure_message") or "The latest task did not complete.",
+                    dataframe=dataframe,
+                )
+            )
+    limitations_section = _collaborative_section_lines("Limitations & Assumptions", limitations_lines)
+
+    next_steps = []
+    ranked_suggestions = sorted(
+        suggestions,
+        key=lambda item: (
+            bool(item.get("terminal")),
+            -(suggestion_impact_percent(item) or 0),
+        ),
+    )
+    for index, suggestion in enumerate(ranked_suggestions, start=1):
+        next_steps.append(format_suggestion_line(suggestion, index=index, dataframe=dataframe))
+    if not next_steps:
+        next_steps = ["No distinct follow-up is currently suggested; the investigation is ready for consolidation or closure."]
+    recommended_next_section = _collaborative_section_lines("Recommended Next Investigation", next_steps[:3])
+
+    awaiting_lines = [
+        "This checkpoint confirms what is already established before the investigation moves forward.",
+        "The next decision should either extend the current interpretation, challenge it with a stronger alternative explanation, or close the investigation if no distinct follow-up remains.",
+    ]
+    if last_failure:
+        awaiting_lines.append(
+            f"If correction is needed, the current issue is: {humanize_text(last_failure.get('message') or last_failure.get('reason') or 'A recent action failed.', dataframe=dataframe)}"
+        )
+    awaiting_section = _collaborative_section_lines("Awaiting Analyst Decision", awaiting_lines)
+
+    sections = [
+        objective_lines,
+        current_finding_lines,
+        key_evidence_section,
+        analytical_approach_section,
+        interpretation_section,
+        confidence_section,
+        limitations_section,
+        recommended_next_section,
+        awaiting_section,
+    ]
+
+    lines = [line for section in sections for line in section if _normalize_text(line)]
     if session.get("final_executive_report"):
         lines.append("Final executive report is available in the standard report sections.")
-    return [line for line in lines if _normalize_text(line) and _normalize_text(line) != "None"]
+    return lines
 
 
 def _render_report(title: str, sections: Dict[str, str]) -> str:
@@ -1364,7 +1580,7 @@ def _build_master_report(
         ("IMPLEMENTATION CONSIDERATIONS", _implementation_lines(predictive_sections, decision_ranking, top_stories, reasoning)),
         ("MONITORING AND SUCCESS METRICS", _monitoring_lines(predictive_sections, decision_ranking, top_stories, reasoning)),
         ("LIMITATIONS AND ASSUMPTIONS", _limitations_lines(state, evidence, predictive_sections, top_stories, reasoning)),
-        ("RANKED ANALYSIS AREAS", _ranked_analysis_area_lines(decision_ranking, top_stories, reasoning)),
+        ("RANKED ANALYSIS AREAS", _ranked_analysis_area_lines(decision_ranking, top_stories, evidence, reasoning)),
         ("OVERALL CONCLUSION", _conclusion_lines(business_question, judgment, recommended_first, predictive_sections, evidence, top_stories, reasoning)),
         ("COLLABORATIVE INVESTIGATION", _collaborative_lines(state, evidence)),
         ("GUIDED ANALYST CONSOLIDATION", _guided_checkpoint_consolidation_lines(state, evidence)),
@@ -1399,6 +1615,7 @@ def _build_master_report(
 
 def _build_executive_report(
     master_sections: Dict[str, str],
+    business_sections: Dict[str, str],
     evidence: Dict[str, Any],
     judgment: Dict[str, Any],
     predictive_sections: Dict[str, str],
@@ -1426,6 +1643,9 @@ def _build_executive_report(
         for story in evidence.get("top_stories", [])[:3]:
             if story.get("insight"):
                 key_findings.append(str(story.get("insight")))
+    if business_sections:
+        business_top = business_sections.get("BUSINESS SUMMARY", "")
+        key_findings.extend(_section_items(business_top, limit=2))
 
     business_effect_lines: List[str] = []
     if reasoning:
@@ -1436,6 +1656,9 @@ def _build_executive_report(
         business_effect_lines.extend(_as_text_list(predictive_sections.get("what_could_go_wrong"), limit=3))
     if not business_effect_lines and judgment.get("contradictions_found"):
         business_effect_lines.append(f"Conflicts to watch: {_format_value(judgment.get('contradictions_found'))}")
+    if business_sections:
+        business_impact = business_sections.get("BUSINESS IMPACT BY AREA", "")
+        business_effect_lines.extend(_section_items(business_impact, limit=4))
 
     action_lines: List[str] = []
     recommended_action = recommended_first.get("recommended_action") if recommended_first else judgment.get("recommended_first_action")
@@ -1447,6 +1670,8 @@ def _build_executive_report(
     action_lines.append(f"Confidence level: {confidence_line}")
     if predictive_sections.get("monitoring_plan") and predictive_sections["monitoring_plan"] != "None":
         action_lines.append(f"Monitoring: {predictive_sections['monitoring_plan']}")
+    if business_sections:
+        action_lines.extend(_section_items(business_sections.get("ROLLOUT PLAN", ""), limit=3))
 
     summary_sections = _section_map(
         ("EXECUTIVE SUMMARY", summary_lines),
@@ -1489,6 +1714,28 @@ def report_node(state: AnalystState) -> AnalystState:
     predictive_sections = _predictive_sections(tool_results)
     selected_columns = state.get("selected_columns", []) or []
     reasoning = evidence.get("analytical_reasoning") or state.get("analytical_reasoning") or {}
+    answer_synthesis = synthesize_answer(
+        business_question=business_question,
+        evidence=evidence,
+        hypotheses=evidence.get("hypotheses") or state.get("hypotheses") or [],
+        current_understanding=(evidence.get("judgment_summary") or {}).get("summary")
+        or (evidence.get("top_stories") or [{}])[0].get("insight")
+        or state.get("current_understanding")
+        or business_question,
+        confidence=judgment.get("global_confidence"),
+        knowledge_gaps=clarification_questions,
+        investigation_memory=state.get("collaborative_memory") or state.get("investigation_memory") or {},
+        dataframe=state.get("dataframe"),
+    )
+    evidence["answer_synthesis"] = answer_synthesis
+    state["answer_synthesis"] = answer_synthesis
+    answer_synthesis_report = render_answer_synthesis_report(answer_synthesis)
+    decision = answer_synthesis.get("investigation_decision") or {}
+    show_internal_metrics = bool(state.get("debug_mode") or evidence.get("debug_mode") or state.get("show_internal_metrics") or evidence.get("show_internal_metrics"))
+    decision_report = render_investigation_decision_report(decision, include_internal_metrics=show_internal_metrics) if decision else ""
+    evidence["investigation_decision"] = decision
+    state["investigation_decision"] = decision
+    evidence["investigation_decision_report"] = decision_report
 
     hitl_summary = "None"
     if human_in_loop:
@@ -1526,6 +1773,7 @@ def report_node(state: AnalystState) -> AnalystState:
 
     executive_sections = _build_executive_report(
         master_sections=master_sections,
+        business_sections=business_sections,
         evidence=evidence,
         judgment=judgment,
         predictive_sections=predictive_sections,
@@ -1538,16 +1786,22 @@ def report_node(state: AnalystState) -> AnalystState:
     master_report = _render_report("================ MASTER REPORT ================", master_sections)
     business_report = _render_report("================ BUSINESS REPORT ================", business_sections)
     executive_report = _render_report("================ EXECUTIVE REPORT ================", executive_sections)
+    analyst_sections = compose_analyst_sections(state, evidence)
+    analyst_report = render_analyst_report(state, evidence) if analyst_sections else ""
     combined_report = master_report + "\n" + business_report + "\n" + executive_report
 
     report_package = {
         "master_report": master_report,
         "business_report": business_report,
         "executive_report": executive_report,
+        "analyst_report": analyst_report,
+        "answer_synthesis": answer_synthesis,
+        "investigation_decision": decision,
         "sections": {
             "master": master_sections,
             "business": business_sections,
             "executive": executive_sections,
+            "analyst": analyst_sections,
         },
         "analytical_reasoning": reasoning,
         "traceability": {
@@ -1570,14 +1824,29 @@ def report_node(state: AnalystState) -> AnalystState:
     evidence["master_report"] = master_report
     evidence["business_report"] = business_report
     evidence["executive_report"] = executive_report
+    evidence["analyst_report"] = analyst_report
     evidence["report_package"] = report_package
+    evidence["answer_synthesis_report"] = answer_synthesis_report
+    evidence["investigation_decision_report"] = decision_report
 
     state["master_report"] = master_report
     state["business_report"] = business_report
     state["executive_report"] = executive_report
-    state["final_report"] = combined_report
+    state["analyst_report"] = analyst_report
+    state["investigation_decision"] = decision
+    presentation_mode = str(state.get("mode") or "").lower()
+    has_collaborative_context = bool(
+        evidence.get("collaborative_session")
+        or state.get("collaborative_session")
+        or evidence.get("guided_checkpoint_summaries")
+        or state.get("guided_checkpoint_summaries")
+    )
+    if analyst_report and (presentation_mode in {"guided", "collaborative"} or has_collaborative_context):
+        state["final_report"] = "\n\n".join([part for part in [answer_synthesis_report, decision_report, analyst_report] if part])
+    else:
+        state["final_report"] = "\n\n".join([part for part in [answer_synthesis_report, decision_report, combined_report] if part])
 
     print("\n===== FINAL REPORT =====")
-    print(combined_report)
+    print(state["final_report"])
 
     return state

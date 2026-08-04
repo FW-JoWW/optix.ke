@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any, Dict, List, Tuple
 
+from core.analytic_capability import infer_capability_signals
 from utils.openai_runtime import get_openai_client
 
 
@@ -199,10 +200,46 @@ def format_reasoning_explanation(reasoning: Dict[str, Any]) -> List[str]:
     return [line for line in lines if line]
 
 
-def interpret_modification_request(request_text: str, decision_object: Dict[str, Any]) -> Dict[str, Any]:
+def _match_capabilities(request_text: str, capability_profile: Dict[str, Any] | None) -> Dict[str, Any]:
+    signals = infer_capability_signals(request_text)
+    profile = capability_profile or {}
+    capability_keywords = profile.get("capability_keywords") or {}
+    supported_capabilities = list(profile.get("supported_capabilities") or [])
+    matched_capabilities: List[str] = []
+    unsupported_capabilities: List[str] = []
+
+    for capability, keywords in capability_keywords.items():
+        if any(keyword in (request_text or "").lower() for keyword in keywords):
+            matched_capabilities.append(capability)
+            if capability not in supported_capabilities:
+                unsupported_capabilities.append(capability)
+
+    return {
+        "signals": signals,
+        "matched_capabilities": matched_capabilities,
+        "unsupported_capabilities": unsupported_capabilities,
+        "supported_capabilities": supported_capabilities,
+    }
+
+
+def interpret_modification_request(
+    request_text: str,
+    decision_object: Dict[str, Any],
+    capability_profile: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     text = (request_text or "").strip().lower()
     alternatives = decision_object.get("alternatives") or []
     recommendation = str(decision_object.get("recommendation", "continue")).lower()
+    capability_match = _match_capabilities(text, capability_profile)
+    request_mode = "neutral"
+    if any(token in text for token in ["instead of", "replace", "swap", "rather than"]):
+        request_mode = "substitution"
+    elif any(token in text for token in ["add", "include", "also", "append", "plus", "along with"]):
+        request_mode = "additive"
+    elif any(token in text for token in ["remove", "drop", "exclude", "without", "skip", "omit"]):
+        request_mode = "removal"
+    question_words = ("what ", "why ", "which ", "how ", "can ", "could ", "should ", "would ", "is ", "are ", "do ", "does ")
+    request_kind = "question" if "?" in text or text.startswith(question_words) else "modification"
 
     keywords = {
         "robust": ["kruskal", "robust", "nonparametric", "stronger"],
@@ -227,12 +264,75 @@ def interpret_modification_request(request_text: str, decision_object: Dict[str,
 
     matches.sort(key=lambda item: item.get("score", 0), reverse=True)
     needs_clarification = not matches and len(text.split()) <= 3
+    supported_matches = [item for item in matches if item.get("name") and item.get("name") != "Modify"]
+    support_status = "supported" if supported_matches else "partial" if matches else "unsupported"
+    if capability_match["matched_capabilities"] and not capability_match["unsupported_capabilities"]:
+        support_status = "supported"
+    elif capability_match["matched_capabilities"] and capability_match["unsupported_capabilities"]:
+        support_status = "partial"
+
+    best_match = matches[0] if matches else {}
+    confidence_score = 85 if support_status == "supported" else 68 if support_status == "partial" else 45
+    if needs_clarification:
+        confidence_score = 35
+    if best_match.get("score"):
+        confidence_score += min(15, int(best_match["score"]) * 5)
+    confidence_score = max(0, min(100, confidence_score))
+    confidence_level = "high" if confidence_score >= 80 else "medium" if confidence_score >= 55 else "low"
+
+    explanation_parts: List[str] = []
+    if capability_match["matched_capabilities"]:
+        explanation_parts.append(
+            f"I mapped your request to {', '.join(capability_match['matched_capabilities'][:4])} within this stage."
+        )
+    if best_match:
+        explanation_parts.append(f"The closest stage option is {best_match.get('name')} because {best_match.get('reason')}.")
+    if not best_match and capability_match["matched_capabilities"]:
+        explanation_parts.append("The request fits the stage capability, but no named alternative was a strong textual match.")
+    if not capability_match["matched_capabilities"]:
+        explanation_parts.append("The request did not match a supported capability for this stage.")
+    if request_mode == "additive":
+        explanation_parts.append("This request adds to the current plan rather than replacing it.")
+    elif request_mode == "substitution":
+        explanation_parts.append("This request asks for a replacement, so I compare it against the current recommendation.")
+    elif request_mode == "removal":
+        explanation_parts.append("This request removes part of the current plan, so I check whether the stage can still stay valid.")
+
+    if support_status == "supported":
+        response_type = "suggest"
+    elif support_status == "partial" and not needs_clarification:
+        response_type = "suggest"
+    else:
+        response_type = "clarify" if needs_clarification else "fallback"
+    if request_kind == "question":
+        response_type = "question"
 
     return {
         "stage": decision_object.get("stage"),
         "original_request": request_text,
+        "request_kind": request_kind,
+        "signals": capability_match["signals"],
+        "matched_capabilities": capability_match["matched_capabilities"],
+        "unsupported_capabilities": capability_match["unsupported_capabilities"],
         "best_matches": matches[:3],
+        "best_match": best_match,
+        "support_status": support_status,
+        "request_mode": request_mode,
         "needs_clarification": needs_clarification,
         "fallback_recommendation": decision_object.get("recommendation") or recommendation,
-        "response_type": "clarify" if needs_clarification else "suggest",
+        "response_type": response_type,
+        "confidence": {
+            "score": confidence_score,
+            "level": confidence_level,
+            "factors": [
+                f"Decision recommendation remains {decision_object.get('recommendation', 'continue')}.",
+                *(f"Matched capability: {item}" for item in capability_match["matched_capabilities"][:3]),
+            ],
+            "reducing_factors": [
+                *(f"Unsupported capability: {item}" for item in capability_match["unsupported_capabilities"][:3]),
+            ],
+        },
+        "explanation": " ".join(explanation_parts).strip(),
+        "why_keep_current": f"The current recommendation is still preferred because {decision_object.get('evidence', ['it remains the strongest supported choice'])[0] if decision_object.get('evidence') else 'it remains the strongest supported choice.'}",
+        "why_modify": f"The requested change is only useful when it maps cleanly to the current stage capabilities.",
     }

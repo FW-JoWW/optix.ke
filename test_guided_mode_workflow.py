@@ -13,6 +13,7 @@ from core.reasoning_objects import (
     build_final_reasoning_object,
     build_result_review_object,
 )
+from nodes.guided_mode_node import _stage_modification_capability_profile
 from scripts.guided_mode_harness import run_guided_workflow, summarize_guided_result
 from utils.issue_detector import detect_issues
 
@@ -82,6 +83,211 @@ def test_guided_mode_column_specific_cleaning_modification() -> None:
     assert any(step.get("column") == "Age" and step.get("action") == "impute_median" for step in plan)
     assert any(entry.get("column") == "Age" and entry.get("action") == "impute_median" for entry in execution_log)
     print("GUIDED COLUMN-SPECIFIC CLEANING OK")
+
+
+def test_guided_mode_modify_explains_confidence_and_rationale() -> None:
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        result = run_guided_workflow(
+            question=QUESTION,
+            responses=[
+                "modify",
+                "use median imputation for Age, keep outliers, do not remove duplicates",
+                "continue",
+                "continue",
+                "continue",
+                "continue",
+            ],
+        )
+
+    output = buffer.getvalue()
+    assert "Stage explanation for data preparation" in output
+    assert "Confidence:" in output
+    assert "Why I am keeping the current plan" in output or "The requested change can be applied" in output
+    assert result.final_state.get("final_report")
+    print("GUIDED MODIFY EXPLANATION OK")
+
+
+def test_guided_mode_natural_language_intent_parsing() -> None:
+    from scripts.guided_mode_harness import build_guided_state
+
+    state, _ = build_guided_state(question=QUESTION)
+    decision = build_data_preparation_object(state)
+    interpretation = interpret_modification_request(
+        "please use median imputation for Age and keep duplicates",
+        decision,
+        capability_profile=_stage_modification_capability_profile("data_preparation"),
+    )
+
+    assert "imputation" in interpretation.get("matched_capabilities", [])
+    assert interpretation.get("confidence", {}).get("score", 0) >= 50
+    assert interpretation.get("support_status") in {"supported", "partial"}
+    print("GUIDED NATURAL LANGUAGE INTENT PARSING OK")
+
+
+def test_guided_mode_additive_analysis_request() -> None:
+    result = run_guided_workflow(
+        question=QUESTION,
+        responses=[
+            "continue",
+            "continue",
+            "modify",
+            "add regression",
+            "continue",
+            "continue",
+            "continue",
+        ],
+    )
+    analysis_plan = result.final_state.get("analysis_plan", []) or result.final_state.get("analysis_evidence", {}).get("analysis_plan", [])
+    decision_log = result.final_state.get("guided_decision_log", [])
+
+    assert any(step.get("tool") == "regression" for step in analysis_plan if isinstance(step, dict))
+    assert any(
+        entry.get("stage") == "analysis_strategy" and "add regression" in entry.get("reason_for_modification", "").lower()
+        for entry in decision_log
+    )
+    assert result.final_state.get("final_report")
+    print("GUIDED ADDITIVE ANALYSIS REQUEST OK")
+
+
+def test_guided_mode_checkpoint_summaries_include_analyst_interpretation() -> None:
+    result = run_guided_workflow(
+        question=QUESTION,
+        responses=["continue", "continue", "continue", "continue"],
+    )
+    summaries = result.final_state.get("analysis_evidence", {}).get("guided_checkpoint_summaries", {})
+
+    assert "Analyst interpretation" in summaries.get("data_preparation", {})
+    assert "Analyst interpretation" in summaries.get("business_understanding", {})
+    assert "Analyst interpretation" in summaries.get("analysis_strategy", {})
+    assert "Analyst interpretation" in summaries.get("result_review", {})
+    assert "Analyst interpretation" in str(result.final_state.get("final_report", ""))
+    print("GUIDED CHECKPOINT INTERPRETATION OK")
+
+
+def test_guided_mode_question_request_is_answered() -> None:
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        result = run_guided_workflow(
+            question=QUESTION,
+            responses=[
+                "modify",
+                "Should duplicate records be removed or retained?",
+                "continue",
+                "continue",
+                "continue",
+                "continue",
+            ],
+        )
+
+    output = buffer.getvalue().lower()
+    assert "that looks like a question" in output
+    assert "could not fully apply" not in output
+    assert result.final_state.get("final_report")
+    print("GUIDED QUESTION REQUEST OK")
+
+
+def test_guided_mode_modify_question_path_shows_full_stage_explanation() -> None:
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        result = run_guided_workflow(
+            question=QUESTION,
+            responses=[
+                "modify",
+                "What would happen if I choose mean instead of median imputation?",
+                "continue",
+                "continue",
+                "continue",
+                "continue",
+            ],
+        )
+
+    output = buffer.getvalue()
+    assert "that looks like a question" in output.lower()
+    assert "analyst interpretation" in output.lower()
+    assert "answer confidence" in output.lower()
+    assert result.final_state.get("final_report")
+    print("GUIDED MODIFY QUESTION EXPLANATION OK")
+
+
+def test_guided_mode_modify_question_targets_named_column() -> None:
+    import pandas as pd
+
+    dataframe = pd.DataFrame(
+        {
+            "seller_id": ["S1", "S2", "S3", "S4"],
+            "Revenue": [100, 120, 140, 160],
+            "Profit": [20, 25, 30, 35],
+            "Region": ["North", "South", "South", "West"],
+        }
+    )
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        result = run_guided_workflow(
+            question=QUESTION,
+            responses=[
+                "continue",
+                "modify",
+                "What happens if we remove seller_id?",
+                "continue",
+                "continue",
+                "continue",
+            ],
+            dataframe=dataframe,
+        )
+
+    output = buffer.getvalue().lower()
+    assert "seller_id" in output
+    assert "direct answer" in output
+    assert "from the business question" in output
+    assert "effect on analysis" in output
+    assert "confidence signal" in output
+    assert result.final_state.get("final_report")
+    print("GUIDED MODIFY NAMED COLUMN QUESTION OK")
+
+
+def test_guided_mode_modify_reports_specific_blocker_reason() -> None:
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        result = run_guided_workflow(
+            question=QUESTION,
+            responses=[
+                "modify",
+                "forward fill for TotallyMissingColumn",
+                "continue",
+                "continue",
+                "continue",
+                "continue",
+            ],
+        )
+
+    output = buffer.getvalue().lower()
+    assert "why this specific request could not be applied" in output
+    assert "no dataset column could be resolved" in output or "column scope" in output
+    assert result.final_state.get("final_report")
+    print("GUIDED MODIFY BLOCKER REASON OK")
+
+
+def test_guided_mode_modify_reports_capability_gap_reason() -> None:
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        result = run_guided_workflow(
+            question=QUESTION,
+            responses=[
+                "continue",
+                "continue",
+                "modify",
+                "use Kruskal-Wallis",
+                "continue",
+                "continue",
+            ],
+        )
+
+    output = buffer.getvalue().lower()
+    assert "capability gap" in output
+    assert "does not implement that statistical test" in output
+    assert result.final_state.get("final_report")
+    print("GUIDED MODIFY CAPABILITY GAP OK")
 
 
 def test_issue_detector_does_not_guess_datetime_for_plain_codes() -> None:
@@ -485,6 +691,11 @@ if __name__ == "__main__":
     test_guided_mode_full_workflow_continue()
     test_guided_mode_full_workflow_modification_and_fallback()
     test_guided_mode_column_specific_cleaning_modification()
+    test_guided_mode_modify_explains_confidence_and_rationale()
+    test_guided_mode_natural_language_intent_parsing()
+    test_guided_mode_additive_analysis_request()
+    test_guided_mode_checkpoint_summaries_include_analyst_interpretation()
+    test_guided_mode_question_request_is_answered()
     test_issue_detector_does_not_guess_datetime_for_plain_codes()
     test_reasoning_layer_returns_structured_explanation()
     test_guided_mode_cancel_gracefully()

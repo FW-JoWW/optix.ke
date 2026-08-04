@@ -172,14 +172,397 @@ def _print_modification_review(stage_label: str, outcome: ModificationOutcome) -
         print("[Agent] Unsupported:", ", ".join(outcome.unsupported))
 
 
-def _prompt_modification_approval(stage_label: str) -> str:
+def _prompt_modification_approval(stage_label: str, prompt_kind: str = "change") -> str:
+    prompt_kind = (prompt_kind or "change").strip().lower()
+    if prompt_kind == "question":
+        prompt = (
+            f"\nHow do you want to proceed with this answer for {stage_label}? "
+            "(accept answer / ask another question / stop here)"
+        )
+        aliases = {
+            "accept answer": "continue",
+            "accept": "continue",
+            "continue": "continue",
+            "ask another question": "modify",
+            "ask another": "modify",
+            "another question": "modify",
+            "modify": "modify",
+            "stop here": "cancel",
+            "stop": "cancel",
+            "cancel": "cancel",
+        }
+    else:
+        prompt = (
+            f"\nHow do you want to proceed with this suggestion for {stage_label}? "
+            "(accept suggestion / refine request / stop here)"
+        )
+        aliases = {
+            "accept suggestion": "continue",
+            "accept": "continue",
+            "continue": "continue",
+            "refine request": "modify",
+            "refine": "modify",
+            "modify": "modify",
+            "adjust": "modify",
+            "stop here": "cancel",
+            "stop": "cancel",
+            "cancel": "cancel",
+        }
     while True:
-        decision = input(
-            f"\nApprove these {stage_label} changes? (continue / modify / cancel): "
-        ).strip().lower()
+        decision = input(prompt).strip().lower()
+        if decision in aliases:
+            return aliases[decision]
         if decision in {"continue", "modify", "cancel"}:
             return decision
-        print("[Agent] Please enter continue, modify, or cancel.")
+        print("[Agent] Please enter accept, refine, or stop.")
+
+
+def _column_semantic_role(state: AnalystState, column: str) -> str:
+    registry = state.get("column_registry") or {}
+    entry = registry.get(column, {}) if isinstance(registry, dict) else {}
+    role = str(entry.get("semantic_role") or "").strip().lower()
+    if role:
+        return role
+    lower = column.lower()
+    if lower.endswith("_id") or lower == "id" or lower.endswith("id"):
+        return "identifier"
+    return ""
+
+
+def _question_target_lines(state: AnalystState, stage: str, request_text: str) -> List[str]:
+    df = _resolve_dataframe(state)
+    available_columns = list(df.columns) if df is not None else []
+    named_columns = _extract_named_columns(request_text, available_columns)
+    if not request_text:
+        return []
+
+    request_l = request_text.lower()
+    removal_request = any(token in request_l for token in ["remove", "drop", "exclude", "without", "skip", "omit"])
+    addition_request = any(token in request_l for token in ["add", "include", "keep", "use"])
+    substitution_request = any(token in request_l for token in ["instead of", "replace", "swap", "rather than"])
+
+    lines: List[str] = []
+    if named_columns:
+        for column in named_columns[:3]:
+            role = _column_semantic_role(state, column)
+            is_selected = column in (state.get("selected_columns") or [])
+            confidence_label = "high" if role or is_selected else "medium"
+            if removal_request:
+                if stage == "business_understanding":
+                    if is_selected:
+                        if role == "identifier":
+                            lines.append(
+                                f"From the business question, {column} behaves like an identifier, so removing it would mostly reduce traceability rather than change the core analytical relationship."
+                            )
+                        else:
+                            lines.append(
+                                f"From the business question, {column} is part of the current analysis scope, so removing it would shrink the evidence set and could change comparisons, charts, and conclusions."
+                            )
+                    else:
+                        lines.append(
+                            f"From the business question, {column} is in the dataset but not currently part of the selected variables, so removing it would not change the active analysis plan."
+                        )
+                elif stage == "data_preparation":
+                    if role == "identifier":
+                        lines.append(
+                            f"From the business question, {column} behaves like an identifier, so removing it would weaken record linkage and auditability more than it would change the core numeric signal."
+                        )
+                    else:
+                        lines.append(
+                            f"From the business question, {column} is part of the dataset, so removing it during cleaning would change the cleaned dataset and may alter downstream evidence if the column carries signal."
+                        )
+                else:
+                    if role == "identifier":
+                        lines.append(
+                            f"From the business question, {column} acts like an identifier, so removing it would mostly affect traceability rather than the main analytical relationship."
+                        )
+                    else:
+                        lines.append(
+                            f"From the business question, {column} is present in the dataset, so removing it would change the current analysis path if the column is part of the active evidence set."
+                        )
+                lines.append(
+                    f"Effect on analysis: removing {column} would mainly affect {'traceability' if role == 'identifier' else 'scope and downstream evidence'}."
+                )
+            elif addition_request:
+                if is_selected:
+                    lines.append(f"From the business question, {column} is already in the current analysis scope.")
+                else:
+                    lines.append(f"From the business question, {column} is available and can be added to the current stage if you want it brought into scope.")
+            elif substitution_request:
+                lines.append(f"From the business question, {column} can be used as the named target for a substitution request, subject to the stage capabilities.")
+            else:
+                lines.append(f"From the business question, {column} is present in the dataset and can be referenced directly in this stage.")
+
+            lines.append(
+                f"Confidence signal: {confidence_label} because the column exists and the request maps to a concrete target."
+            )
+
+    if not named_columns:
+        if any(token in request_l for token in ["remove", "drop", "exclude", "without", "skip", "omit"]):
+            lines.append("No dataset column could be resolved from the request, so the workflow cannot apply the requested removal safely.")
+        elif any(token in request_l for token in ["add", "include", "keep", "use"]):
+            lines.append("No dataset column could be resolved from the request, so the workflow cannot confidently add the requested field.")
+        elif any(token in request_l for token in ["instead of", "replace", "swap", "rather than"]):
+            lines.append("No clear replacement target could be resolved from the request, so the workflow cannot complete the substitution safely.")
+
+    return lines
+
+
+def _modification_blocker_lines(
+    state: AnalystState,
+    stage: str,
+    instruction: str,
+    outcome: ModificationOutcome,
+    interpretation: Dict[str, Any],
+) -> List[str]:
+    df = _resolve_dataframe(state)
+    available_columns = list(df.columns) if df is not None else []
+    named_columns = _extract_named_columns(instruction, available_columns)
+    unsupported = {str(item).lower() for item in (outcome.unsupported or [])}
+    lines: List[str] = []
+
+    if outcome.fallback_reason:
+        lines.append(outcome.fallback_reason)
+
+    if stage == "data_preparation":
+        if unsupported & {"mean imputation", "median imputation", "mode imputation", "forward fill", "backward fill", "category standardization", "datetime conversion", "numeric conversion"}:
+            if named_columns:
+                lines.append(
+                    f"Column scope: I matched {', '.join(named_columns[:4])}, but the current cleaning plan does not have a safe place to apply every part of the request."
+                )
+            else:
+                lines.append("Column scope: no dataset column could be resolved from the request, so the cleaning action cannot be targeted safely.")
+        if "duplicate retention" in unsupported:
+            if df is not None and not df.duplicated().any():
+                lines.append("Data condition: the dataset has no duplicate rows, so there is nothing to retain or reverse.")
+            else:
+                lines.append("Data condition: duplicate retention only works when there is a duplicate-removal step or duplicate rows to preserve.")
+        if "outlier retention" in unsupported:
+            lines.append("Plan condition: there is no outlier-removal step in the current cleaning plan to reverse.")
+        if "conflicting imputation instructions" in unsupported:
+            lines.append("Request conflict: mean and median were both requested for the same cleaning action, so the stage cannot apply both at once.")
+
+    elif stage == "business_understanding":
+        if unsupported:
+            if named_columns:
+                lines.append(
+                    f"Column scope: I matched {', '.join(named_columns[:4])}, but the current variable selection does not support applying the request exactly as written."
+                )
+            else:
+                lines.append("Column scope: no dataset column could be matched from the request, so the variable selection cannot be updated safely.")
+
+    elif stage == "analysis_strategy":
+        if unsupported & {"kruskal-wallis", "mann-whitney", "wilcoxon"}:
+            lines.append("Capability gap: the current guided analysis engine does not implement that statistical test in this stage.")
+        if "regression" in unsupported:
+            if len(named_columns) >= 2:
+                lines.append(
+                    f"Data condition: I identified {', '.join(named_columns[:2])}, but the current plan still could not form a valid regression step from them."
+                )
+            elif df is not None and len(available_columns) < 2:
+                lines.append("Data condition: regression needs at least two usable columns, but the dataset does not provide enough resolved variables.")
+            else:
+                lines.append("Capability gap: regression could not be assembled from the current guided-analysis plan.")
+
+    elif stage == "result_review":
+        if "chart removal" in unsupported:
+            lines.append("Capability gap: this stage can reshape or swap visualizations, but it does not delete charts from the reporting pipeline.")
+
+    if interpretation.get("support_status") == "partial" and not lines:
+        lines.append("The request only partially matches the supported capabilities in this stage.")
+
+    return lines
+
+
+def _stage_modification_capability_profile(stage: str) -> Dict[str, Any]:
+    if stage == "data_preparation":
+        return {
+            "supported_capabilities": [
+                "imputation",
+                "duplicate_handling",
+                "outlier_handling",
+                "category_cleaning",
+                "type_conversion",
+                "version_restore",
+            ],
+            "capability_keywords": {
+                "imputation": ["mean", "median", "mode", "impute", "fill"],
+                "duplicate_handling": ["duplicate", "deduplicate", "retain duplicate", "remove duplicate"],
+                "outlier_handling": ["outlier", "outliers", "cap", "trim"],
+                "category_cleaning": ["standardize", "normalize", "capitalize", "whitespace"],
+                "type_conversion": ["datetime", "numeric", "convert"],
+                "version_restore": ["restore", "revert", "undo", "previous version"],
+            },
+        }
+    if stage == "business_understanding":
+        return {
+            "supported_capabilities": ["column_selection", "column_replacement", "column_exclusion"],
+            "capability_keywords": {
+                "column_selection": ["include", "keep", "add", "use"],
+                "column_replacement": ["instead of", "replace", "swap"],
+                "column_exclusion": ["remove", "exclude", "drop", "without", "ignore"],
+            },
+        }
+    if stage == "analysis_strategy":
+        return {
+            "supported_capabilities": ["analysis_method", "analysis_scope"],
+            "capability_keywords": {
+                "analysis_method": ["anova", "correlation", "regression", "kruskal", "mann", "wilcoxon", "skip correlation", "remove correlation"],
+                "analysis_scope": ["add", "remove", "skip", "use", "method"],
+            },
+        }
+    if stage == "result_review":
+        return {
+            "supported_capabilities": ["visualization_adjustment"],
+            "capability_keywords": {
+                "visualization_adjustment": ["scatter", "regression", "boxplot", "histogram", "bar chart", "bar plot", "hide chart", "remove chart"],
+            },
+        }
+    return {"supported_capabilities": [], "capability_keywords": {}}
+
+
+def _stage_decision_object(state: AnalystState, stage: str) -> Dict[str, Any]:
+    if stage == "data_preparation":
+        return build_data_preparation_object(state)
+    if stage == "business_understanding":
+        return build_business_understanding_object(state)
+    if stage == "analysis_strategy":
+        return build_analysis_strategy_object(state)
+    if stage == "result_review":
+        return build_result_review_object(state)
+    return {"stage": stage, "recommendation": "continue", "confidence": {"score": 50, "level": "medium", "factors": [], "reducing_factors": []}, "alternatives": []}
+
+
+def _print_modification_explanation(
+    state: AnalystState,
+    stage: str,
+    instruction: str,
+    outcome: ModificationOutcome,
+) -> Dict[str, Any]:
+    decision_object = _stage_decision_object(state, stage)
+    interpretation = interpret_modification_request(
+        instruction,
+        decision_object,
+        capability_profile=_stage_modification_capability_profile(stage),
+    )
+    confidence = decision_object.get("confidence") or {}
+    alternatives = decision_object.get("alternatives") or []
+    evidence = decision_object.get("evidence") or []
+    assumptions = decision_object.get("assumptions") or []
+    impact = decision_object.get("impact") or []
+
+    print(f"\n[Agent] Stage explanation for {stage.replace('_', ' ')}:")
+    if interpretation.get("explanation"):
+        print(f"[Agent] {interpretation['explanation']}")
+    print(f"[Agent] Recommendation: {decision_object.get('recommendation', 'continue')}")
+    request_mode = interpretation.get("request_mode", "neutral")
+    if request_mode == "additive":
+        print("[Agent] Request type: additive change to the current plan.")
+    elif request_mode == "substitution":
+        print("[Agent] Request type: substitution request against the current plan.")
+    elif request_mode == "removal":
+        print("[Agent] Request type: removal request against the current plan.")
+    if evidence:
+        print(f"[Agent] Why this plan is preferred: {evidence[0]}")
+    if alternatives:
+        primary_alt = alternatives[0]
+        if isinstance(primary_alt, dict) and primary_alt.get("reason"):
+            print(f"[Agent] Why it beats the alternative: {primary_alt.get('reason')}")
+
+    if confidence:
+        print(f"[Agent] Confidence: {confidence.get('score', 'unknown')}% ({confidence.get('level', 'unknown')})")
+        factors = confidence.get("factors") or []
+        if factors:
+            print(f"[Agent] Confidence factors: {', '.join(map(str, factors[:3]))}")
+        reducers = confidence.get("reducing_factors") or []
+        if reducers:
+            print(f"[Agent] Confidence reducers: {', '.join(map(str, reducers[:3]))}")
+    if assumptions:
+        print(f"[Agent] Assumptions: {', '.join(map(str, assumptions[:3]))}")
+    if impact:
+        print(f"[Agent] Expected impact: {', '.join(map(str, impact[:2]))}")
+
+    if interpretation.get("best_match"):
+        best_match = interpretation["best_match"]
+        print(f"[Agent] Closest supported option: {best_match.get('name')} - {best_match.get('reason')}")
+    elif interpretation.get("best_matches"):
+        top_matches = interpretation.get("best_matches") or []
+        print(
+            "[Agent] Interpreted request matches: "
+            + "; ".join(
+                f"{item.get('name')}" for item in top_matches[:3] if isinstance(item, dict) and item.get("name")
+            )
+        )
+
+    matched_capabilities = interpretation.get("matched_capabilities") or []
+    unsupported_capabilities = interpretation.get("unsupported_capabilities") or []
+    if matched_capabilities:
+        print(f"[Agent] Supported in this stage: {', '.join(map(str, matched_capabilities[:4]))}")
+    if unsupported_capabilities:
+        print(f"[Agent] Not supported here: {', '.join(map(str, unsupported_capabilities[:4]))}")
+
+    if outcome.applied:
+        if request_mode == "additive":
+            print("[Agent] The requested addition can be layered onto the current stage capabilities.")
+        elif request_mode == "substitution":
+            print("[Agent] The requested substitution can be applied within the current stage capabilities.")
+        else:
+            print("[Agent] The requested change can be applied within the current stage capabilities.")
+    else:
+        fallback_reason = outcome.fallback_reason or f"The current recommendation remains the best-supported option because {evidence[0] if evidence else 'it best matches the available evidence.'}"
+        print(f"[Agent] Why I am keeping the current plan: {fallback_reason}")
+        blockers = _modification_blocker_lines(state, stage, instruction, outcome, interpretation)
+        if blockers:
+            print("[Agent] Why this specific request could not be applied:")
+            for blocker in blockers[:4]:
+                print(f"[Agent] - {blocker}")
+
+    return interpretation
+
+
+def _print_stage_question_answer(state: AnalystState, stage: str, interpretation: Dict[str, Any]) -> None:
+    if stage == "data_preparation":
+        summary = _data_preparation_summary(state)
+    elif stage == "business_understanding":
+        summary = _business_understanding_summary(state)
+    elif stage == "analysis_strategy":
+        summary = _analysis_strategy_summary(state)
+    elif stage == "result_review":
+        summary = _visualization_summary(state)
+    else:
+        summary = {}
+
+    print(f"\n[Agent] That looks like a question, so I am answering it directly for {stage.replace('_', ' ')}.")
+    if interpretation.get("original_request"):
+        print(f"[Agent] Question: {interpretation.get('original_request')}")
+        target_lines = _question_target_lines(state, stage, str(interpretation.get("original_request") or ""))
+        if target_lines:
+            print("[Agent] Direct answer:")
+            for line in target_lines[:4]:
+                print(f"[Agent] - {line}")
+    display_order = ["Analyst interpretation"] if interpretation.get("request_kind") == "question" else {
+        "data_preparation": ["Analyst interpretation", "What happened", "What I found", "What was done", "Why this decision was made", "What I recommend"],
+        "business_understanding": ["Analyst interpretation", "Business question", "Detected analytical intent", "Primary variables", "Supporting variables", "Why these variables", "Why these variables were excluded", "Recommendation"],
+        "analysis_strategy": ["Analyst interpretation", "What happened", "Why this method was selected", "Why not another method", "Assumptions and status", "Expected business value", "Recommendation"],
+        "result_review": ["Analyst interpretation", "What happened", "Why this happened", "What I recommend", "What happens next"],
+    }.get(stage, list(summary.keys())[:4] if summary else [])
+    if summary:
+        for heading in display_order:
+            if heading not in summary:
+                continue
+            body = summary.get(heading)
+            if isinstance(body, str):
+                print(f"[Agent] {heading}: {body}")
+            elif isinstance(body, list) and body:
+                print(f"[Agent] {heading}: {body[0]}")
+                if heading == "Analyst interpretation":
+                    for line in body[1:3]:
+                        print(f"[Agent] {heading} detail: {line}")
+    confidence = interpretation.get("confidence") or {}
+    if confidence:
+        print(f"[Agent] Answer confidence: {confidence.get('score', 'unknown')}% ({confidence.get('level', 'unknown')})")
+    if interpretation.get("explanation"):
+        print(f"[Agent] Interpretation: {interpretation['explanation']}")
 
 
 def _format_count(items: List[Any]) -> str:
@@ -358,6 +741,22 @@ def _confidence_bundle(profile: Dict[str, Any], issues: List[Dict[str, Any]], va
     }
 
 
+def _top_issue_summary(issues: List[Dict[str, Any]]) -> str:
+    if not issues:
+        return "No material data-quality issues were detected."
+    top_issue = sorted(issues, key=_issue_impact_rank, reverse=True)[0]
+    issue_type = str(top_issue.get("issue_type", "issue")).replace("_", " ")
+    column = top_issue.get("column")
+    if column is None:
+        target = "the dataset"
+    else:
+        target = str(column)
+    reason = top_issue.get("reason") or top_issue.get("reasoning") or top_issue.get("explanation")
+    summary = f"{issue_type} on {target}"
+    if reason:
+        summary = f"{summary}: {reason}"
+    return summary
+
 def _impact_preview(stage: str, applied: bool, detail: str | None = None) -> Dict[str, Any]:
     if stage == "data_preparation":
         stages = ["Cleaning", "Validation", "Analysis dataset", "Planner", "Visualizations", "Executive report"]
@@ -493,6 +892,7 @@ def _data_preparation_summary(state: AnalystState) -> Dict[str, List[str] | str]
     confidence = _confidence_bundle(profile, issues, validation)
 
     dataset_summary = [
+        f"Bottom line: Top issue is {_top_issue_summary(issues)}.",
         f"Rows: {profile.get('row_count', len(df) if df is not None else 0)}",
         f"Columns: {profile.get('column_count', len(df.columns) if df is not None else 0)}",
         f"Numeric columns: {_format_count(groups.get('numeric', []))}",
@@ -544,6 +944,12 @@ def _data_preparation_summary(state: AnalystState) -> Dict[str, List[str] | str]
             f"Row loss ratio: {validation.get('row_loss_ratio', 0.0)}",
             f"Schema stable: {validation.get('schema_stable', True)}",
         ]
+    top_issue_summary = _top_issue_summary(issues)
+    analyst_interpretation = [
+        f"This checkpoint says the dataset is usable, but the top issue remains unresolved: {top_issue_summary}.",
+        f"Why it matters: the chosen cleaning action determines whether the next stages work from a reliable dataset or from a version that still carries avoidable bias or noise.",
+        f"Current confidence is {confidence['score']}% ({confidence['category']}), so the recommendation is reasonably grounded in the validation profile but still benefits from analyst review.",
+    ]
     stage_reasoning, reasoning_payload, reasoning_status = _explain_stage_decision(
         state,
         build_data_preparation_object(state),
@@ -562,6 +968,7 @@ def _data_preparation_summary(state: AnalystState) -> Dict[str, List[str] | str]
         "What happened": dataset_summary,
         "What I found": issue_lines,
         "What was done": cleaning_lines,
+        "Analyst interpretation": analyst_interpretation,
         "Why this decision was made": stage_reasoning or reasoning_lines,
         "What I recommend": [main_recommendation, *alternative_recommendations],
         "How confident I am": [
@@ -911,8 +1318,36 @@ def guided_data_preparation_checkpoint_node(state: AnalystState) -> AnalystState
                 "data preparation",
                 "Examples: use mean imputation, do not remove duplicates, keep outliers, standardize categories for Region",
             )
+            interpretation = interpret_modification_request(
+                instruction,
+                _stage_decision_object(state, "data_preparation"),
+                capability_profile=_stage_modification_capability_profile("data_preparation"),
+            )
+            if interpretation.get("request_kind") == "question":
+                _print_stage_question_answer(state, "data_preparation", interpretation)
+                approval = _prompt_modification_approval("data preparation", "question")
+                if approval == "modify":
+                    continue
+                if approval == "cancel":
+                    restore_guided_stage_snapshot(state, "data_preparation", base_version)
+                    state["awaiting_user"] = True
+                    state["question_for_user"] = "Guided mode canceled at data preparation."
+                    evidence["final_output"] = ["Guided mode canceled during data preparation."]
+                    _append_log(
+                        state,
+                        "data_preparation",
+                        recommendation,
+                        "cancel",
+                        base_version,
+                        reason=instruction,
+                        details={"summary": summary, "question": True},
+                    )
+                    return state
+                _append_log(state, "data_preparation", recommendation, "continue", base_version, reason=instruction, details={"summary": summary, "question": True})
+                return state
             outcome = _parse_cleaning_modification(state, instruction)
             _print_modification_review("data preparation", outcome)
+            _print_modification_explanation(state, "data_preparation", instruction, outcome)
             approval = _prompt_modification_approval("data preparation")
             if approval == "modify":
                 restore_guided_stage_snapshot(state, "data_preparation", base_version)
@@ -1025,6 +1460,13 @@ def _business_understanding_summary(state: AnalystState) -> Dict[str, List[str] 
         state,
         build_business_understanding_object(state),
     )
+    analytical_intent = str(intent.get("analytic_intent") or intent.get("type") or "unknown")
+    analyst_interpretation = [
+        f"This question is being interpreted as a {analytical_intent} problem, which means the workflow is framing the dataset around the business relationship you are trying to understand.",
+        f"The analysis will center on {', '.join(primary[:3]) if primary else 'the currently selected variables'} and treat {', '.join(supporting[:3]) if supporting else 'supporting context only'} as secondary evidence rather than the main signal.",
+        f"The excluded variables are not being ignored; they are being set aside because they do not materially strengthen the current question frame.",
+        f"Confidence is {confidence_text}, so the framing is strong enough to proceed but still worth checking against the real business context.",
+    ]
 
     return {
         "Business question": [state.get("business_question", "N/A")],
@@ -1032,6 +1474,7 @@ def _business_understanding_summary(state: AnalystState) -> Dict[str, List[str] 
         "Primary variables": primary if primary else ([f"{selected[0]}: primary analytical focus"] if selected else ["No primary variables were identified."]),
         "Supporting variables": supporting if supporting else ["No additional supporting variables were identified."],
         "Rejected variables": reasons_rejected,
+        "Analyst interpretation": analyst_interpretation,
         "Why these variables": stage_reasoning or ((primary + supporting) if (primary or supporting) else ["No explicit inclusion reasons were available."]),
         "Why these variables were excluded": reasons_rejected,
         "Confidence": confidence_text,
@@ -1133,8 +1576,36 @@ def guided_business_understanding_checkpoint_node(state: AnalystState) -> Analys
                 "business understanding",
                 "Examples: include Age, remove Region, use Profit instead of Revenue",
             )
+            interpretation = interpret_modification_request(
+                instruction,
+                _stage_decision_object(state, "business_understanding"),
+                capability_profile=_stage_modification_capability_profile("business_understanding"),
+            )
+            if interpretation.get("request_kind") == "question":
+                _print_stage_question_answer(state, "business_understanding", interpretation)
+                approval = _prompt_modification_approval("business understanding", "question")
+                if approval == "modify":
+                    continue
+                if approval == "cancel":
+                    restore_guided_stage_snapshot(state, "business_understanding", base_version)
+                    state["awaiting_user"] = True
+                    state["question_for_user"] = "Guided mode canceled at business understanding."
+                    evidence["final_output"] = ["Guided mode canceled during business understanding."]
+                    _append_log(
+                        state,
+                        "business_understanding",
+                        recommendation,
+                        "cancel",
+                        base_version,
+                        reason=instruction,
+                        details={"summary": summary, "question": True},
+                    )
+                    return state
+                _append_log(state, "business_understanding", recommendation, "continue", base_version, reason=instruction, details={"summary": summary, "question": True})
+                return state
             outcome = _parse_selection_modification(state, instruction)
             _print_modification_review("business understanding", outcome)
+            _print_modification_explanation(state, "business_understanding", instruction, outcome)
             approval = _prompt_modification_approval("business understanding")
             if approval == "modify":
                 restore_guided_stage_snapshot(state, "business_understanding", base_version)
@@ -1211,8 +1682,14 @@ def _analysis_strategy_summary(state: AnalystState) -> Dict[str, List[str] | str
         state,
         build_analysis_strategy_object(state),
     )
+    analyst_interpretation = [
+        f"This checkpoint says the working analysis plan is to use {', '.join(tool_names[:4]) if (tool_names := [item.get('tool', 'analysis result') for item in plan[:8]]) else 'the available tools'} to answer the question.",
+        f"In practical terms, this is the bridge between the business question and the evidence: it determines what will be measured, what comparisons will be made, and what conclusions can be defended later.",
+        f"Confidence is {confidence_text}, so the plan is usable but still worth checking against the intended business question before execution.",
+    ]
     return {
         "What happened": steps,
+        "Analyst interpretation": analyst_interpretation,
         "Why this method was selected": stage_reasoning or [selected_reason],
         "Why not another method": ["Alternative methods were not selected because the current plan is the best fit for the available intent, variables, and assumptions."],
         "Assumptions and status": assumption_checks,
@@ -1337,8 +1814,36 @@ def guided_analysis_strategy_checkpoint(state: AnalystState) -> AnalystState:
                 "analysis strategy",
                 "Examples: skip correlation, add regression, use ANOVA, use Kruskal-Wallis",
             )
+            interpretation = interpret_modification_request(
+                instruction,
+                _stage_decision_object(state, "analysis_strategy"),
+                capability_profile=_stage_modification_capability_profile("analysis_strategy"),
+            )
+            if interpretation.get("request_kind") == "question":
+                _print_stage_question_answer(state, "analysis_strategy", interpretation)
+                approval = _prompt_modification_approval("analysis strategy", "question")
+                if approval == "modify":
+                    continue
+                if approval == "cancel":
+                    restore_guided_stage_snapshot(state, "analysis_strategy", base_version)
+                    state["awaiting_user"] = True
+                    state["question_for_user"] = "Guided mode canceled at analysis strategy."
+                    evidence["final_output"] = ["Guided mode canceled during analysis strategy."]
+                    _append_log(
+                        state,
+                        "analysis_strategy",
+                        recommendation,
+                        "cancel",
+                        base_version,
+                        reason=instruction,
+                        details={"summary": summary, "question": True},
+                    )
+                    return state
+                _append_log(state, "analysis_strategy", recommendation, "continue", base_version, reason=instruction, details={"summary": summary, "question": True})
+                return state
             outcome = _parse_analysis_modification(state, instruction)
             _print_modification_review("analysis strategy", outcome)
+            _print_modification_explanation(state, "analysis_strategy", instruction, outcome)
             approval = _prompt_modification_approval("analysis strategy")
             if approval == "modify":
                 restore_guided_stage_snapshot(state, "analysis_strategy", base_version)
@@ -1407,8 +1912,15 @@ def _visualization_summary(state: AnalystState) -> Dict[str, List[str] | str]:
         state,
         build_result_review_object(state),
     )
+    strongest_finding = preview_lines[0] if preview_lines else "no preview available."
+    analyst_interpretation = [
+        f"The strongest current finding is: {strongest_finding}",
+        f"That finding matters because it becomes the headline for the report, so it needs to be specific enough for an analyst to defend and clear enough for a stakeholder to act on.",
+        f"Confidence is {str(confidence) if confidence is not None else 'unknown'}, and the visual evidence is represented by {len(charts)} chart(s).",
+    ]
     return {
         "What happened": preview_lines,
+        "Analyst interpretation": analyst_interpretation,
         "Why this happened": stage_reasoning or [str(judgment.get("dominant_reasoning", "Evidence quality not yet finalized."))],
         "What I recommend": ["Continue to the reporting layer unless you want to change how the charts are rendered."],
         "How confident I am": [str(confidence) if confidence is not None else "unknown"],
@@ -1486,8 +1998,36 @@ def guided_result_review_checkpoint_node(state: AnalystState) -> AnalystState:
                 "result review",
                 "Examples: replace boxplot with histogram, use regression instead of scatter, hide a chart",
             )
+            interpretation = interpret_modification_request(
+                instruction,
+                _stage_decision_object(state, "result_review"),
+                capability_profile=_stage_modification_capability_profile("result_review"),
+            )
+            if interpretation.get("request_kind") == "question":
+                _print_stage_question_answer(state, "result_review", interpretation)
+                approval = _prompt_modification_approval("result review", "question")
+                if approval == "modify":
+                    continue
+                if approval == "cancel":
+                    restore_guided_stage_snapshot(state, "result_review", base_version)
+                    state["awaiting_user"] = True
+                    state["question_for_user"] = "Guided mode canceled at result review."
+                    evidence["final_output"] = ["Guided mode canceled during result review."]
+                    _append_log(
+                        state,
+                        "result_review",
+                        recommendation,
+                        "cancel",
+                        base_version,
+                        reason=instruction,
+                        details={"summary": summary, "question": True},
+                    )
+                    return state
+                _append_log(state, "result_review", recommendation, "continue", base_version, reason=instruction, details={"summary": summary, "question": True})
+                return state
             outcome = _parse_visualization_modification(state, instruction)
             _print_modification_review("result review", outcome)
+            _print_modification_explanation(state, "result_review", instruction, outcome)
             approval = _prompt_modification_approval("result review")
             if approval == "modify":
                 restore_guided_stage_snapshot(state, "result_review", base_version)
