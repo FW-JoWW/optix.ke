@@ -17,11 +17,30 @@ class CollaborativeHarnessResult:
 
 def default_collaborative_responses() -> List[str]:
     return [
-        "new investigation",
-        "compare results",
-        "challenge finding",
-        "finish investigation",
+        "What should we investigate next?",
+        "1",
+        "Investigate customer churn by region",
+        "What information is still missing?",
+        "2",
+        "Task 1 using Spearman correlation",
+        "Show all current hypotheses",
+        "3",
+        "Task 1 and Task 2",
+        "Show the strongest evidence.",
+        "4",
+        "Could age explain this instead?",
+        "Rank the hypotheses by confidence",
+        "5",
+        "1",
+        "What did we conclude earlier?",
+        "Queue three investigations",
+        "Show queued tasks",
+        "6",
     ]
+
+
+def demo_collaborative_responses() -> List[str]:
+    return default_collaborative_responses()
 
 
 def run_collaborative_workflow(

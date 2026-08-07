@@ -14,9 +14,17 @@ from state.state import AnalystState
 
 from .answer_synthesis import synthesize_answer
 from .models import EvidenceRecord, HypothesisRecord, InvestigationSession
-from .integrity import build_traceability_record, evaluate_investigation_integrity
+from .integrity import build_traceability_record, evaluate_investigation_integrity, evaluate_task_request_relevance, update_best_answer_anchor
 from .narration import humanize_columns, humanize_text, suggestion_impact_percent
 from .task_manager import TaskManager
+
+
+def _best_answer_text(memory: Dict[str, Any], fallback: str = "") -> str:
+    return (
+        (memory.get("best_answer") or {}).get("answer")
+        or memory.get("current_understanding")
+        or fallback
+    )
 
 
 @dataclass
@@ -276,17 +284,28 @@ def _build_evidence_record(task_id: str, final_state: AnalystState, summary: Dic
     )
 
 
-def _derive_hypothesis(task_request: str, final_state: AnalystState, evidence_record: EvidenceRecord) -> HypothesisRecord:
+def _derive_hypothesis(
+    task_request: str,
+    final_state: AnalystState,
+    evidence_record: EvidenceRecord,
+    integrity: Dict[str, Any] | None = None,
+) -> HypothesisRecord:
     evidence = final_state.get("analysis_evidence", {}) or {}
     judgment = evidence.get("judgment_summary", {}) or {}
     top_story = _first_story(evidence)
     confidence = _confidence_from_state(final_state)
     confidence_value = float(confidence) if isinstance(confidence, (int, float)) else None
-    if confidence_value is not None and confidence_value >= 70:
+    integrity = dict(integrity or {})
+    promoted = bool(integrity.get("should_promote"))
+    question_relevance = int((integrity.get("question_relevance") or {}).get("score") or 0)
+    continuity_score = int((integrity.get("continuity") or {}).get("score") or 0)
+    if promoted and confidence_value is not None and confidence_value >= 70 and question_relevance >= 45 and continuity_score >= 35:
         status = "supported"
     elif confidence_value is not None and confidence_value < 45:
         status = "inconclusive"
     else:
+        status = "inconclusive"
+    if not promoted:
         status = "inconclusive"
     if judgment.get("contradictions_found"):
         status = "rejected" if confidence_value is not None and confidence_value < 60 else "inconclusive"
@@ -294,6 +313,15 @@ def _derive_hypothesis(task_request: str, final_state: AnalystState, evidence_re
     notes = []
     if judgment.get("contradictions_found"):
         notes.append("Contradictions were surfaced by the analytical pipeline.")
+    if integrity:
+        notes.append(
+            f"Integrity gate: relevance={integrity.get('question_relevance', {}).get('level', 'unknown')}, "
+            f"continuity={integrity.get('continuity', {}).get('level', 'unknown')}, "
+            f"information_gain={integrity.get('information_gain', {}).get('level', 'unknown')}, "
+            f"validity={integrity.get('analytical_validity', {}).get('level', 'unknown')}."
+        )
+        if not promoted:
+            notes.append("The result was retained as supporting evidence because it did not sufficiently advance the main investigation.")
     if final_state.get("llm_reasoning_status"):
         notes.append(str(final_state.get("llm_reasoning_status")))
     return HypothesisRecord(
@@ -308,11 +336,12 @@ def _derive_hypothesis(task_request: str, final_state: AnalystState, evidence_re
 
 def _suggest_next_investigations(session: InvestigationSession, final_state: AnalystState, task_id: str) -> List[Dict[str, Any]]:
     original_question = final_state.get("business_question") or session.original_question or ""
-    question = original_question.lower()
     suggestions: List[Dict[str, Any]] = []
     evidence = final_state.get("analysis_evidence", {}) or {}
     top_story = _first_story(evidence)
     confidence = _confidence_from_state(final_state)
+    current_understanding = _best_answer_text(session.investigation_memory, session.original_question or original_question)
+    current_hypothesis = current_understanding
     previous_next = []
     if session.checkpoint_summaries:
         previous_next = list(session.checkpoint_summaries[-1].get("next_investigations") or [])
@@ -351,7 +380,7 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
                     tokens.add(token)
         question_tokens = {
             token.strip(".,:;!?()[]{}<>\"'")
-            for token in question.split()
+            for token in original_question.lower().split()
             if len(token.strip(".,:;!?()[]{}<>\"'")) >= 4
         }
         return len(tokens & question_tokens)
@@ -361,7 +390,14 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
         title = str(candidate.get("title") or "")
         request = str(candidate.get("request") or candidate.get("description") or "")
         reason = str(candidate.get("reason") or candidate.get("justification") or "")
-        relevance = min(100, 20 + _term_overlap_score(title, request, reason) * 18)
+        integrity = evaluate_task_request_relevance(
+            original_question=original_question,
+            task_request=request,
+            current_understanding=current_understanding,
+            current_hypothesis=current_hypothesis,
+            prior_findings=session.investigation_memory.get("previous_findings") or [],
+        )
+        relevance = min(100, max(integrity["question_alignment"]["score"], 20 + _term_overlap_score(title, request, reason) * 18))
         if any(term in (title + " " + request + " " + reason).lower() for term in ["challenge", "falsify", "test", "verify"]):
             uncertainty_reduction = 85
         elif any(term in (title + " " + request + " " + reason).lower() for term in ["compare", "contrast"]):
@@ -370,18 +406,24 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
             uncertainty_reduction = 70
         else:
             uncertainty_reduction = 60
+        hypothesis_coverage = min(100, 35 + integrity["continuity"]["score"] // 2 + (10 if integrity["allowed"] else 0))
         business_value = min(100, 35 + relevance // 2 + (10 if top_story.get("insight") else 0))
         analytical_confidence = _confidence_score(candidate.get("confidence", confidence))
         recommendation_score = round(
-            (0.40 * relevance)
-            + (0.25 * uncertainty_reduction)
-            + (0.20 * business_value)
-            + (0.15 * analytical_confidence)
+            (0.35 * relevance)
+            + (0.20 * hypothesis_coverage)
+            + (0.20 * uncertainty_reduction)
+            + (0.15 * business_value)
+            + (0.10 * analytical_confidence)
         )
         candidate["question_relevance"] = relevance
+        candidate["hypothesis_coverage"] = hypothesis_coverage
         candidate["uncertainty_reduction"] = uncertainty_reduction
         candidate["business_value"] = business_value
         candidate["analytical_confidence"] = analytical_confidence
+        candidate["integrity"] = integrity
+        candidate["continuity_score"] = integrity["continuity"]["score"]
+        candidate["integrity_score"] = integrity["score"]
         candidate["recommendation_score"] = max(0, min(100, recommendation_score))
         return candidate
 
@@ -391,6 +433,8 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
         enriched: List[Dict[str, Any]] = []
         for index, item in enumerate(items[:3]):
             candidate = _rank_suggestion(item)
+            if not candidate["integrity"].get("allowed") and candidate["integrity"]["score"] < 45:
+                continue
             candidate["impact_percent"] = max(
                 0,
                 min(
@@ -398,6 +442,7 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
                     round(
                         0.35 * base_impact
                         + 0.30 * candidate["question_relevance"]
+                        + 0.15 * candidate["hypothesis_coverage"]
                         + 0.20 * candidate["uncertainty_reduction"]
                         + 0.15 * candidate["business_value"]
                         + impact_offsets[index],
@@ -411,13 +456,14 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
                 item.get("recommendation_score", 0),
                 item.get("impact_percent", 0),
                 item.get("question_relevance", 0),
+                item.get("hypothesis_coverage", 0),
                 item.get("uncertainty_reduction", 0),
             ),
             reverse=True,
         )
         return enriched
 
-    if any(term in question for term in ["region", "geo", "geographic", "location"]):
+    if any(term in original_question.lower() for term in ["region", "geo", "geographic", "location"]):
         suggestions.append(
             {
                 "title": "Investigate regional differences",
@@ -428,7 +474,7 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
             }
         )
 
-    if any(term in question for term in ["customer", "segment", "group", "cohort"]):
+    if any(term in original_question.lower() for term in ["customer", "segment", "group", "cohort"]):
         suggestions.append(
             {
                 "title": "Compare customer segments",
@@ -495,7 +541,7 @@ def _build_desk_view(session: InvestigationSession) -> Dict[str, Any]:
         "running_tasks": running,
         "queued_tasks": queued,
         "failed_tasks": failed,
-        "current_understanding": session.investigation_memory.get("current_understanding"),
+        "current_understanding": _best_answer_text(session.investigation_memory, session.original_question),
         "last_failure": session.investigation_memory.get("last_failure"),
         "evidence_summary": [record.statement for record in session.evidence_store.values()],
         "current_hypotheses": [hypothesis.to_dict() for hypothesis in session.hypotheses.values()],
@@ -537,20 +583,10 @@ def _inject_collaborative_context(state: AnalystState, session: InvestigationSes
 
 
 def _default_initial_tasks(question: str) -> List[Dict[str, Any]]:
-    challenge_request = f"Challenge the leading conclusion for: {question}"
-    comparison_request = f"Compare the current conclusion against an alternative explanation for: {question}"
     return [
         {
             "title": "Primary investigation",
             "request": question,
-        },
-        {
-            "title": "Challenge finding",
-            "request": challenge_request,
-        },
-        {
-            "title": "Comparison task",
-            "request": comparison_request,
         },
     ]
 
@@ -628,12 +664,11 @@ def run_collaborative_investigation(
         summary = _summarize_task_result(task.request, final_state, task.task_id, task.version)
         evidence = _build_evidence_record(task.task_id, final_state, summary)
         manager.mark_completed(task.task_id, final_state, evidence, summary)
-        hypothesis = _derive_hypothesis(task.request, final_state, evidence)
-        current_hypothesis = session.investigation_memory.get("current_understanding") or session.original_question
+        current_hypothesis = _best_answer_text(session.investigation_memory, session.original_question)
         answer_synthesis = synthesize_answer(
             business_question=task.request,
             evidence=final_state.get("analysis_evidence", {}) or {},
-            hypotheses=[hypothesis.to_dict()],
+            hypotheses=[],
             current_understanding=summary.get("current_understanding") or summary.get("task_finding") or task.request,
             confidence=summary.get("confidence"),
             knowledge_gaps=session.investigation_memory.get("knowledge_gaps") or [],
@@ -658,8 +693,19 @@ def run_collaborative_investigation(
         summary["traceability"] = build_traceability_record(integrity)
         summary["investigation_decision"] = decision
         summary["current_understanding"] = integrity["promoted_understanding"] if integrity["should_promote"] else (session.investigation_memory.get("current_understanding") or session.original_question)
+        summary["best_answer"] = update_best_answer_anchor(
+            session.investigation_memory,
+            original_question=session.original_question,
+            summary=summary,
+            integrity=integrity,
+            task_id=task.task_id,
+            task_title=task.title,
+        )
+        if not integrity["should_promote"]:
+            summary["narrative"] = f"Supporting evidence only: {summary.get('narrative') or summary['task_finding']}"
         summary["task_finding"] = summary.get("task_finding") or summary["current_understanding"]
         summary["integrity_status"] = integrity["overall"]["level"]
+        hypothesis = _derive_hypothesis(task.request, final_state, evidence, integrity=integrity)
         hypothesis.notes.append(
             f"Integrity: question relevance={integrity['question_relevance']['level']}, continuity={integrity['continuity']['level']}, information gain={integrity['information_gain']['level']}, validity={integrity['analytical_validity']['level']}."
         )
@@ -757,7 +803,7 @@ def run_collaborative_investigation(
             f"Investigation ID: {session.investigation_id}",
             f"Original question: {session.original_question}",
             f"Completed tasks: {', '.join(session.completed_tasks) if session.completed_tasks else 'None'}",
-            f"Current understanding: {session.investigation_memory.get('current_understanding') or 'None'}",
+            f"Current understanding: {_best_answer_text(session.investigation_memory, 'None')}",
             "Task findings:",
         ]
         for task_id in session.completed_tasks:

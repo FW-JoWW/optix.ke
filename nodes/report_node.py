@@ -1351,9 +1351,10 @@ def _appendix_lines(state: AnalystState, evidence: Dict[str, Any], top_stories: 
 
 def _collaborative_answer_line(state: AnalystState, session: Dict[str, Any], dataframe: Any) -> str:
     question = session.get("original_question") or state.get("business_question") or "the investigation"
+    memory = session.get("investigation_memory") or state.get("collaborative_memory") or state.get("investigation_memory") or {}
     answer = (
-        session.get("investigation_memory", {}).get("current_understanding")
-        or state.get("collaborative_memory", {}).get("current_understanding")
+        (memory.get("best_answer") or {}).get("answer")
+        or memory.get("current_understanding")
         or "The investigation remains inconclusive."
     )
     question_text = humanize_text(question, dataframe=dataframe)
@@ -1401,7 +1402,11 @@ def _collaborative_lines(state: AnalystState, evidence: Dict[str, Any]) -> List[
     if latest_confidence is None and latest_task_id:
         latest_confidence = (tasks.get(latest_task_id) or {}).get("result_summary", {}).get("confidence")
     confidence_text = _confidence_label(latest_confidence, fallback="unknown")
-    current_understanding = memory.get("current_understanding") or session.get("current_understanding")
+    current_understanding = (
+        (memory.get("best_answer") or {}).get("answer")
+        or memory.get("current_understanding")
+        or session.get("current_understanding")
+    )
     direct_answer = humanize_text(current_understanding or "The investigation is still inconclusive.", dataframe=dataframe)
     objective_text = humanize_text(session.get("objective") or state.get("business_question") or "the investigation", dataframe=dataframe)
     question_text = humanize_text(session.get("original_question") or state.get("business_question") or "the question", dataframe=dataframe)

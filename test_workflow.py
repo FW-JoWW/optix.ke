@@ -33,7 +33,11 @@ def _run_collaborative(question: str, workflow_mode: str, dataset_path: str, df:
     responses = [item.strip() for item in collab_responses_env.split("|") if item.strip()] if collab_responses_env else None
     build_final_report = collab_report_mode != "preview"
 
-    print("\n[Agent] Running collaborative workflow in scripted test mode.")
+    if responses is None:
+        print("\n[Agent] Running collaborative workflow in interactive test mode.")
+        print("[Agent] This path uses the same collaborative session runner as the live mode, so it keeps going until the decision layer asks for human guidance or you select a human action.")
+    else:
+        print("\n[Agent] Running collaborative workflow in scripted test mode.")
     initial_tasks = [
         {
             "title": "Primary investigation",
@@ -71,9 +75,11 @@ def main() -> None:
     if mode == "collaborative":
         dataset_path = "data/olist_merged_dataset.csv"
         df = load_default_dataframe(dataset_path)
-        if workflow_mode in {"collaborative-smoke", "collaborative-preview"}:
+        use_sample_dataset = os.getenv("COLLABORATIVE_USE_SAMPLE_DATASET", "").strip().lower() in {"1", "true", "yes"}
+        if use_sample_dataset:
             df = build_guided_sample_dataframe()
             dataset_path = "data/collaborative_test_dataset.csv"
+            print("\n[Agent] Collaborative test dataset override enabled.")
         _run_collaborative(question, workflow_mode, dataset_path, df)
         return
 

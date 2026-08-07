@@ -16,6 +16,28 @@ def _normalize_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _best_answer_text(memory: Dict[str, Any], session: Dict[str, Any], fallback: str = "") -> str:
+    session_memory = {}
+    if isinstance(session, dict):
+        session_memory = session.get("investigation_memory") or session.get("collaborative_memory") or {}
+    anchored_answer = _normalize_text((memory.get("best_answer") or {}).get("answer"))
+    if anchored_answer:
+        return anchored_answer
+    session_anchored_answer = _normalize_text((session_memory.get("best_answer") or {}).get("answer"))
+    if session_anchored_answer:
+        return session_anchored_answer
+    for value in [
+        memory.get("current_understanding"),
+        session_memory.get("current_understanding"),
+        session.get("current_understanding") if isinstance(session, dict) else "",
+        fallback,
+    ]:
+        text = _normalize_text(value)
+        if text:
+            return text
+    return ""
+
+
 def _non_empty_lines(lines: Sequence[str]) -> List[str]:
     return [line for line in lines if _normalize_text(line)]
 
@@ -514,7 +536,8 @@ def _guided_sections(state: AnalystState, evidence: Dict[str, Any]) -> Dict[str,
         evidence_lines = [humanize_text(llm_insights)] if llm_insights else ["The guided checkpoints have not yet yielded a stable narrative."]
 
     current_understanding = humanize_text(
-        (judgment.get("summary") if isinstance(judgment, dict) else None)
+        _best_answer_text({}, state)
+        or (judgment.get("summary") if isinstance(judgment, dict) else None)
         or (judgment.get("dominant_reasoning") if isinstance(judgment, dict) else None)
         or (top_stories[0].get("insight") if top_stories else None)
         or llm_insights
@@ -622,8 +645,7 @@ def _collaborative_sections(state: AnalystState, evidence: Dict[str, Any]) -> Di
     question = humanize_text(session.get("original_question") or state.get("business_question") or "the business question", dataframe=dataframe)
     objective = humanize_text(session.get("objective") or question, dataframe=dataframe)
     current_understanding = humanize_text(
-        memory.get("current_understanding")
-        or session.get("current_understanding")
+        _best_answer_text(memory, session)
         or (top_stories[0].get("insight") if top_stories else None)
         or (evidence.get("judgment_summary") or {}).get("dominant_reasoning")
         or (evidence.get("judgment_summary") or {}).get("summary")
@@ -756,7 +778,7 @@ def compose_final_analyst_sections(state: AnalystState, evidence: Dict[str, Any]
     memory = session.get("investigation_memory") or state.get("collaborative_memory") or {}
     question = humanize_text(session.get("original_question") or state.get("business_question") or "the business question", dataframe=dataframe)
     current_understanding = humanize_text(
-        memory.get("current_understanding")
+        _best_answer_text(memory, session)
         or (evidence.get("judgment_summary") or {}).get("summary")
         or (evidence.get("judgment_summary") or {}).get("dominant_reasoning")
         or (evidence.get("top_stories") or [{}])[0].get("insight")

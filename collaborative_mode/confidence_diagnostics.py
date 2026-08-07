@@ -655,11 +655,15 @@ def evaluate_investigation_decision(
 
     continuing_value = max(information_gain_score, decision_impact_score, actionability_score)
     expected_gain = int(fastest.get("expected_confidence_gain", 0) or 0)
-    should_stop = mandatory_pass and bool(sufficiency.get("diminishing_returns")) and int(confidence.get("overall", {}).get("score", 0) or 0) >= stop_threshold
+    answer_ready = str(answer.get("answer_position") or "").strip().lower() == "direct"
+    should_stop = mandatory_pass and bool(sufficiency.get("diminishing_returns")) and int(confidence.get("overall", {}).get("score", 0) or 0) >= stop_threshold and answer_ready
     if mandatory_pass and risk_level == "high":
         should_stop = should_stop and int(confidence.get("overall", {}).get("score", 0) or 0) >= 80
     should_continue = not mandatory_pass and bool(fastest.get("reducible", False)) and expected_gain >= 15 and not should_stop
-    should_ask_user = collaborative_mode and not mandatory_pass and not should_continue and not should_stop
+    should_ask_user = collaborative_mode and not should_stop and (
+        (not mandatory_pass and not should_continue)
+        or (mandatory_pass and bool(sufficiency.get("diminishing_returns")) and not answer_ready)
+    )
     if collaborative_mode and not mandatory_pass and expected_gain < 15 and not should_stop:
         should_ask_user = True
 
@@ -697,6 +701,16 @@ def evaluate_investigation_decision(
             "The evidence base is promising, but the expected benefit of another analysis step is uncertain.",
             "Human guidance is needed to choose the most valuable next investigation path.",
         ]
+        if not answer_ready:
+            decision_reasoning.insert(
+                0,
+                "The current evidence supports a closest-defensible answer, but it still falls short of a direct answer to the business question.",
+            )
+        if mandatory_pass and bool(sufficiency.get("diminishing_returns")) and not answer_ready:
+            decision_reasoning.insert(
+                1 if decision_reasoning and not answer_ready else 0,
+                "The analysis has reached diminishing returns, but the current evidence still does not produce a direct answer to the business question.",
+            )
 
     if failed_gates:
         decision_reasoning.append("Mandatory gates that are still open: " + ", ".join(gate["gate"] for gate in failed_gates))
@@ -775,6 +789,49 @@ def evaluate_investigation_decision(
         "internal_metrics": internal_metrics,
         "audit_log": audit_log,
         "gates": mandatory_gates,
+    }
+
+
+def build_investigation_decision_bundle(
+    *,
+    business_question: str,
+    evidence: Dict[str, Any],
+    answer: Dict[str, Any],
+    hypotheses: Sequence[Dict[str, Any]] | None = None,
+    investigation_memory: Dict[str, Any] | None = None,
+    collaborative_mode: bool = False,
+    dataframe: Any = None,
+) -> Dict[str, Any]:
+    """
+    Build the full confidence and investigation decision package from one place.
+
+    This keeps the decision logic centralized in the diagnostics layer so the
+    synthesis, reporting, and workflow modules can consume a single result
+    instead of independently reconstructing the same reasoning.
+    """
+    diagnostics = evaluate_confidence_diagnostics(
+        business_question=business_question,
+        evidence=evidence,
+        answer=answer,
+        hypotheses=hypotheses,
+        investigation_memory=investigation_memory,
+        dataframe=dataframe,
+    )
+    decision = evaluate_investigation_decision(
+        business_question=business_question,
+        evidence=evidence,
+        answer=answer,
+        diagnostics=diagnostics,
+        hypotheses=hypotheses,
+        investigation_memory=investigation_memory,
+        collaborative_mode=collaborative_mode,
+        dataframe=dataframe,
+    )
+    return {
+        "confidence_diagnostics": diagnostics,
+        "confidence_diagnostics_sections": build_confidence_diagnostics_sections(diagnostics),
+        "investigation_decision": decision,
+        "investigation_decision_sections": build_investigation_decision_sections(decision),
     }
 
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Sequence
 
+from nodes.intent_parser_node import classify_analytic_intent
+
 
 def _normalize_text(value: Any) -> str:
     if value is None:
@@ -122,6 +124,106 @@ def _actual_contribution(passed: bool, summary: Dict[str, Any]) -> str:
     return _normalize_text(summary.get("current_understanding") or summary.get("narrative") or "The task produced supporting evidence only.")
 
 
+def evaluate_task_request_relevance(
+    *,
+    original_question: str,
+    task_request: str,
+    current_understanding: str = "",
+    current_hypothesis: str = "",
+    prior_findings: Sequence[Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Determine whether a proposed collaborative task stays on the current investigation branch.
+
+    The gate is intentionally deterministic and conservative: it prefers to block
+    requests that look like a new branch unless they clearly support the original
+    question or the active line of reasoning.
+    """
+    prior_findings = list(prior_findings or [])
+    request_text = _normalize_text(task_request)
+    question_text = _normalize_text(original_question)
+    understanding_text = _normalize_text(current_understanding)
+    hypothesis_text = _normalize_text(current_hypothesis)
+    request_lower = request_text.lower()
+
+    direct_alignment = max(
+        _score_text_match(question_text, request_text, understanding_text),
+        _score_text_match(question_text, hypothesis_text, *prior_findings[:5]),
+    )
+    continuity = _score_continuity(request_text, hypothesis_text or understanding_text, prior_findings)
+    intent = classify_analytic_intent(request_text)
+
+    if not request_text:
+        return {
+            "allowed": False,
+            "decision": "reject",
+            "score": 0,
+            "level": "None",
+            "question_alignment": {"score": 0, "level": "None"},
+            "continuity": {"score": continuity, "level": _classify_level(continuity)},
+            "intent": intent,
+            "reason": "The request is empty, so there is nothing to evaluate against the investigation.",
+            "recommended_next_step": "Describe the investigation using the same business question or one of its direct follow-up branches.",
+        }
+
+    intent_score = 50
+    if intent == "comparison":
+        intent_score = 82
+    elif intent in {"investigative", "relationship"}:
+        intent_score = 74
+    elif intent in {"temporal", "extremes", "profiling", "outliers", "data_quality", "predictive"}:
+        intent_score = 68
+
+    if any(term in request_lower for term in ["challenge", "compare", "refine", "rerun", "re-run", "repeat", "verify", "test", "falsify"]):
+        intent_score = min(100, intent_score + 8)
+
+    if any(term in request_lower for term in ["task-", "task ", "version", "hypothesis", "finding", "conclusion"]):
+        direct_alignment = min(100, direct_alignment + 6)
+
+    overall = round((0.55 * direct_alignment) + (0.30 * continuity) + (0.15 * intent_score))
+    question_level = _classify_level(direct_alignment)
+    continuity_level = _classify_level(continuity)
+    overall_level = _classify_level(overall)
+
+    allowed = (
+        direct_alignment >= 40
+        and overall >= 55
+    ) or (
+        intent in {"comparison", "investigative", "relationship"} and continuity >= 60 and overall >= 50
+    )
+
+    decision = "allow" if allowed else "reject"
+    if allowed:
+        reason = (
+            f"The request remains aligned with the active investigation. "
+            f"Question alignment is {question_level}, continuity is {continuity_level}, and the overall relevance is {overall_level}."
+        )
+        recommended_next_step = "Proceed with the task and keep the current investigation thread."
+    else:
+        reason = (
+            f"The request looks like a new branch rather than a direct follow-up. "
+            f"Question alignment is {question_level}, continuity is {continuity_level}, and the overall relevance is {overall_level}."
+        )
+        recommended_next_step = (
+            "Restate the request using the current business question, a completed task id, or an explicit follow-up hypothesis."
+        )
+
+    return {
+        "allowed": allowed,
+        "decision": decision,
+        "score": overall,
+        "level": overall_level,
+        "question_alignment": {"score": direct_alignment, "level": question_level},
+        "continuity": {"score": continuity, "level": continuity_level},
+        "intent": intent,
+        "reason": reason,
+        "recommended_next_step": recommended_next_step,
+        "current_understanding": understanding_text,
+        "current_hypothesis": hypothesis_text,
+        "prior_findings_count": len(prior_findings),
+    }
+
+
 def evaluate_investigation_integrity(
     *,
     original_question: str,
@@ -202,6 +304,57 @@ def evaluate_investigation_integrity(
         ),
         "promoted_understanding": _normalize_text(summary.get("current_understanding") or summary.get("narrative") or ""),
     }
+
+
+def update_best_answer_anchor(
+    session_memory: Dict[str, Any],
+    *,
+    original_question: str = "",
+    summary: Dict[str, Any],
+    integrity: Dict[str, Any],
+    task_id: str,
+    task_title: str,
+) -> Dict[str, Any]:
+    """
+    Track the most question-relevant answer seen so far.
+
+    This is separate from the live current_understanding so that a later
+    low-relevance task cannot overwrite a better answer to the original question.
+    """
+    session_memory = session_memory if isinstance(session_memory, dict) else {}
+    answer_text = _normalize_text(summary.get("current_understanding") or summary.get("task_finding") or summary.get("narrative") or "")
+    if not answer_text:
+        return session_memory.get("best_answer") or {}
+
+    candidate = {
+        "task_id": task_id,
+        "task_title": task_title,
+        "answer": answer_text,
+        "request_match": _score_text_match(original_question, summary.get("request") or task_title),
+        "question_relevance": int((integrity.get("question_relevance") or {}).get("score") or 0),
+        "answer_match": _score_text_match(original_question, answer_text),
+        "overall_integrity": int((integrity.get("overall") or {}).get("score") or 0),
+        "answer_position": _normalize_text(summary.get("answer_position") or summary.get("status") or ""),
+        "timestamp": summary.get("timestamp"),
+        "source_request": summary.get("request"),
+    }
+    existing = session_memory.get("best_answer") or {}
+
+    def _rank(item: Dict[str, Any]) -> tuple[int, int, int, str]:
+        answer_position = str(item.get("answer_position") or "").lower()
+        directness_bonus = 1 if answer_position == "direct" else 0
+        return (
+            int(item.get("request_match") or 0),
+            int(item.get("question_relevance") or 0),
+            int(item.get("answer_match") or 0),
+            int(item.get("overall_integrity") or 0),
+            directness_bonus,
+            str(item.get("timestamp") or ""),
+        )
+
+    if not existing or _rank(candidate) >= _rank(existing):
+        session_memory["best_answer"] = candidate
+    return session_memory.get("best_answer") or candidate
 
 
 def build_traceability_record(integrity: Dict[str, Any]) -> Dict[str, Any]:

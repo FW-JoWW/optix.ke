@@ -4,9 +4,8 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 from .confidence_diagnostics import (
     build_confidence_diagnostics_sections,
+    build_investigation_decision_bundle,
     build_investigation_decision_sections,
-    evaluate_confidence_diagnostics,
-    evaluate_investigation_decision,
     render_confidence_diagnostics_report,
     render_investigation_decision_report,
 )
@@ -258,7 +257,14 @@ def synthesize_answer(
             "raw": judgment,
         })
 
-    current_text = _normalize_text(current_understanding or investigation_memory.get("current_understanding") or judgment.get("summary") or (evidence_items[0]["text"] if evidence_items else ""))
+    best_answer = (investigation_memory.get("best_answer") or {}).get("answer")
+    current_text = _normalize_text(
+        best_answer
+        or current_understanding
+        or investigation_memory.get("current_understanding")
+        or judgment.get("summary")
+        or (evidence_items[0]["text"] if evidence_items else "")
+    )
     directness = _overlap_score(business_question, current_text)
     evidence_score = min(100, 20 + len(direct_items) * 25 + len(indirect_items) * 12 + len(supporting_items) * 6 - len(conflicting_items) * 15)
     if directness >= 3:
@@ -406,56 +412,35 @@ def synthesize_answer(
         recommendation_score=recommendation_confidence,
     )
 
-    diagnostics = evaluate_confidence_diagnostics(
+    answer_payload = {
+        "confidence": confidence_bundle,
+        "evidence_breakdown": {
+            "direct": direct_items,
+            "indirect": indirect_items,
+            "supporting": supporting_items,
+            "conflicting": conflicting_items,
+            "missing": missing_evidence,
+        },
+        "answer_position": answer_position,
+        "key_assumptions": missing_evidence[:4] if sufficiency_status != "yes" else [
+            "The answer remains contingent on the current evidence base staying stable.",
+        ],
+        "remaining_uncertainty": remaining_uncertainty[:4],
+        "recommended_next_investigation": recommended_next[:3],
+    }
+    decision_bundle = build_investigation_decision_bundle(
         business_question=business_question,
         evidence=evidence,
-        answer={
-            "confidence": confidence_bundle,
-            "evidence_breakdown": {
-                "direct": direct_items,
-                "indirect": indirect_items,
-                "supporting": supporting_items,
-                "conflicting": conflicting_items,
-                "missing": missing_evidence,
-            },
-            "answer_position": answer_position,
-            "key_assumptions": missing_evidence[:4] if sufficiency_status != "yes" else [
-                "The answer remains contingent on the current evidence base staying stable.",
-            ],
-            "remaining_uncertainty": remaining_uncertainty[:4],
-            "recommended_next_investigation": recommended_next[:3],
-        },
-        hypotheses=hypotheses,
-        investigation_memory=investigation_memory,
-        dataframe=dataframe,
-    )
-    diagnostics_sections = build_confidence_diagnostics_sections(diagnostics)
-    decision = evaluate_investigation_decision(
-        business_question=business_question,
-        evidence=evidence,
-        answer={
-            "confidence": confidence_bundle,
-            "evidence_breakdown": {
-                "direct": direct_items,
-                "indirect": indirect_items,
-                "supporting": supporting_items,
-                "conflicting": conflicting_items,
-                "missing": missing_evidence,
-            },
-            "answer_position": answer_position,
-            "key_assumptions": missing_evidence[:4] if sufficiency_status != "yes" else [
-                "The answer remains contingent on the current evidence base staying stable.",
-            ],
-            "remaining_uncertainty": remaining_uncertainty[:4],
-            "recommended_next_investigation": recommended_next[:3],
-        },
-        diagnostics=diagnostics,
+        answer=answer_payload,
         hypotheses=hypotheses,
         investigation_memory=investigation_memory,
         collaborative_mode=bool(evidence.get("collaborative_session")),
         dataframe=dataframe,
     )
-    decision_sections = build_investigation_decision_sections(decision)
+    diagnostics = decision_bundle["confidence_diagnostics"]
+    diagnostics_sections = decision_bundle["confidence_diagnostics_sections"]
+    decision = decision_bundle["investigation_decision"]
+    decision_sections = decision_bundle["investigation_decision_sections"]
     if diagnostics.get("recommendation_alignment", {}).get("should_stop"):
         recommended_next = [decision.get("recommended_next_step") or diagnostics.get("evidence_sufficiency", {}).get("stopping_recommendation") or "Finish the investigation."]
 

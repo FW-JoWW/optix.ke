@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 
-from collaborative_mode.models import CollaborativeTask, InvestigationSession
+from collaborative_mode.models import CollaborativeTask, EvidenceRecord, InvestigationSession
 from collaborative_mode.answer_synthesis import render_answer_synthesis_report, synthesize_answer
 from collaborative_mode.confidence_diagnostics import evaluate_investigation_decision, render_investigation_decision_report
+from collaborative_mode.narrative_composer import render_analyst_report
 from collaborative_mode.session_runner import CollaborativeSessionController
+from collaborative_mode.session_runner import _infer_action_from_text
 from collaborative_mode.task_manager import TaskManager
 import collaborative_mode.orchestrator as collaborative_orchestrator
+from collaborative_mode.presentation import render_collaborative_handoff_view
 from scripts.collaborative_mode_harness import build_guided_sample_dataframe
 from scripts.collaborative_mode_harness import run_collaborative_workflow, summarize_collaborative_result
 
@@ -154,6 +157,53 @@ def test_collaborative_mode_exposes_desk_and_suggestions() -> None:
     print("COLLABORATIVE DESK OK")
 
 
+def test_collaborative_mode_handoff_view_reads_like_analyst_brief() -> None:
+    session = InvestigationSession(
+        investigation_id="inv-handoff",
+        original_question=QUESTION,
+    )
+    session.current_status = "awaiting_user"
+    session.investigation_memory["current_understanding"] = "Revenue and Profit appear to move together across regions."
+    session.investigation_memory["investigation_decision"] = {
+        "decision": "ASK_USER",
+        "reasoning": [
+            "The current evidence supports a closest-defensible answer, but it still falls short of a direct answer to the business question.",
+            "Human guidance is needed to choose the most valuable next investigation path.",
+        ],
+        "remaining_uncertainties": [
+            "The regional comparison still needs a direct validation pass.",
+        ],
+        "recommended_next_step": "Choose the most valuable next investigation path.",
+    }
+    session.checkpoint_summaries.append({"task_title": "Regional analysis"})
+    session.completed_tasks.append("task-1")
+    session.ai_suggestions.append({"title": "Compare segments", "request": "Compare the most important customer segments.", "confidence": 0.9})
+
+    handoff = render_collaborative_handoff_view(session.to_dict())
+
+    assert "ANALYST HANDOFF" in handoff
+    assert "What we know:" in handoff
+    assert "Why human input is needed now:" in handoff
+    assert "What is still uncertain:" in handoff
+    assert "Best next actions:" in handoff
+
+
+def test_collaborative_mode_routes_key_capabilities() -> None:
+    cases = {
+        "Refine task": "refine task",
+        "Accept AI suggestion": "accept ai suggestion",
+        "Update our current understanding.": "query",
+        "Create a new investigation.": "new investigation",
+        "Finish investigation": "finish investigation",
+        "What should we investigate next?": "query",
+        "Show all active investigations.": "query",
+    }
+
+    for phrase, expected_action in cases.items():
+        action, _ = _infer_action_from_text(phrase)
+        assert action == expected_action, phrase
+
+
 def test_answer_synthesis_prefers_direct_evidence_when_available() -> None:
     synthesis = synthesize_answer(
         business_question="What is the relationship between Revenue and Profit by Region?",
@@ -271,6 +321,39 @@ def test_investigation_decision_stops_when_evidence_is_sufficient() -> None:
     assert decision["decision"] == "STOP"
     assert "Decision: STOP" in report
     assert "Original question has been answered" not in report  # report should stay analyst-like, not templated verbatim
+
+
+def test_investigation_decision_asks_user_when_diminishing_returns_do_not_yet_answer_the_question() -> None:
+    decision = evaluate_investigation_decision(
+        business_question="What is the relationship between Revenue and Profit by Region?",
+        evidence={},
+        answer={
+            "answer_position": "closest_defensible",
+            "evidence_breakdown": {
+                "direct": [1],
+                "indirect": [],
+                "supporting": [1],
+                "conflicting": [],
+            },
+        },
+        diagnostics={
+            "confidence": {
+                "overall": {"score": 86},
+                "question_coverage": {"score": 88},
+                "evidence_quality": {"score": 82},
+                "alternative_explanation": {"score": 80},
+                "business_interpretation": {"score": 76},
+                "recommendation": {"score": 74},
+            },
+            "evidence_sufficiency": {"diminishing_returns": True, "would_more_analysis_help": False},
+            "uncertainty_sources": [],
+            "fastest_path_to_strengthen_confidence": {"reducible": False, "expected_confidence_gain": 4, "action": "Finish the investigation"},
+        },
+        collaborative_mode=True,
+    )
+
+    assert decision["decision"] == "ASK_USER"
+    assert "direct answer" in " ".join(decision["reasoning"]).lower()
 
 
 def test_investigation_decision_respects_risk_and_stricter_thresholds() -> None:
@@ -443,6 +526,34 @@ def test_investigation_decision_report_hides_internal_metrics_by_default() -> No
     assert "Internal Decision Metrics" in debug_report
 
 
+def test_collaborative_query_router_understands_more_capability_language() -> None:
+    controller = CollaborativeSessionController.create(
+        question=QUESTION,
+        dataframe=build_guided_sample_dataframe(),
+        initial_tasks=[{"title": "Primary investigation", "request": QUESTION}],
+        build_final_report=False,
+    )
+    controller.session.evidence_store["task-1-evidence"] = EvidenceRecord(
+        evidence_id="task-1-evidence",
+        task_source="task-1",
+        evidence_type="task_result",
+        statement="Revenue and Profit move together across regions.",
+        confidence=0.92,
+        quality_score=0.91,
+    )
+
+    assert "What to investigate next" in controller.respond_to_query("Suggest three new analyses")
+    assert "Supported hypotheses" in controller.respond_to_query("Rank the hypotheses by confidence")
+    assert "Current understanding" in controller.respond_to_query("What did we conclude earlier?")
+    assert "Evidence count" in controller.respond_to_query("Show the strongest evidence")
+
+
+def test_collaborative_action_router_accepts_imperative_capability_text() -> None:
+    assert _infer_action_from_text("Create a new investigation about churn")[0] == "new investigation"
+    assert _infer_action_from_text("Resume previous investigation inv-20260804-123456")[0] == "resume previous investigation"
+    assert _infer_action_from_text("Queue three investigations")[0] == "queue three investigations"
+
+
 def test_collaborative_task_manager_can_compare_finished_tasks() -> None:
     session = InvestigationSession(
         investigation_id="inv-test",
@@ -515,6 +626,56 @@ def test_unrelated_result_stays_supporting_evidence_only(monkeypatch) -> None:
     assert session.get("investigation_memory", {}).get("supporting_findings")
     assert "Investigation Integrity" in result.final_state.get("final_report", "")
     print("COLLABORATIVE INTEGRITY GATE OK")
+
+
+def test_final_report_prefers_best_answer_anchor_over_late_drift() -> None:
+    best_answer = "fixed telephony has the highest payment_value_total and health_beauty the lowest."
+    drift_answer = "2017-09-29 15:24:00 has the highest payment_value_total and 2018-03-03 17:11:00 the lowest."
+    session = InvestigationSession(
+        investigation_id="inv-anchor",
+        original_question="Which product category has the highest and lowest payment value?",
+    )
+    session.investigation_memory["best_answer"] = {
+        "task_id": "task-1",
+        "task_title": "Primary investigation",
+        "answer": best_answer,
+        "question_relevance": 92,
+        "overall_integrity": 91,
+    }
+    session.investigation_memory["current_understanding"] = drift_answer
+    session.investigation_memory["investigation_decision"] = {
+        "decision": "STOP",
+        "recommended_next_step": "Finish the investigation.",
+        "reasoning": ["The original question is already answered."],
+        "remaining_uncertainties": [],
+    }
+
+    session_dict = session.to_dict()
+    evidence = {
+        "collaborative_session": session_dict,
+        "top_stories": [
+            {
+                "type": "ranking",
+                "insight": drift_answer,
+                "confidence": "high",
+            }
+        ],
+        "judgment_summary": {
+            "summary": drift_answer,
+            "global_confidence": 91,
+        },
+    }
+    state = {
+        "mode": "collaborative",
+        "business_question": session.original_question,
+        "collaborative_session": session_dict,
+        "analysis_evidence": evidence,
+    }
+    report = render_analyst_report(state, evidence)
+
+    assert best_answer in report
+    assert f"Direct Answer\n- {best_answer}" in report
+    print("COLLABORATIVE ANSWER ANCHOR OK")
 
 
 def test_collaborative_integration_smoke_can_be_enabled_explicitly() -> None:

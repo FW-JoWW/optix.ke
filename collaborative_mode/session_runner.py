@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import redirect_stdout
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -17,8 +18,8 @@ from nodes.report_node import report_node
 from state.state import AnalystState
 
 from .narrative_composer import compose_checkpoint_narrative
-from .integrity import build_traceability_record, evaluate_investigation_integrity
-from .presentation import render_collaborative_desk_view
+from .integrity import build_traceability_record, evaluate_investigation_integrity, evaluate_task_request_relevance, update_best_answer_anchor
+from .presentation import render_collaborative_desk_view, render_collaborative_handoff_view
 from .narration import format_suggestion_line, humanize_columns, humanize_text, suggestion_impact_percent
 from .models import InvestigationSession
 from .registry import get_investigation, list_investigations, register_investigation, unregister_investigation
@@ -35,6 +36,14 @@ from .orchestrator import (
     create_investigation_session,
 )
 from .task_manager import TaskManager
+
+
+def _best_answer_text(memory: Dict[str, Any], fallback: str = "") -> str:
+    return (
+        (memory.get("best_answer") or {}).get("answer")
+        or memory.get("current_understanding")
+        or fallback
+    )
 
 
 PromptFn = Callable[[str], str]
@@ -89,19 +98,28 @@ def _extract_task_ids(text: str) -> List[str]:
 
 def _looks_like_query(text: str) -> bool:
     lowered = (text or "").strip().lower()
+    query_starts = (
+        "what ",
+        "which ",
+        "show ",
+        "summarize ",
+        "continue ",
+        "generate ",
+        "explain ",
+        "recommend ",
+        "suggest ",
+        "why ",
+        "how ",
+        "rank ",
+        "list ",
+        "display ",
+        "tell me ",
+        "can you ",
+        "could you ",
+        "should we ",
+    )
     return lowered.endswith("?") or lowered.startswith(
-        (
-            "what ",
-            "which ",
-            "show ",
-            "summarize ",
-            "continue ",
-            "generate ",
-            "explain ",
-            "recommend ",
-            "why ",
-            "how ",
-        )
+        query_starts
     ) or "?" in lowered
 
 
@@ -114,8 +132,46 @@ def _infer_action_from_text(text: str) -> tuple[str | None, str]:
     task_ids = _extract_task_ids(raw)
     analytic_intent = classify_analytic_intent(raw)
 
-    if _looks_like_query(raw):
+    if lowered.startswith(("create a new investigation", "create new investigation", "start a new investigation", "new investigation")):
+        return "new investigation", raw
+
+    if lowered.startswith(("refine task", "refine investigation", "refine ", "rerun task", "re-run task", "repeat task")):
+        return "refine task", raw
+
+    if lowered.startswith(("accept ai suggestion", "accept ai suggestions", "accept ai recommendation", "accept suggestion", "accept recommendations")):
+        return "accept ai suggestion", raw
+
+    if lowered.startswith(("resume previous investigation", "resume a previous investigation", "resume investigation", "resume prior investigation")):
+        return "resume previous investigation", raw
+
+    if lowered.startswith(("show all active investigations", "show queued tasks", "what is the objective", "summarize everything discovered", "what should we investigate next", "what questions remain unanswered", "what information is still missing")):
         return "query", raw
+
+    if lowered.startswith(("what are the highest priority investigations", "recommend the next analytical task", "suggest alternative investigation paths", "which investigation would provide the greatest business value", "what should we investigate next")):
+        return "query", raw
+
+    if lowered.startswith(("resume this investigation", "continue from where we stopped", "continue from where we left off")):
+        return "resume previous investigation", raw
+
+    if lowered.startswith(("update our current understanding", "generate the current narrative", "what is the current business story", "what did we conclude earlier", "has our understanding changed")):
+        return "query", raw
+
+    if lowered.startswith(("close this investigation", "close investigation", "finish this investigation", "finish investigation", "archive this investigation", "archive investigation", "rename the investigation", "rename investigation", "set objective", "update objective", "objective")):
+        if lowered.startswith(("close", "finish")):
+            return "finish investigation", raw
+        if lowered.startswith("archive"):
+            return "archive this investigation", raw
+        if lowered.startswith(("rename the investigation", "rename investigation")):
+            return "rename", raw
+        if lowered.startswith(("set objective", "update objective", "objective")):
+            return "set objective", raw
+        return "query", raw
+
+    if lowered.startswith(("i disagree", "test an alternative explanation", "could another variable explain", "challenge this finding", "verify this conclusion independently", "can this relationship be explained by confounding variables", "could this be simpson", "test whether the result is robust", "can you falsify this hypothesis")):
+        return "challenge finding", raw
+
+    if lowered.startswith(("cancel task", "remove queued", "remove this queued investigation", "remove task")):
+        return "cancel task", raw
 
     if lowered.startswith(("compare ", "compare task", "compare version")) or task_ids or analytic_intent == "comparison":
         if task_ids:
@@ -125,7 +181,25 @@ def _infer_action_from_text(text: str) -> tuple[str | None, str]:
     if lowered.startswith(("challenge ", "challenge finding", "challenge findings", "can you ", "could ", "test whether ", "falsify ")) or analytic_intent in {"investigative", "relationship"}:
         return "challenge finding", raw
 
-    if lowered.startswith(("investigate ", "analyze ", "analyse ", "build ", "repeat ", "rerun ", "re-run ", "run ", "use ", "test ", "question ")) or analytic_intent in {
+    if lowered.startswith("queue three investigations"):
+        return "queue three investigations", raw
+
+    if lowered.startswith(("queue ", "enqueue ")):
+        return "queue", raw.removeprefix("queue").removeprefix("enqueue").strip()
+
+    if lowered.startswith(("reorder ", "prioritize ")):
+        return "reorder queue", raw
+
+    if lowered.startswith(("pause queue", "pause the queue")):
+        return "pause queue", raw
+
+    if lowered.startswith(("resume queue", "resume the queue")):
+        return "resume queue", raw
+
+    if lowered.startswith(("execute next task", "execute the next task", "next task", "run next task")):
+        return "execute next task", raw
+
+    if lowered.startswith(("investigate ", "analyze ", "analyse ", "build ", "repeat ", "rerun ", "re-run ", "run ", "use ", "test ", "question ", "queue ", "prioritize ", "pause queue", "resume queue", "execute next task", "next task")) or analytic_intent in {
         "temporal",
         "composition",
         "relationship",
@@ -139,7 +213,7 @@ def _infer_action_from_text(text: str) -> tuple[str | None, str]:
             return "refine task", raw
         return "new investigation", raw
 
-    if lowered.startswith(("resume previous investigation", "show all active investigations", "what is the objective", "summarize everything discovered", "what should we investigate next")):
+    if _looks_like_query(raw):
         return "query", raw
 
     return None, raw
@@ -196,6 +270,13 @@ def _capability_panel_lines(controller: "CollaborativeSessionController") -> Lis
         " - 'Re-run Task 4 using Spearman correlation'",
         " - 'Could age explain this instead?'",
         " - 'What should we investigate next?'",
+        "Capability questions you can ask:",
+        " - What information is still missing?",
+        " - Which hypotheses are supported?",
+        " - Show the strongest evidence.",
+        " - Rank the hypotheses by confidence.",
+        " - Summarize what we have learned so far.",
+        " - Which investigation would provide the greatest business value?",
     ]
     if suggestions:
         lines.append("AI recommendations:")
@@ -328,6 +409,23 @@ class CollaborativeSessionController:
         self._refresh_registry()
         return {"status": "failed", "message": message, "run_next": False, "failure": failure}
 
+    def _gate_task_request(self, action: str, task_request: str, details: str = "") -> Dict[str, Any] | None:
+        gate = evaluate_task_request_relevance(
+            original_question=self.session.original_question,
+            task_request=task_request,
+            current_understanding=self.session.investigation_memory.get("current_understanding") or self.question,
+            current_hypothesis=self.session.objective or self.session.investigation_memory.get("current_understanding") or self.question,
+            prior_findings=self.session.investigation_memory.get("previous_findings") or [],
+        )
+        if gate.get("allowed"):
+            return None
+        return self._record_failure(
+            action,
+            f"{action.title()} failed: {gate.get('reason')}",
+            details=details or task_request,
+            reason=gate.get("reason"),
+        )
+
     def process_next_task(self) -> CollaborativeRunResult:
         if self.finished:
             return self._snapshot()
@@ -386,12 +484,11 @@ class CollaborativeSessionController:
         summary = _summarize_task_result(task.request, final_state, task.task_id, task.version)
         evidence = _build_evidence_record(task.task_id, final_state, summary)
         self.manager.mark_completed(task.task_id, final_state, evidence, summary)
-        hypothesis = _derive_hypothesis(task.request, final_state, evidence)
-        current_hypothesis = self.session.investigation_memory.get("current_understanding") or self.question
+        current_hypothesis = _best_answer_text(self.session.investigation_memory, self.question)
         answer_synthesis = synthesize_answer(
             business_question=task.request,
             evidence=final_state.get("analysis_evidence", {}) or {},
-            hypotheses=[hypothesis.to_dict()],
+            hypotheses=[],
             current_understanding=summary.get("current_understanding") or summary.get("task_finding") or task.request,
             confidence=summary.get("confidence"),
             knowledge_gaps=self.session.investigation_memory.get("knowledge_gaps") or [],
@@ -417,7 +514,18 @@ class CollaborativeSessionController:
         summary["investigation_decision"] = decision
         summary["task_finding"] = summary.get("task_finding") or summary.get("current_understanding")
         summary["current_understanding"] = integrity["promoted_understanding"] if integrity["should_promote"] else (self.session.investigation_memory.get("current_understanding") or self.question)
+        summary["best_answer"] = update_best_answer_anchor(
+            self.session.investigation_memory,
+            original_question=self.session.original_question,
+            summary=summary,
+            integrity=integrity,
+            task_id=task.task_id,
+            task_title=task.title,
+        )
+        if not integrity["should_promote"]:
+            summary["narrative"] = f"Supporting evidence only: {summary.get('narrative') or summary['task_finding']}"
         summary["integrity_status"] = integrity["overall"]["level"]
+        hypothesis = _derive_hypothesis(task.request, final_state, evidence, integrity=integrity)
         hypothesis.notes.append(
             f"Integrity: question relevance={integrity['question_relevance']['level']}, continuity={integrity['continuity']['level']}, information gain={integrity['information_gain']['level']}, validity={integrity['analytical_validity']['level']}."
         )
@@ -483,7 +591,11 @@ class CollaborativeSessionController:
         final_state["analysis_evidence"]["investigation_decision"] = decision
         final_state["investigation_decision"] = decision
         self.last_successful_state = final_state
-        self.session.current_status = "awaiting_user"
+        decision_label = str(decision.get("decision") or "").strip().upper()
+        if decision_label == "CONTINUE" and self.session.queued_tasks and not self.queue_paused:
+            self.session.current_status = "active"
+        else:
+            self.session.current_status = "awaiting_user"
         self._refresh_registry()
         return self._snapshot()
 
@@ -517,15 +629,31 @@ class CollaborativeSessionController:
             return {"status": "archived", "message": "Investigation archived.", "run_next": False}
 
         if normalized in {"rename", "rename investigation"}:
-            if details:
+            if details and details.lower() not in {"rename the investigation", "rename investigation"}:
                 self.session.investigation_title = details
+            else:
+                return self._record_failure(
+                    "rename",
+                    "Rename investigation needs a new investigation title.",
+                    details=details,
+                    reason="The rename command must include the new name for the investigation.",
+                    input_needed="Provide a short new title for the investigation.",
+                )
             self._refresh_registry()
             return {"status": "updated", "message": "Investigation renamed.", "run_next": False}
 
         if normalized in {"set objective", "update objective", "objective"}:
-            if details:
+            if details and details.lower() not in {"set objective", "update objective", "objective"}:
                 self.session.objective = details
                 self.session.investigation_memory["objective"] = details
+            else:
+                return self._record_failure(
+                    "set objective",
+                    "Update objective needs the new objective text.",
+                    details=details,
+                    reason="The objective command must include the new business question or target outcome.",
+                    input_needed="State the new objective in one sentence.",
+                )
             self._refresh_registry()
             return {"status": "updated", "message": "Objective updated.", "run_next": False}
 
@@ -570,10 +698,33 @@ class CollaborativeSessionController:
                     self.session.decision_log.append({"action": "resume previous investigation", "details": details})
                     self._refresh_registry()
                     return {"status": "completed", "message": f"Resumed investigation {details}.", "run_next": False}
+                resumed, available = self._resume_best_available_investigation()
+                if resumed:
+                    return {"status": "completed", "message": f"Resumed investigation {available}.", "run_next": False}
+                if available:
+                    return self._record_failure(
+                        "resume previous investigation",
+                        "Resume previous investigation needs a specific investigation id.",
+                        details=details,
+                        reason=f"Multiple investigations are available: {available}. Please name the one to resume.",
+                        input_needed=f"Choose one of: {available}.",
+                    )
             elif task_ids and self.resume_previous_investigation(task_ids[0]):
                 self.session.decision_log.append({"action": "resume previous investigation", "details": task_ids[0]})
                 self._refresh_registry()
                 return {"status": "completed", "message": f"Resumed investigation {task_ids[0]}.", "run_next": False}
+            elif not details:
+                resumed, available = self._resume_best_available_investigation()
+                if resumed:
+                    return {"status": "completed", "message": f"Resumed investigation {available}.", "run_next": False}
+                if available:
+                    return self._record_failure(
+                        "resume previous investigation",
+                        "Resume previous investigation needs a specific investigation id.",
+                        details=details,
+                        reason=f"Multiple investigations are available: {available}. Please name the one to resume.",
+                        input_needed=f"Choose one of: {available}.",
+                    )
             return self._record_failure(
                 "resume previous investigation",
                 "Could not find a previous investigation to resume.",
@@ -583,6 +734,9 @@ class CollaborativeSessionController:
 
         if normalized in {"new investigation", "new", "new task"}:
             request = details or (self.session.ai_suggestions[0]["request"] if self.session.ai_suggestions else self.question)
+            gate_failure = self._gate_task_request("new investigation", request, details=details)
+            if gate_failure:
+                return gate_failure
             title = _title_from_description(details or request, "New investigation")
             self.manager.enqueue_request(request=request, title=title, metadata={"source_action": "new investigation"})
             self.session.current_status = "active"
@@ -591,6 +745,9 @@ class CollaborativeSessionController:
         if normalized in {"refine task", "refine"}:
             task_id, request = self._parse_refine_details(details)
             if task_id and request and task_id in self.session.tasks:
+                gate_failure = self._gate_task_request("refine task", request, details=details)
+                if gate_failure:
+                    return gate_failure
                 refined = self.manager.refine_task(task_id, request, metadata={"source_action": "refine task"})
                 self.session.current_status = "active"
                 self.session.decision_log[-1]["created_task_id"] = refined.task_id
@@ -643,8 +800,11 @@ class CollaborativeSessionController:
                     reason=f"Ambiguous reference detected. Please name which active finding to challenge. Current active findings include: {options}.",
                     input_needed=f"Specify which finding to challenge, for example one of: {options}.",
                 )
-            challenge_text = details or self.session.investigation_memory.get("current_understanding") or self.question
+            challenge_text = details or _best_answer_text(self.session.investigation_memory, self.question)
             request = f"Challenge the leading conclusion for: {challenge_text}"
+            gate_failure = self._gate_task_request("challenge finding", request, details=details)
+            if gate_failure:
+                return gate_failure
             self.manager.enqueue_request(
                 request=request,
                 title=_title_from_description(challenge_text, "Challenge finding"),
@@ -663,8 +823,12 @@ class CollaborativeSessionController:
                         details=details,
                         reason="The recommendation list has converged, so the next step is to consolidate or finish the investigation.",
                     )
+                suggestion_request = str(suggestion.get("request") or self.question)
+                gate_failure = self._gate_task_request("accept ai suggestion", suggestion_request, details=details or str(suggestion.get("title") or ""))
+                if gate_failure:
+                    return gate_failure
                 self.manager.enqueue_request(
-                    request=str(suggestion.get("request") or self.question),
+                    request=suggestion_request,
                     title=str(suggestion.get("title") or "Accepted AI suggestion"),
                     dependencies=suggestion.get("depends_on") or [],
                     metadata={"source_action": "accept ai suggestion", "suggestion": suggestion.get("title")},
@@ -679,15 +843,26 @@ class CollaborativeSessionController:
             )
 
         if normalized in {"queue", "enqueue"} and details:
+            gate_failure = self._gate_task_request("queue", details, details=details)
+            if gate_failure:
+                return gate_failure
             self.manager.enqueue_request(request=details, title=_title_from_description(details, "Queued investigation"))
             self.session.current_status = "active"
             self._refresh_registry()
             return {"status": "queued", "message": "Queued investigation.", "run_next": False}
 
         if normalized in {"queue three investigations"}:
-            for suffix in ("1", "2", "3"):
+            requests = [f"{self.question} - queued investigation {suffix}" for suffix in ("1", "2", "3")]
+            failures: list[Dict[str, Any]] = []
+            for request in requests:
+                gate_failure = self._gate_task_request("queue three investigations", request, details=request)
+                if gate_failure:
+                    failures.append(gate_failure)
+            if failures:
+                return failures[0]
+            for suffix, request in zip(("1", "2", "3"), requests):
                 self.manager.enqueue_request(
-                    request=f"{self.question} - queued investigation {suffix}",
+                    request=request,
                     title=f"Queued investigation {suffix}",
                     metadata={"source_action": "queue three investigations"},
                 )
@@ -807,9 +982,29 @@ class CollaborativeSessionController:
         self.queue_paused = other.queue_paused
         return True
 
+    def _resume_best_available_investigation(self) -> tuple[bool, str]:
+        candidates = [
+            item
+            for item in self.list_active_investigations()
+            if item.get("investigation_id") != self.session.investigation_id
+        ]
+        if len(candidates) == 1:
+            investigation_id = str(candidates[0].get("investigation_id") or "").strip()
+            if investigation_id and self.resume_previous_investigation(investigation_id):
+                self.session.decision_log.append({"action": "resume previous investigation", "details": investigation_id})
+                self._refresh_registry()
+                return True, investigation_id
+        if candidates:
+            available = ", ".join(
+                f"{item.get('investigation_id')} ({item.get('title') or item.get('objective') or 'untitled'})"
+                for item in candidates[:5]
+            )
+            return False, available
+        return False, ""
+
     def summarize_progress(self) -> str:
         checkpoints = self.session.checkpoint_summaries
-        current_understanding = self.session.investigation_memory.get("current_understanding") or "The investigation is still inconclusive."
+        current_understanding = _best_answer_text(self.session.investigation_memory, "The investigation is still inconclusive.")
         question_text = humanize_text(self.question, dataframe=self.base_state.get("dataframe"))
         current_focus = "No checkpoint has been completed yet."
         remaining_gap = "The next task should reduce uncertainty around the original question."
@@ -830,7 +1025,7 @@ class CollaborativeSessionController:
             f"Queued tasks: {len(self.session.queued_tasks)}",
             f"Evidence items: {len(self.session.evidence_store)}",
             f"Hypotheses: {len(self.session.hypotheses)}",
-            f"Current understanding: {self.session.investigation_memory.get('current_understanding') or 'None yet'}",
+            f"Current understanding: {_best_answer_text(self.session.investigation_memory, 'None yet')}",
         ]
         if checkpoints:
             latest = checkpoints[-1]
@@ -867,7 +1062,7 @@ class CollaborativeSessionController:
             f"Datasets used: {memory.get('datasets_used') or [self.session.investigation_memory.get('dataset_path') or self.base_state.get('dataset_path')] }",
             f"Cleaning version: {memory.get('cleaning_version') or 'unknown'}",
             f"Pending tasks: {self.session.queued_tasks or []}",
-            f"Earlier conclusion: {memory.get('current_understanding') or 'None yet'}",
+            f"Earlier conclusion: {_best_answer_text(memory, 'None yet')}",
         ]
         return "\n".join(lines)
 
@@ -986,8 +1181,17 @@ class CollaborativeSessionController:
                 for item in investigations
             ))
 
-        if "resume previous investigation" in query:
-            return self._with_explainer("Use resume_previous_investigation(investigation_id) to attach a prior investigation into the current controller.")
+        if "resume previous investigation" in query or "resume a previous investigation" in query or "continue from where we stopped" in query:
+            investigations = self.list_active_investigations()
+            if investigations:
+                return self._with_explainer(
+                    "Resume a previous investigation by naming one of the active investigation ids: "
+                    + ", ".join(item["investigation_id"] for item in investigations[:5])
+                    + "."
+                )
+            return self._with_explainer(
+                self.summarize_memory()
+            )
 
         if "what is the objective" in query or query.startswith("objective"):
             return self._with_explainer(f"Objective: {self.session.objective or self.question}")
@@ -996,16 +1200,16 @@ class CollaborativeSessionController:
             return self._with_explainer(self.summarize_everything_discovered())
 
         if "what should we investigate next" in query or "recommend the next analytical task" in query:
-            return self._with_explainer(self._query_planning())
+            return self._query_planning()
 
         if "what are the highest priority investigations" in query:
-            return self._with_explainer(self._query_planning())
+            return self._query_planning()
 
         if "what questions remain unanswered" in query or "what information is still missing" in query:
-            return self._with_explainer(self._query_planning())
+            return self._query_planning()
 
-        if "which investigation would provide the greatest business value" in query:
-            return self._with_explainer(self._query_planning())
+        if "which investigation would provide the greatest business value" in query or "suggest alternative investigation paths" in query or "suggest three new analyses" in query:
+            return self._query_planning()
 
         if "show queued tasks" in query:
             return self._with_explainer("\n".join(
@@ -1035,14 +1239,11 @@ class CollaborativeSessionController:
         if "what have we already analyzed" in query or "continue from where we stopped" in query:
             return self._with_explainer(self.summarize_memory())
 
-        if "which variables have already been tested" in query or "which models have already been built" in query:
+        if "which variables have already been tested" in query or "which models have already been built" in query or "what cleaning version are we using" in query or "which datasets have already been used" in query or "which tasks are still pending" in query:
             return self._with_explainer(self.summarize_memory())
 
-        if "show the strongest evidence" in query or "which evidence is statistically significant" in query:
-            return self._with_explainer(self._query_evidence())
-
-        if "which findings support this conclusion" in query or "which findings contradict it" in query:
-            return self._with_explainer(self._query_evidence())
+        if "show the strongest evidence" in query or "which evidence is statistically significant" in query or "show weak evidence" in query or "which findings support this conclusion" in query or "which findings contradict it" in query or "which evidence has the highest confidence" in query or "which evidence depends on another task" in query or "which evidence is still provisional" in query:
+            return self._query_evidence()
 
         if "compare" in query and ("task" in query or "version" in query or "model" in query or "region" in query):
             comparisons = self.session.task_comparisons or []
@@ -1055,16 +1256,16 @@ class CollaborativeSessionController:
                 )
             return self._with_explainer("\n".join(lines))
 
-        if "show all current hypotheses" in query or "which hypotheses are supported" in query or "which hypotheses remain inconclusive" in query:
+        if "show all current hypotheses" in query or "which hypotheses are supported" in query or "which hypotheses remain inconclusive" in query or "which hypotheses have been rejected" in query or "rank the hypotheses by confidence" in query or "merge similar hypotheses" in query or "remove a hypothesis" in query or "create a new hypothesis" in query:
             return self._query_hypotheses()
 
-        if "what did we conclude earlier" in query or "generate the current narrative" in query or "what is the current business story" in query:
+        if "what did we conclude earlier" in query or "generate the current narrative" in query or "what is the current business story" in query or "update our current understanding" in query or "has our understanding changed" in query or "which new findings changed our conclusions" in query or "which earlier conclusions remain valid" in query or "which conclusions became stronger" in query or "which conclusions became weaker" in query:
             return self._with_explainer(self.summarize_progress())
 
-        if "summarize every successful task" in query or "show the complete investigation history" in query:
+        if "summarize every successful task" in query or "show the complete investigation history" in query or "generate the executive investigation report" in query or "explain how the final conclusions were reached" in query or "show the evidence trail behind every recommendation" in query:
             return self._with_explainer(self.summarize_history())
 
-        if "show the evidence trail" in query or "show the evidence trail behind every recommendation" in query:
+        if "show the evidence trail" in query:
             return self._query_evidence()
 
         if "evidence generated by task" in query or "show evidence generated by" in query:
@@ -1120,7 +1321,7 @@ class CollaborativeSessionController:
                 f"Investigation ID: {self.session.investigation_id}",
                 f"Original question: {self.session.original_question}",
                 f"Completed tasks: {', '.join(self.session.completed_tasks) if self.session.completed_tasks else 'None'}",
-                f"Current understanding: {self.session.investigation_memory.get('current_understanding') or 'None'}",
+                f"Current understanding: {_best_answer_text(self.session.investigation_memory, 'None')}",
                 "Task findings:",
             ]
             for task_id in self.session.completed_tasks:
@@ -1166,6 +1367,10 @@ def run_interactive_collaborative_session(
     """
     prompt = input_fn or input
     printer = print_fn or print
+    auto_advance_setting = os.getenv("COLLABORATIVE_AUTO_ADVANCE", "").strip().lower()
+    # Default to advancing through ordinary CONTINUE decisions so the loop only pauses
+    # when the decision layer genuinely needs human guidance.
+    auto_advance = auto_advance_setting not in {"0", "false", "no", "off"}
     controller = CollaborativeSessionController.create(
         question=question,
         dataset_path=dataset_path,
@@ -1183,6 +1388,77 @@ def run_interactive_collaborative_session(
         return prompt(message)
 
     result = controller.process_next_task()
+
+    def _current_decision() -> str:
+        decision = controller.session.investigation_memory.get("investigation_decision") or {}
+        return str(decision.get("decision") or "").strip().upper()
+
+    def _should_auto_continue() -> bool:
+        if controller.finished or controller.queue_paused:
+            return False
+        if not controller.session.queued_tasks:
+            return False
+        return _current_decision() == "CONTINUE"
+
+    def _drain_continuing_tasks() -> None:
+        nonlocal result
+        while _should_auto_continue():
+            result = controller.process_next_task()
+            last_failure = controller.session.investigation_memory.get("last_failure") or {}
+            if last_failure.get("action") == "execute task":
+                task_id = last_failure.get("task_id") or "unknown task"
+                failure_message = last_failure.get("message") or last_failure.get("reason") or "Task execution failed."
+                result = controller._snapshot()
+                printer(f"\nTask {task_id} failed: {failure_message}")
+                break
+
+    def _advance_until_user_needed() -> bool:
+        """
+        Keep moving while the decision layer says CONTINUE.
+
+        Returns True when the workflow finished or finalized autonomously.
+        Returns False when the loop should hand control back for a user action.
+        """
+        nonlocal result
+        progressed = False
+
+        while not controller.finished and _current_decision() == "CONTINUE":
+            if controller.session.queued_tasks:
+                _drain_continuing_tasks()
+                progressed = True
+                if controller.finished:
+                    return True
+                continue
+
+            ranked_suggestions = controller._rank_suggestions(controller.session.ai_suggestions or [])
+            if ranked_suggestions:
+                top_suggestion = ranked_suggestions[0]
+                printer(
+                    "\nDecision layer says continue, so the workflow is automatically taking the strongest next suggestion: "
+                    f"{top_suggestion.get('title') or top_suggestion.get('request') or 'Next investigation'}."
+                )
+                action_result, finished = _execute_action("accept ai suggestion", "")
+                progressed = True
+                if finished:
+                    return True
+                if action_result.get("status") == "failed":
+                    final_result = controller.finalize()
+                    printer("\n===== FINAL REPORT =====")
+                    printer(final_result.final_state.get("final_report", "No report generated"))
+                    result = final_result
+                    return True
+                continue
+
+            printer(
+                "\nThe decision layer still indicates continuation, but no distinct follow-up remains available. Finalizing the investigation to avoid an unnecessary pause."
+            )
+            final_result = controller.finalize()
+            printer("\n===== FINAL REPORT =====")
+            printer(final_result.final_state.get("final_report", "No report generated"))
+            result = final_result
+            return True
+
+        return progressed
 
     def _show_failure(action_name: str, action_result: Dict[str, Any]) -> str:
         failure = action_result.get("failure") or controller.session.investigation_memory.get("last_failure") or {}
@@ -1224,18 +1500,7 @@ def run_interactive_collaborative_session(
                 result = controller._snapshot()
             else:
                 result = controller.process_next_task()
-                last_failure = controller.session.investigation_memory.get("last_failure") or {}
-                if last_failure.get("action") == "execute task":
-                    task_id = last_failure.get("task_id") or "unknown task"
-                    failure_message = last_failure.get("message") or last_failure.get("reason") or "Task execution failed."
-                    return {
-                        "status": "failed",
-                        "message": f"{task_id} failed: {failure_message}",
-                        "run_next": False,
-                        "failure": last_failure,
-                    }, False
-        else:
-            result = controller._snapshot()
+                _drain_continuing_tasks()
 
         return action_result, False
 
@@ -1262,6 +1527,13 @@ def run_interactive_collaborative_session(
             printer("\n===== FINAL REPORT =====")
             printer(final_result.final_state.get("final_report", "No report generated"))
             return final_result
+
+        if _advance_until_user_needed():
+            return result
+
+        if _current_decision() == "ASK_USER":
+            printer("\n===== ASK_USER HANDOFF =====")
+            printer(render_collaborative_handoff_view(controller.session.to_dict(), dataframe=controller.base_state.get("dataframe")))
 
         selection = ask(
             "\nChoose an action (1-6) or ask a capability question:\n> "
@@ -1322,7 +1594,7 @@ def run_interactive_collaborative_session(
             printer(controller.respond_to_query(selection))
             continue
 
-        if inferred_action in {"new investigation", "refine task", "compare results", "challenge finding"}:
+        if inferred_action in {"new investigation", "refine task", "compare results", "challenge finding", "queue three investigations", "queue", "reorder queue", "resume previous investigation"}:
             action_result, finished = _execute_action(inferred_action, inferred_details)
             if finished:
                 return result
