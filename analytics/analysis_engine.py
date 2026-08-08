@@ -6,7 +6,7 @@ import math
 import warnings
 import pandas as pd
 
-from inferential_engine import run_inferential_analysis
+from analytics.inferential_engine import run_inferential_analysis
 from predictive.predictive_engine import run_predictive_analysis
 from prescriptive.prescriptive_engine import run_prescriptive_analysis
 from tools.anova_tool import anova_tool

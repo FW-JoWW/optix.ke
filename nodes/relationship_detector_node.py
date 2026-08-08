@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from relationship_detector import detect_relationships
+from analytics.relationship_detector import detect_relationships
 from state.state import AnalystState
 
 

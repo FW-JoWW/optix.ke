@@ -4,7 +4,7 @@ from typing import Any, Dict
 
 import pandas as pd
 
-from data_profiling import profile_dataset
+from analytics.data_profiling import profile_dataset
 
 
 def validate_cleaning(

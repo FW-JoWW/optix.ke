@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
-from insight_generation import generate_insights
+from core.insight_generation import generate_insights
 from state.state import AnalystState
 from utils.openai_runtime import get_openai_client
 

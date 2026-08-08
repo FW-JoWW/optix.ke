@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Dict, Iterable, List, Sequence
 
 from .confidence_diagnostics import (
@@ -10,6 +12,7 @@ from .confidence_diagnostics import (
     render_investigation_decision_report,
 )
 from .narration import humanize_text, suggestion_impact_percent, format_suggestion_line
+from utils.openai_runtime import get_openai_client
 
 
 def _normalize_text(value: Any) -> str:
@@ -18,6 +21,37 @@ def _normalize_text(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     return str(value).strip()
+
+
+def _unique_lines(lines: Sequence[Any]) -> List[str]:
+    seen: set[str] = set()
+    unique: List[str] = []
+    for line in lines:
+        text = _normalize_text(line)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(text)
+    return unique
+
+
+def _question_relevant_lines(question: str, lines: Sequence[Any]) -> List[str]:
+    question_terms = _tokens(question)
+    if not question_terms:
+        return _unique_lines(lines)
+    relevant: List[str] = []
+    for line in _unique_lines(lines):
+        line_terms = _tokens(line)
+        if line_terms & question_terms:
+            relevant.append(line)
+            continue
+        lowered = line.lower()
+        if lowered.startswith(("no ", "the evidence", "the analysis", "the answer", "if yes", "if partial", "if no")):
+            relevant.append(line)
+    return relevant
 
 
 def _tokens(value: Any) -> set[str]:
@@ -40,6 +74,17 @@ def _overlap_score(*values: Any) -> int:
     for value in values[1:]:
         overlap |= _tokens(value)
     return len(base & overlap)
+
+
+def _numeric_tokens(value: Any) -> set[str]:
+    return set(re.findall(r"-?\d+(?:\.\d+)?", _normalize_text(value)))
+
+
+def _collect_numeric_tokens(*values: Any) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        tokens |= _numeric_tokens(value)
+    return tokens
 
 
 def _confidence_label(value: Any) -> str:
@@ -223,6 +268,284 @@ def _confidence_bundle(
         "business": {"score": business_score, "label": _confidence_label(business_score)},
         "recommendation": {"score": recommendation_score, "label": _confidence_label(recommendation_score)},
     }
+
+
+def _build_semantic_answer_prompt(
+    *,
+    business_question: str,
+    deterministic_answer: str,
+    answer_status: str,
+    evidence_items: Sequence[Dict[str, Any]],
+    missing_evidence: Sequence[str],
+    confidence_bundle: Dict[str, Any],
+    current_understanding: str,
+    business_interpretation: str,
+) -> str:
+    evidence_lines = []
+    for item in list(evidence_items)[:8]:
+        source = _normalize_text(item.get("source") or item.get("type") or "evidence")
+        text = _normalize_text(item.get("text") or "")
+        confidence = _normalize_text(item.get("confidence") or "unknown")
+        if text:
+            evidence_lines.append(f"- {source} | confidence={confidence} | {text}")
+
+    missing_lines = [f"- {line}" for line in list(missing_evidence)[:5] if _normalize_text(line)]
+    return f"""
+You are a senior data analyst converting evidence into an answer to the user's question.
+You must answer the question using only the evidence below.
+Do not invent numbers, categories, causes, or business context.
+If the evidence does not directly answer the question, say so plainly and explain what evidence is missing.
+If the evidence is only a proxy, explain why it is a proxy and not the exact answer.
+If the evidence is enough, state the answer directly and briefly explain why.
+
+Business question:
+{business_question}
+
+Deterministic answer candidate:
+{deterministic_answer}
+
+Deterministic answer status:
+{answer_status}
+
+Current understanding:
+{current_understanding}
+
+Current business interpretation:
+{business_interpretation}
+
+Confidence bundle:
+{json.dumps(confidence_bundle, ensure_ascii=True, indent=2)}
+
+Evidence items:
+{chr(10).join(evidence_lines) if evidence_lines else "- None"}
+
+Known missing evidence:
+{chr(10).join(missing_lines) if missing_lines else "- None"}
+
+Return JSON only in exactly this shape:
+{{
+  "answer_status": "direct | partial | insufficient",
+  "direct_answer": "concise business answer or a statement that the question cannot yet be answered",
+  "business_interpretation": "why the evidence does or does not answer the question",
+  "supporting_evidence_summary": ["short evidence-based bullets"],
+  "observed_facts": ["short fact-based bullets"],
+  "analytical_interpretation": ["short interpretation bullets"],
+  "key_assumptions": ["assumptions or missing information"],
+  "remaining_uncertainty": ["what still blocks a final answer"],
+  "recommended_next_investigation": ["the most useful next step"],
+  "reasoning": "short explanation of how the evidence maps to the question"
+}}
+""".strip()
+
+
+def _validate_semantic_answer_payload(payload: Dict[str, Any], allowed_numbers: set[str]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    required_keys = {
+        "answer_status",
+        "direct_answer",
+        "business_interpretation",
+        "supporting_evidence_summary",
+        "observed_facts",
+        "analytical_interpretation",
+        "key_assumptions",
+        "remaining_uncertainty",
+        "recommended_next_investigation",
+        "reasoning",
+    }
+    if not required_keys.issubset(payload.keys()):
+        return False
+
+    if str(payload.get("answer_status", "")).lower() not in {"direct", "partial", "insufficient"}:
+        return False
+
+    for field in (
+        "direct_answer",
+        "business_interpretation",
+        "reasoning",
+    ):
+        text = _normalize_text(payload.get(field))
+        if not text:
+            return False
+        if allowed_numbers:
+            for token in _numeric_tokens(text):
+                if token not in allowed_numbers:
+                    return False
+
+    for field in (
+        "supporting_evidence_summary",
+        "observed_facts",
+        "analytical_interpretation",
+        "key_assumptions",
+        "remaining_uncertainty",
+        "recommended_next_investigation",
+    ):
+        value = payload.get(field)
+        if not isinstance(value, list):
+            return False
+        for item in value:
+            if not _normalize_text(item):
+                return False
+            if allowed_numbers:
+                for token in _numeric_tokens(item):
+                    if token not in allowed_numbers:
+                        return False
+
+    return True
+
+
+def _parse_json_object(text: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _semantic_answer_fallback(
+    *,
+    business_question: str,
+    deterministic_answer: str,
+    answer_status: str,
+    evidence_items: Sequence[Dict[str, Any]],
+    missing_evidence: Sequence[str],
+    confidence_bundle: Dict[str, Any],
+    current_understanding: str,
+    business_interpretation: str,
+) -> Dict[str, Any]:
+    if answer_status == "partial":
+        business_answer = (
+            f"The best available answer is {deterministic_answer}."
+            if deterministic_answer
+            else "The answer is still provisional."
+        )
+    else:
+        business_answer = (
+            f"The current evidence does not yet answer {humanize_text(business_question)}."
+            if business_question
+            else "The current evidence does not yet support a direct answer."
+        )
+    return {
+        "answer_status": answer_status if answer_status in {"direct", "partial", "insufficient"} else "partial",
+        "direct_answer": business_answer,
+        "business_interpretation": business_interpretation,
+        "supporting_evidence_summary": [
+            f"Direct evidence: {item['text']}" for item in list(evidence_items)[:3] if _normalize_text(item.get("text"))
+        ] or ["No direct evidence has yet been captured for the original business question."],
+        "observed_facts": [
+            _normalize_text(item.get("text")) for item in list(evidence_items)[:3] if _normalize_text(item.get("text"))
+        ] or ["No observed fact directly resolves the question yet."],
+        "analytical_interpretation": [
+            "The evidence base is still being translated into a direct answer for the business question."
+        ],
+        "key_assumptions": list(missing_evidence[:4]) or ["No direct evidence has yet been captured for the original business question."],
+        "remaining_uncertainty": list(missing_evidence[:4]) or ["No direct evidence has yet been captured for the original business question."],
+        "recommended_next_investigation": [
+            "Collect evidence that directly measures the business concept named in the question."
+        ],
+        "reasoning": (
+            f"The evidence suggests {current_understanding} but the business interpretation still does not directly answer the question."
+        ),
+    }
+
+
+def _semantic_synthesize_answer(
+    *,
+    business_question: str,
+    deterministic_answer: str,
+    answer_status: str,
+    evidence_items: Sequence[Dict[str, Any]],
+    missing_evidence: Sequence[str],
+    confidence_bundle: Dict[str, Any],
+    current_understanding: str,
+    business_interpretation: str,
+) -> tuple[Dict[str, Any], str]:
+    client = get_openai_client()
+    if client is None:
+        return (
+            _semantic_answer_fallback(
+                business_question=business_question,
+                deterministic_answer=deterministic_answer,
+                answer_status=answer_status,
+                evidence_items=evidence_items,
+                missing_evidence=missing_evidence,
+                confidence_bundle=confidence_bundle,
+                current_understanding=current_understanding,
+                business_interpretation=business_interpretation,
+            ),
+            "deterministic_fallback",
+        )
+
+    prompt = _build_semantic_answer_prompt(
+        business_question=business_question,
+        deterministic_answer=deterministic_answer,
+        answer_status=answer_status,
+        evidence_items=evidence_items,
+        missing_evidence=missing_evidence,
+        confidence_bundle=confidence_bundle,
+        current_understanding=current_understanding,
+        business_interpretation=business_interpretation,
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        content = (response.choices[0].message.content or "").strip()
+        parsed = _parse_json_object(content)
+    except Exception:
+        return (
+            _semantic_answer_fallback(
+                business_question=business_question,
+                deterministic_answer=deterministic_answer,
+                answer_status=answer_status,
+                evidence_items=evidence_items,
+                missing_evidence=missing_evidence,
+                confidence_bundle=confidence_bundle,
+                current_understanding=current_understanding,
+                business_interpretation=business_interpretation,
+            ),
+            "deterministic_fallback",
+        )
+
+    allowed_numbers = _collect_numeric_tokens(
+        business_question,
+        deterministic_answer,
+        current_understanding,
+        business_interpretation,
+        missing_evidence,
+        " ".join(_normalize_text(item.get("text")) for item in evidence_items),
+    )
+    if not _validate_semantic_answer_payload(parsed, allowed_numbers):
+        return (
+            _semantic_answer_fallback(
+                business_question=business_question,
+                deterministic_answer=deterministic_answer,
+                answer_status=answer_status,
+                evidence_items=evidence_items,
+                missing_evidence=missing_evidence,
+                confidence_bundle=confidence_bundle,
+                current_understanding=current_understanding,
+                business_interpretation=business_interpretation,
+            ),
+            "validation_fallback",
+        )
+
+    return parsed, "live_llm"
 
 
 def synthesize_answer(
@@ -428,6 +751,64 @@ def synthesize_answer(
         "remaining_uncertainty": remaining_uncertainty[:4],
         "recommended_next_investigation": recommended_next[:3],
     }
+
+    semantic_reasoning_status = "deterministic_only"
+    semantic_answer = None
+    needs_semantic_synthesis = sufficiency_status != "yes" or directness < 2 or answer_position != "direct"
+    if needs_semantic_synthesis:
+        semantic_answer, semantic_reasoning_status = _semantic_synthesize_answer(
+            business_question=business_question,
+            deterministic_answer=direct_answer_core,
+            answer_status=sufficiency_status,
+            evidence_items=evidence_items,
+            missing_evidence=missing_evidence,
+            confidence_bundle=confidence_bundle,
+            current_understanding=current_text,
+            business_interpretation=business_interpretation,
+        )
+        if semantic_answer:
+            semantic_status = _normalize_text(semantic_answer.get("answer_status") or sufficiency_status).lower()
+            if semantic_status in {"direct", "partial", "insufficient"}:
+                answer_position = {
+                    "direct": "direct",
+                    "partial": "closest_defensible",
+                    "insufficient": "needs_more_evidence",
+                }[semantic_status]
+            direct_answer = _normalize_text(semantic_answer.get("direct_answer") or direct_answer)
+            business_interpretation = _normalize_text(semantic_answer.get("business_interpretation") or business_interpretation)
+            supporting_evidence_summary = _unique_lines(semantic_answer.get("supporting_evidence_summary") or supporting_evidence_summary)
+            facts = _unique_lines(semantic_answer.get("observed_facts") or facts)
+            analytical_interpretation = _unique_lines(semantic_answer.get("analytical_interpretation") or analytical_interpretation)
+            missing_evidence_override = _unique_lines(semantic_answer.get("key_assumptions") or [])
+            if missing_evidence_override:
+                missing_evidence = missing_evidence_override
+            remaining_uncertainty_override = _unique_lines(semantic_answer.get("remaining_uncertainty") or [])
+            if remaining_uncertainty_override:
+                remaining_uncertainty = remaining_uncertainty_override
+            recommended_override = _unique_lines(semantic_answer.get("recommended_next_investigation") or [])
+            if recommended_override:
+                recommended_next = recommended_override[:3]
+            semantic_reasoning = _normalize_text(semantic_answer.get("reasoning") or "")
+        else:
+            semantic_reasoning = ""
+    else:
+        semantic_reasoning = ""
+
+    answer_payload.update(
+        {
+            "answer_position": answer_position,
+            "direct_answer": direct_answer,
+            "business_interpretation": business_interpretation,
+            "reasoning": semantic_reasoning if needs_semantic_synthesis else "",
+            "key_assumptions": missing_evidence[:4] if sufficiency_status != "yes" else [
+                "The answer remains contingent on the current evidence base staying stable.",
+            ],
+            "remaining_uncertainty": remaining_uncertainty[:4],
+            "recommended_next_investigation": recommended_next[:3],
+            "semantic_reasoning_status": semantic_reasoning_status,
+        }
+    )
+
     decision_bundle = build_investigation_decision_bundle(
         business_question=business_question,
         evidence=evidence,
@@ -470,6 +851,8 @@ def synthesize_answer(
         "confidence_diagnostics_sections": diagnostics_sections,
         "investigation_decision": decision,
         "investigation_decision_sections": decision_sections,
+        "semantic_reasoning_status": semantic_reasoning_status,
+        "semantic_reasoning": semantic_reasoning if needs_semantic_synthesis else "",
     }
 
 
@@ -477,6 +860,7 @@ def build_answer_synthesis_sections(answer: Dict[str, Any]) -> Dict[str, List[st
     if not answer:
         return {}
 
+    question = _normalize_text(answer.get("business_question"))
     sufficiency = answer.get("confidence") or {}
     status = _normalize_text(sufficiency.get("status") or "").lower()
     status_line = {
@@ -509,13 +893,14 @@ def build_answer_synthesis_sections(answer: Dict[str, Any]) -> Dict[str, List[st
                 )
             ),
         ],
-        "Supporting Evidence Summary": list(answer.get("supporting_evidence_summary") or []),
-        "Observed Facts": list(answer.get("observed_facts") or []),
-        "Analytical Interpretation": list(answer.get("analytical_interpretation") or []),
-        "Business Interpretation": [answer.get("business_interpretation")] if answer.get("business_interpretation") else [],
-        "Key Assumptions": list(answer.get("key_assumptions") or []),
-        "Remaining Uncertainty": list(answer.get("remaining_uncertainty") or []),
-        "Recommended Next Investigation": list(answer.get("recommended_next_investigation") or []),
+        "Supporting Evidence Summary": _question_relevant_lines(question, answer.get("supporting_evidence_summary") or []),
+        "Observed Facts": _question_relevant_lines(question, answer.get("observed_facts") or []),
+        "Analytical Interpretation": _question_relevant_lines(question, answer.get("analytical_interpretation") or []),
+        "Business Interpretation": _unique_lines([answer.get("business_interpretation")] if answer.get("business_interpretation") else []),
+        "Semantic Interpretation": _unique_lines([answer.get("semantic_reasoning")] if answer.get("semantic_reasoning") else []),
+        "Key Assumptions": _unique_lines(answer.get("key_assumptions") or []),
+        "Remaining Uncertainty": _unique_lines(answer.get("remaining_uncertainty") or []),
+        "Recommended Next Investigation": _unique_lines(answer.get("recommended_next_investigation") or []),
     }
     diagnostics = answer.get("confidence_diagnostics") or {}
     diagnostics_sections = answer.get("confidence_diagnostics_sections") or {}

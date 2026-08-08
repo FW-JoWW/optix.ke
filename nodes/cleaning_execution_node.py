@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from cleaning_executor import execute_cleaning_actions
+from normalization.cleaning_executor import execute_cleaning_actions
 from state.state import AnalystState
 
 

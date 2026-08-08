@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 from collaborative_mode.models import CollaborativeTask, EvidenceRecord, InvestigationSession
@@ -249,7 +250,62 @@ def test_answer_synthesis_reports_missing_evidence_when_sparse() -> None:
     assert synthesis["confidence"]["status"] == "no"
     assert synthesis["remaining_uncertainty"]
     assert synthesis["evidence_breakdown"]["missing"]
-    assert "no direct evidence" in " ".join(synthesis["evidence_breakdown"]["missing"]).lower()
+    missing_text = " ".join(synthesis["evidence_breakdown"]["missing"]).lower()
+    assert missing_text
+    assert "revenue and profit by region" in missing_text or "direct evidence" in missing_text
+
+
+def test_answer_synthesis_uses_llm_semantic_fallback_when_deterministic_answer_is_indirect(monkeypatch) -> None:
+    class _FakeResponse:
+        def __init__(self, content: str) -> None:
+            self.choices = [type("Choice", (), {"message": type("Message", (), {"content": content})()})()]
+
+    class _FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    payload = {
+                        "answer_status": "insufficient",
+                        "direct_answer": "The current evidence does not directly provide a churn rate.",
+                        "business_interpretation": "The available evidence describes inactivity gaps, which is related but not the same as churn rate.",
+                        "supporting_evidence_summary": ["The evidence tracks customer inactivity and repeat gaps."],
+                        "observed_facts": ["Median customer inactivity is 223.0 days."],
+                        "analytical_interpretation": ["The evidence is directional only and does not define churn explicitly."],
+                        "key_assumptions": ["A churn definition is still missing."],
+                        "remaining_uncertainty": ["The dataset does not expose a churn rate or churn flag."],
+                        "recommended_next_investigation": ["Measure churn directly using a churn-specific field or definition."],
+                        "reasoning": "The evidence supports an inactivity pattern, but churn still needs a direct measure.",
+                    }
+                    return _FakeResponse(json.dumps(payload))
+
+    monkeypatch.setattr("collaborative_mode.answer_synthesis.get_openai_client", lambda: _FakeClient())
+
+    synthesis = synthesize_answer(
+        business_question="What is the churn rate?",
+        evidence={
+            "top_stories": [
+                {
+                    "type": "summary_numeric",
+                    "insight": "Median customer inactivity is 223.0 days; repeat gaps have a median of 29.0 days",
+                    "confidence": "moderate",
+                }
+            ],
+            "judgment_summary": {
+                "summary": "Median customer inactivity is 223.0 days; repeat gaps have a median of 29.0 days",
+                "global_confidence": 45,
+            },
+        },
+        hypotheses=[],
+        current_understanding="Median customer inactivity is 223.0 days; repeat gaps have a median of 29.0 days",
+        confidence=45,
+        knowledge_gaps=["Need direct evidence that speaks to churn rate."],
+        investigation_memory={},
+    )
+
+    assert synthesis["semantic_reasoning_status"] == "live_llm"
+    assert "does not directly provide a churn rate" in synthesis["direct_answer"].lower()
+    assert "churn-specific field" in " ".join(synthesis["recommended_next_investigation"]).lower()
 
 
 def test_answer_synthesis_includes_confidence_diagnostics_and_stop_logic() -> None:
@@ -488,6 +544,79 @@ def test_investigation_decision_asks_user_in_collaborative_mode_when_benefit_is_
 
     assert decision["decision"] == "ASK_USER"
     assert decision["question_for_user"]
+
+
+def test_investigation_decision_asks_user_in_collaborative_mode_when_answer_is_still_partial() -> None:
+    decision = evaluate_investigation_decision(
+        business_question="Why is churn rising?",
+        evidence={},
+        answer={
+            "answer_position": "closest_defensible",
+            "evidence_breakdown": {
+                "direct": [1],
+                "indirect": [1],
+                "supporting": [1],
+                "conflicting": [],
+            },
+        },
+        diagnostics={
+            "confidence": {
+                "overall": {"score": 62},
+                "question_coverage": {"score": 58},
+                "evidence_quality": {"score": 60},
+                "alternative_explanation": {"score": 57},
+                "business_interpretation": {"score": 59},
+                "recommendation": {"score": 58},
+            },
+            "evidence_sufficiency": {"diminishing_returns": False, "would_more_analysis_help": True},
+            "uncertainty_sources": [
+                {"source": "Need a clearer business interpretation", "severity": "medium", "reducible": True, "reason": "The evidence still needs analyst judgment to become decision-ready."},
+            ],
+            "fastest_path_to_strengthen_confidence": {"reducible": True, "expected_confidence_gain": 18, "action": "Review the evidence with the analyst"},
+        },
+        collaborative_mode=True,
+    )
+
+    assert decision["decision"] == "ASK_USER"
+    assert "direct answer" in " ".join(decision["reasoning"]).lower()
+
+
+def test_investigation_decision_asks_user_when_answer_text_is_still_provisional() -> None:
+    decision = evaluate_investigation_decision(
+        business_question="What is the churn rate?",
+        evidence={},
+        answer={
+            "answer_position": "direct",
+            "direct_answer": "The churn rate cannot yet be answered.",
+            "business_interpretation": "The evidence provided does not directly address the churn rate.",
+            "remaining_uncertainty": ["The answer is still indirect."],
+            "evidence_breakdown": {
+                "direct": [1],
+                "indirect": [1],
+                "supporting": [1],
+                "conflicting": [],
+            },
+        },
+        diagnostics={
+            "confidence": {
+                "overall": {"score": 64},
+                "question_coverage": {"score": 58},
+                "evidence_quality": {"score": 61},
+                "alternative_explanation": {"score": 58},
+                "business_interpretation": {"score": 59},
+                "recommendation": {"score": 57},
+            },
+            "evidence_sufficiency": {"diminishing_returns": False, "would_more_analysis_help": True},
+            "uncertainty_sources": [
+                {"source": "Indirect answer", "severity": "medium", "reducible": True, "reason": "The answer is still not direct enough for closure."},
+            ],
+            "fastest_path_to_strengthen_confidence": {"reducible": True, "expected_confidence_gain": 18, "action": "Ask the analyst whether the current proxy is acceptable"},
+        },
+        collaborative_mode=True,
+    )
+
+    assert decision["decision"] == "ASK_USER"
+    assert any("provisional" in reason.lower() or "direct answer" in reason.lower() for reason in decision["reasoning"])
 
 
 def test_investigation_decision_report_hides_internal_metrics_by_default() -> None:

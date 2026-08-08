@@ -5,7 +5,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, List
 
 from core.analytic_capability import infer_capability_signals
-from decision_models import (
+from decision.decision_models import (
     AnalysisOperation,
     AnalysisPlanModel,
     AnalysisAbstractionModel,

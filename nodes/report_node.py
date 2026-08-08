@@ -1692,7 +1692,9 @@ def report_node(state: AnalystState) -> AnalystState:
     Generates a professional report that reads like a finished workflow output.
     """
     evidence = state.setdefault("analysis_evidence", {})
-    business_question = state.get("business_question", "N/A")
+    collaborative_session = evidence.get("collaborative_session") or state.get("collaborative_session") or {}
+    collaborative_question = _normalize_text(collaborative_session.get("original_question"))
+    business_question = collaborative_question or state.get("business_question", "N/A")
     evidence["business_question"] = business_question
     llm_insights = state.get("llm_insights") or evidence.get("llm_insights") or "None"
     clarification_questions: List[str] = (
@@ -1719,19 +1721,53 @@ def report_node(state: AnalystState) -> AnalystState:
     predictive_sections = _predictive_sections(tool_results)
     selected_columns = state.get("selected_columns", []) or []
     reasoning = evidence.get("analytical_reasoning") or state.get("analytical_reasoning") or {}
+    collaborative_memory = state.get("collaborative_memory") or state.get("investigation_memory") or {}
+    collaborative_best_answer = (
+        _normalize_text((collaborative_memory.get("best_answer") or {}).get("answer"))
+        or _normalize_text(((collaborative_session.get("investigation_memory") or {}).get("best_answer") or {}).get("answer"))
+    )
     answer_synthesis = synthesize_answer(
         business_question=business_question,
         evidence=evidence,
         hypotheses=evidence.get("hypotheses") or state.get("hypotheses") or [],
-        current_understanding=(evidence.get("judgment_summary") or {}).get("summary")
+        current_understanding=collaborative_best_answer
+        or (evidence.get("judgment_summary") or {}).get("summary")
         or (evidence.get("top_stories") or [{}])[0].get("insight")
         or state.get("current_understanding")
         or business_question,
         confidence=judgment.get("global_confidence"),
         knowledge_gaps=clarification_questions,
-        investigation_memory=state.get("collaborative_memory") or state.get("investigation_memory") or {},
+        investigation_memory=collaborative_memory,
         dataframe=state.get("dataframe"),
     )
+    # Keep the executive report focused on the business question instead of branch noise.
+    question_tokens = {
+        token.strip(".,:;!?()[]{}<>\"'")
+        for token in str(business_question or "").lower().split()
+        if len(token.strip(".,:;!?()[]{}<>\"'")) >= 4
+    }
+
+    def _question_relevant_lines(lines: Any) -> List[str]:
+        if not question_tokens:
+            return [line for line in (lines or []) if isinstance(line, str) and line.strip()]
+        filtered: List[str] = []
+        for line in lines or []:
+            text = str(line or "").strip()
+            if not text:
+                continue
+            line_tokens = {
+                token.strip(".,:;!?()[]{}<>\"'")
+                for token in text.lower().split()
+                if len(token.strip(".,:;!?()[]{}<>\"'")) >= 4
+            }
+            if line_tokens & question_tokens or text.lower().startswith(("no ", "the evidence", "the analysis", "the answer", "if yes", "if partial", "if no")):
+                filtered.append(text)
+        return filtered
+
+    answer_synthesis["supporting_evidence_summary"] = _question_relevant_lines(answer_synthesis.get("supporting_evidence_summary"))
+    answer_synthesis["observed_facts"] = _question_relevant_lines(answer_synthesis.get("observed_facts"))
+    answer_synthesis["analytical_interpretation"] = _question_relevant_lines(answer_synthesis.get("analytical_interpretation"))
+    answer_synthesis["recommended_next_investigation"] = _question_relevant_lines(answer_synthesis.get("recommended_next_investigation"))
     evidence["answer_synthesis"] = answer_synthesis
     state["answer_synthesis"] = answer_synthesis
     answer_synthesis_report = render_answer_synthesis_report(answer_synthesis)

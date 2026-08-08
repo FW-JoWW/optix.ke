@@ -541,6 +541,33 @@ def _infer_risk_level(business_question: str, evidence: Dict[str, Any], answer: 
     return "medium"
 
 
+def _answer_needs_human_guidance(answer: Dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            _normalize_text(answer.get("direct_answer") or ""),
+            _normalize_text(answer.get("business_interpretation") or ""),
+            _normalize_text(answer.get("reasoning") or ""),
+            _normalize_text(answer.get("remaining_uncertainty") or ""),
+        ]
+    ).lower()
+    if not text:
+        return False
+    triggers = [
+        "cannot yet be answered",
+        "does not directly address",
+        "does not directly answer",
+        "still falls short",
+        "not yet sufficient",
+        "provisional",
+        "indirect only",
+        "still indirect",
+        "needs direct evidence",
+        "needs human guidance",
+        "not directly provide",
+    ]
+    return any(trigger in text for trigger in triggers)
+
+
 def evaluate_investigation_decision(
     *,
     business_question: str,
@@ -656,12 +683,16 @@ def evaluate_investigation_decision(
     continuing_value = max(information_gain_score, decision_impact_score, actionability_score)
     expected_gain = int(fastest.get("expected_confidence_gain", 0) or 0)
     answer_ready = str(answer.get("answer_position") or "").strip().lower() == "direct"
+    semantic_guidance_needed = _answer_needs_human_guidance(answer)
     should_stop = mandatory_pass and bool(sufficiency.get("diminishing_returns")) and int(confidence.get("overall", {}).get("score", 0) or 0) >= stop_threshold and answer_ready
     if mandatory_pass and risk_level == "high":
         should_stop = should_stop and int(confidence.get("overall", {}).get("score", 0) or 0) >= 80
     should_continue = not mandatory_pass and bool(fastest.get("reducible", False)) and expected_gain >= 15 and not should_stop
+    answer_is_not_direct = not answer_ready
     should_ask_user = collaborative_mode and not should_stop and (
-        (not mandatory_pass and not should_continue)
+        answer_is_not_direct
+        or semantic_guidance_needed
+        or (not mandatory_pass and not should_continue)
         or (mandatory_pass and bool(sufficiency.get("diminishing_returns")) and not answer_ready)
     )
     if collaborative_mode and not mandatory_pass and expected_gain < 15 and not should_stop:
@@ -701,15 +732,15 @@ def evaluate_investigation_decision(
             "The evidence base is promising, but the expected benefit of another analysis step is uncertain.",
             "Human guidance is needed to choose the most valuable next investigation path.",
         ]
-        if not answer_ready:
+        if not answer_ready or semantic_guidance_needed:
             decision_reasoning.insert(
                 0,
-                "The current evidence supports a closest-defensible answer, but it still falls short of a direct answer to the business question.",
+                "The current answer is still provisional and does not yet give a direct answer to the business question.",
             )
-        if mandatory_pass and bool(sufficiency.get("diminishing_returns")) and not answer_ready:
+        if mandatory_pass and bool(sufficiency.get("diminishing_returns")) and (not answer_ready or semantic_guidance_needed):
             decision_reasoning.insert(
-                1 if decision_reasoning and not answer_ready else 0,
-                "The analysis has reached diminishing returns, but the current evidence still does not produce a direct answer to the business question.",
+                1 if decision_reasoning else 0,
+                "The analysis has reached diminishing returns, but the current evidence still does not produce a decisive answer to the business question.",
             )
 
     if failed_gates:

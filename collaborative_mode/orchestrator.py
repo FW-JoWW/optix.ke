@@ -342,6 +342,20 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
     confidence = _confidence_from_state(final_state)
     current_understanding = _best_answer_text(session.investigation_memory, session.original_question or original_question)
     current_hypothesis = current_understanding
+    executed_requests = {
+        str(item.get("request") or "").strip().lower()
+        for item in (session.investigation_memory.get("task_summaries") or {}).values()
+        if isinstance(item, dict) and str(item.get("request") or "").strip()
+    }
+    executed_requests |= {
+        str(task.request or "").strip().lower()
+        for task in session.tasks.values()
+        if str(task.request or "").strip()
+    }
+    has_executed_challenge = any(
+        any(term in request for term in ("challenge", "test", "verify", "falsify"))
+        for request in executed_requests
+    )
     previous_next = []
     if session.checkpoint_summaries:
         previous_next = list(session.checkpoint_summaries[-1].get("next_investigations") or [])
@@ -417,6 +431,7 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
             + (0.10 * analytical_confidence)
         )
         candidate["question_relevance"] = relevance
+        candidate["request_alignment"] = int(integrity["question_alignment"]["score"])
         candidate["hypothesis_coverage"] = hypothesis_coverage
         candidate["uncertainty_reduction"] = uncertainty_reduction
         candidate["business_value"] = business_value
@@ -433,6 +448,17 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
         enriched: List[Dict[str, Any]] = []
         for index, item in enumerate(items[:3]):
             candidate = _rank_suggestion(item)
+            request_key = str(candidate.get("request") or candidate.get("description") or candidate.get("title") or "").strip().lower()
+            if request_key and request_key in executed_requests:
+                continue
+            candidate_text = " ".join(
+                str(candidate.get(field) or "")
+                for field in ("title", "request", "description", "reason", "justification")
+            ).lower()
+            if has_executed_challenge and any(term in candidate_text for term in ("challenge", "test", "verify", "falsify")) and candidate.get("request_alignment", 0) < 50:
+                continue
+            if candidate.get("question_relevance", 0) < 35 and not any(term in candidate_text for term in ("compare", "challenge", "refine", "rerun", "repeat")):
+                continue
             if not candidate["integrity"].get("allowed") and candidate["integrity"]["score"] < 45:
                 continue
             candidate["impact_percent"] = max(
@@ -524,7 +550,16 @@ def _suggest_next_investigations(session: InvestigationSession, final_state: Ana
             }
         ]
 
-    return suggestions[:3]
+    unique_suggestions: List[Dict[str, Any]] = []
+    seen_signatures: set[tuple[str, str]] = set()
+    for suggestion in suggestions:
+        signature = _signature(suggestion)
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        unique_suggestions.append(suggestion)
+
+    return unique_suggestions[:3]
 
 
 def _build_desk_view(session: InvestigationSession) -> Dict[str, Any]:

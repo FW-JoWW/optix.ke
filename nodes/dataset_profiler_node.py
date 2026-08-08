@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from data_profiling import profile_dataset
+from analytics.data_profiling import profile_dataset
 from state.state import AnalystState
 
 

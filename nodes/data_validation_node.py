@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from state.state import AnalystState
-from validation import validate_cleaning
+from guards.validation import validate_cleaning
 
 
 def data_validation_node(state: AnalystState) -> AnalystState:

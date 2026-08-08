@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from judgment_orchestrator import JudgmentOrchestrator
+from engine.judgment_orchestrator import JudgmentOrchestrator
 from state.state import AnalystState
 
 

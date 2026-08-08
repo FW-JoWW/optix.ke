@@ -555,6 +555,7 @@ class CollaborativeSessionController:
                 self.session.investigation_memory["current_understanding"] = self.question
         self.session.investigation_memory.setdefault("previous_findings", []).append(summary["task_finding"])
         self.session.investigation_memory.setdefault("task_references", []).append(task.task_id)
+        self.session.investigation_memory.setdefault("executed_investigation_requests", []).append(task.request)
         self.session.investigation_memory["objective"] = self.session.objective or self.question
         next_suggestions = _suggest_next_investigations(self.session, final_state, task.task_id)
         self.session.ai_suggestions = next_suggestions

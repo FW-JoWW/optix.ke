@@ -42,6 +42,36 @@ def _non_empty_lines(lines: Sequence[str]) -> List[str]:
     return [line for line in lines if _normalize_text(line)]
 
 
+def _unique_non_empty_lines(lines: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    unique: List[str] = []
+    for line in lines:
+        text = _normalize_text(line)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(text)
+    return unique
+
+
+def _question_relevant_lines(question: str, lines: Sequence[str]) -> List[str]:
+    question_terms = _tokens(question)
+    if not question_terms:
+        return _unique_non_empty_lines(lines)
+    relevant: List[str] = []
+    for line in _unique_non_empty_lines(lines):
+        lowered = line.lower()
+        if _tokens(line) & question_terms:
+            relevant.append(line)
+            continue
+        if lowered.startswith(("no ", "the evidence", "the analysis", "the answer", "if yes", "if partial", "if no")):
+            relevant.append(line)
+    return relevant
+
+
 def _tokens(value: Any) -> set[str]:
     text = _normalize_text(value).lower()
     return {token for token in text.split() if len(token) >= 4}
@@ -761,12 +791,29 @@ def _final_timeline_lines(state: AnalystState, evidence: Dict[str, Any]) -> List
     checkpoints = _all_checkpoints(session)
     if not checkpoints:
         return ["No step-by-step timeline was available."]
+    question = humanize_text(session.get("original_question") or state.get("business_question") or "")
     lines: List[str] = []
     for index, checkpoint in enumerate(checkpoints[:5], start=1):
-        title = humanize_text(checkpoint.get("task_title") or checkpoint.get("task_request") or f"Checkpoint {index}")
+        integrity = checkpoint.get("integrity") or {}
+        relevance = int((integrity.get("question_relevance") or {}).get("score") or 0)
+        task_request = humanize_text(checkpoint.get("task_request") or checkpoint.get("traceability", {}).get("purpose_of_task") or "")
+        task_title = humanize_text(checkpoint.get("task_title") or "")
+        checkpoint_text = " ".join(
+            part for part in [task_request, task_title, humanize_text(checkpoint.get("current_understanding") or checkpoint.get("narrative") or "")] if part
+        )
+        direct_relevance = _overlap_score(question, checkpoint_text)
+        if index > 1 and direct_relevance < 1:
+            continue
+        if relevance and relevance < 50 and direct_relevance < 1:
+            continue
+        title = task_title or task_request or f"Checkpoint {index}"
         summary = humanize_text(checkpoint.get("current_understanding") or checkpoint.get("narrative") or "No conclusion captured.")
-        lines.append(f"{index}. {title}: {summary}")
-    return lines
+        line = f"{index}. {title}: {summary}"
+        if _tokens(line) & _tokens(question):
+            lines.append(line)
+        elif relevance >= 50 and direct_relevance >= 1:
+            lines.append(line)
+    return _unique_non_empty_lines(lines) or ["No step-by-step timeline was available."]
 
 
 def compose_final_analyst_sections(state: AnalystState, evidence: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -792,14 +839,14 @@ def compose_final_analyst_sections(state: AnalystState, evidence: Dict[str, Any]
     confidence_value = (evidence.get("judgment_summary") or {}).get("global_confidence")
     direct_answer = _direct_answer(question, current_understanding, _overlap_score(question, current_understanding))
     supporting_items = list(evidence_store.values()) or top_stories
-    supported_lines = _evidence_lines(supporting_items, top_stories, dataframe=dataframe)
+    supported_lines = _question_relevant_lines(question, _evidence_lines(supporting_items, top_stories, dataframe=dataframe))
     hypothesis_values = list((session.get("hypotheses") or {}).values())
     tested_lines = [
         humanize_text(item.get("hypothesis") or item.get("summary") or item.get("statement") or "", dataframe=dataframe)
         for item in hypothesis_values
         if isinstance(item, dict) and _normalize_text(item.get("hypothesis") or item.get("summary") or item.get("statement"))
     ]
-    tested_lines = [line for line in tested_lines if line]
+    tested_lines = _question_relevant_lines(question, [line for line in tested_lines if line])
     if not tested_lines:
         tested_lines = ["The investigation has not yet surfaced a clearly named hypothesis trail."]
 
@@ -808,12 +855,13 @@ def compose_final_analyst_sections(state: AnalystState, evidence: Dict[str, Any]
         for item in hypothesis_values
         if isinstance(item, dict) and str(item.get("status", "")).lower() == "rejected"
     ]
-    alt_lines = [line for line in alt_lines if line]
+    alt_lines = _question_relevant_lines(question, [line for line in alt_lines if line])
     if not alt_lines:
         alt_lines = ["No strong alternative explanation has been established yet."]
 
-    gap_lines = _gap_lines(question, current_understanding, supporting_items, hypothesis_values, suggestions, session.get("last_failure") or {})
+    gap_lines = _question_relevant_lines(question, _gap_lines(question, current_understanding, supporting_items, hypothesis_values, suggestions, session.get("last_failure") or {}))
     planning_lines, justification = _planning_lines(suggestions, question, dataframe=dataframe)
+    planning_lines = _question_relevant_lines(question, planning_lines)
     timeline_lines = _final_timeline_lines(state, evidence)
     integrity = memory.get("last_integrity") or ((session.get("checkpoint_summaries") or [{}])[-1].get("integrity") if session.get("checkpoint_summaries") else {})
     traceability = memory.get("last_traceability") or ((session.get("checkpoint_summaries") or [{}])[-1].get("traceability") if session.get("checkpoint_summaries") else {})
@@ -827,6 +875,10 @@ def compose_final_analyst_sections(state: AnalystState, evidence: Dict[str, Any]
         investigation_memory=memory,
         dataframe=dataframe,
     )
+    synthesis["supporting_evidence_summary"] = _question_relevant_lines(question, synthesis.get("supporting_evidence_summary") or [])
+    synthesis["observed_facts"] = _question_relevant_lines(question, synthesis.get("observed_facts") or [])
+    synthesis["analytical_interpretation"] = _question_relevant_lines(question, synthesis.get("analytical_interpretation") or [])
+    synthesis["recommended_next_investigation"] = _question_relevant_lines(question, synthesis.get("recommended_next_investigation") or [])
     synthesis_sections = build_answer_synthesis_sections(synthesis)
 
     answer_lines = [
@@ -861,7 +913,7 @@ def compose_final_analyst_sections(state: AnalystState, evidence: Dict[str, Any]
                 humanize_text((evidence.get("decision_recommended_first") or {}).get("recommended_action") or (evidence.get("judgment_summary") or {}).get("recommended_first_action") or "No immediate business action is established.", dataframe=dataframe),
                 "The recommended business action should stay tied to the evidence rather than the internal workflow.",
             ]),
-            ("Recommended Future Investigations", planning_lines[:9] + ([f"Why this is preferred: {justification}"] if justification else [])),
+            ("Recommended Future Investigations", _unique_non_empty_lines(planning_lines[:9] + ([f"Why this is preferred: {justification}"] if justification else []))),
             ("Investigation Timeline", timeline_lines),
             ("Overall Confidence", [
                 f"Confidence: {_confidence_label(confidence_value)}",

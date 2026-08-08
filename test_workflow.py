@@ -29,13 +29,17 @@ def load_default_dataframe(dataset_path: str) -> pd.DataFrame:
 
 def _run_collaborative(question: str, workflow_mode: str, dataset_path: str, df: pd.DataFrame) -> None:
     collab_responses_env = os.getenv("COLLABORATIVE_TEST_RESPONSES", "").strip()
+    collab_test_mode = os.getenv("COLLABORATIVE_TEST_MODE", "").strip().lower()
     collab_report_mode = os.getenv("COLLABORATIVE_REPORT_MODE", "").strip().lower()
-    responses = [item.strip() for item in collab_responses_env.split("|") if item.strip()] if collab_responses_env else None
+    use_scripted_responses = collab_test_mode in {"scripted", "1", "true", "yes"}
+    responses = [item.strip() for item in collab_responses_env.split("|") if item.strip()] if (collab_responses_env and use_scripted_responses) else None
     build_final_report = collab_report_mode != "preview"
 
     if responses is None:
         print("\n[Agent] Running collaborative workflow in interactive test mode.")
         print("[Agent] This path uses the same collaborative session runner as the live mode, so it keeps going until the decision layer asks for human guidance or you select a human action.")
+        if collab_responses_env and not use_scripted_responses:
+            print("[Agent] Scripted collaborative responses were detected, but they are being ignored because COLLABORATIVE_TEST_MODE is not set to scripted.")
     else:
         print("\n[Agent] Running collaborative workflow in scripted test mode.")
     initial_tasks = [

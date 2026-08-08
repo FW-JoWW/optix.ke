@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
-from cleaning_executor import execute_cleaning_actions
+from normalization.cleaning_executor import execute_cleaning_actions
 from core.reasoning_layer import explain_decision, format_reasoning_explanation, interpret_modification_request
 from core.guided_versions import capture_guided_stage_snapshot, diff_guided_stage_snapshots, restore_guided_stage_snapshot
 from core.reasoning_objects import (
@@ -20,7 +20,7 @@ from nodes.cleaning_audit_node import cleaning_audit_node
 from nodes.data_validation_node import data_validation_node
 from nodes.visualization_generator_node import visualization_generator_node
 from state.state import AnalystState
-from data_profiling import profile_dataset
+from analytics.data_profiling import profile_dataset
 
 
 @dataclass

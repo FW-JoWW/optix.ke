@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from analysis_engine import execute_analysis_plan
+from analytics.analysis_engine import execute_analysis_plan
 from state.state import AnalystState
 
 

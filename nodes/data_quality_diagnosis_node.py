@@ -2,9 +2,9 @@
 import json
 
 from ambiguity_detector import detect_ambiguity
-from context_inference import infer_context
-from data_profiling import profile_dataset
-from structural_signal_extraction import extract_structural_signals
+from core.context_inference import infer_context
+from analytics.data_profiling import profile_dataset
+from analytics.structural_signal_extraction import extract_structural_signals
 from state.state import AnalystState
 from utils.cleaning_recommender import recommend_cleaning_issues
 from utils.issue_detector import detect_issues
