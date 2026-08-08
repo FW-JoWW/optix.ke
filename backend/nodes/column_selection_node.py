@@ -1,0 +1,272 @@
+# nodes/column_selection_node.py
+from backend.state.state import AnalystState
+
+
+def _build_fallback_registry(df):
+    registry = {}
+    for col in df.columns:
+        dtype = df[col].dtype
+        if str(dtype) in {"object", "category"}:
+            role = "categorical_feature"
+        elif str(dtype).startswith(("datetime64", "datetime")):
+            role = "datetime"
+        elif str(dtype) in {"bool"}:
+            role = "categorical_feature"
+        else:
+            role = "numeric_measure"
+        registry[col] = {"semantic_role": role}
+    return registry
+
+def extract_intent_columns(filters):
+    columns = []
+
+    def visit(node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "condition":
+            col = node.get("column")
+            if col:
+                columns.append(col)
+            return
+        if node.get("type") == "logic":
+            for child in node.get("conditions", []):
+                visit(child)
+
+    for item in filters or []:
+        visit(item)
+
+    return list(dict.fromkeys(columns))
+
+
+def dedupe_preserve_order(columns):
+    seen = set()
+    ordered = []
+    for col in columns:
+        if col and col not in seen:
+            ordered.append(col)
+            seen.add(col)
+    return ordered
+
+def column_selection_node(state: AnalystState) -> AnalystState:
+
+    column_registry = state.get("column_registry")
+    df = state.get("analysis_dataset")
+    if df is None:
+        df = state.get("cleaned_data")
+    if df is None:
+        df = state.get("dataframe")
+
+    if column_registry is None and df is not None:
+        column_registry = _build_fallback_registry(df)
+        state["column_registry"] = column_registry
+
+    if column_registry is None:
+        raise ValueError("Column registry missing")
+
+    if df is None:
+        raise ValueError("Filtered dataset missing")
+
+    question = state.get("business_question", "")
+    intent = state.get("intent", {})
+    parser_selected_columns = intent.get("selected_columns", []) or state.get("selected_columns", [])
+    resolved_role_columns = [
+        value
+        for key, value in (intent.get("resolved_role_columns") or {}).items()
+        if key.endswith("_column") or key.endswith("_metric") or key == "focus_dimension"
+        if isinstance(value, str)
+    ]
+
+    candidate_columns = list(column_registry.keys())
+
+    if parser_selected_columns:
+        matched_columns = []
+        print("\n[INFO] Semantic column matcher skipped - explicit columns already identified")
+    elif state.get("disable_semantic_matcher"):
+        matched_columns = []
+        print("\n[INFO] Semantic column matcher disabled - using intent columns only")
+    else:
+        try:
+            from backend.utils.semantic_matcher import semantic_column_match
+            matched_columns = semantic_column_match(
+                question,
+                candidate_columns,
+                threshold=0.4
+            )
+        except Exception as e:
+            matched_columns = []
+            print(f"\n[INFO] Semantic column matcher unavailable - using intent columns only: {e}")
+
+    intent_columns = extract_intent_columns(intent.get("filters", []))
+
+    if intent.get("group_by"):
+        intent_columns.append(intent["group_by"])
+    if intent.get("aggregate_column"):
+        intent_columns.append(intent["aggregate_column"])
+
+    selected_columns = dedupe_preserve_order(parser_selected_columns + resolved_role_columns + intent_columns + matched_columns)
+
+    if not selected_columns and intent_columns:
+        selected_columns = dedupe_preserve_order(intent_columns + matched_columns)
+    else:
+        selected_columns = selected_columns or dedupe_preserve_order(matched_columns)
+
+    if not selected_columns:
+        profile = state.get("dataset_profile", {})
+        identifier_columns = set(profile.get("identifier_columns", []))
+        preferred_columns = [
+            col for col in df.columns
+            if col not in identifier_columns
+            and df[col].notna().mean() >= 0.2
+        ]
+        selected_columns = preferred_columns[:5] or df.columns.tolist()[:5]
+
+    selected_columns = [c for c in selected_columns if c in df.columns]
+
+    if not selected_columns:
+        raise ValueError("No valid colimns selected after filtering")
+
+    analysis_df = df[selected_columns].copy()
+
+    state["selected_columns"] = selected_columns
+    state["analysis_dataset"] = analysis_df
+
+    print("\n=== COLUMN SELECTION ===")
+    print(selected_columns)
+
+    return state
+
+
+"""# nodes/column_selection_node.py
+from backend.state.state import AnalystState
+from backend.utils.semantic_matcher import semantic_column_match
+import pandas as pd
+
+def column_selection_node(state: AnalystState) -> AnalystState:
+    '''
+    Selects columns for analysis using semantic roles and
+    embedding-based matching with the business question.
+    Works for any dataset.
+    '''
+
+    # Load column registry and dataset
+    column_registry = state.get("column_registry")
+    df = state.get("cleaned_data") or state.get("dataframe")
+
+    if column_registry is None:
+        raise ValueError("Column registry not found. Run column_semantic_classifier first.")
+
+    if df is None:
+        raise ValueError("Dataset not found.")
+
+    question = state.get("business_question", "")
+
+    # Filter columns by semantic roles
+    allowed_roles = ["numeric_measure", "categorical_feature", "datetime"]
+    candidate_columns = [
+        col for col, meta in column_registry.items()
+        if meta.get("semantic_role") in allowed_roles
+    ]
+
+    if not candidate_columns:
+        raise ValueError("No valid columns found for analysis.")
+
+    # Use semantic matching to prioritize columns for this question
+    intent = state.get("intent", {})
+    
+    # prioritize columns from intent
+    intent_columns = [f["column"] for f in intent.get("filters", [])]
+    if intent.get("group_by"):
+        intent_columns.append(intent["group_by"])
+        
+    #matched_columns = list(set(intent_columns + candidate_columns))
+    matched_columns = semantic_column_match(question, candidate_columns, threshold=0.4)
+
+    # Further classify columns by type for analysis heuristics
+    numeric_cols = [col for col in matched_columns if column_registry[col]["semantic_role"] == "numeric_measure"]
+    categorical_cols = [col for col in matched_columns if column_registry[col]["semantic_role"] == "categorical_feature"]
+    datetime_cols = [col for col in matched_columns if column_registry[col]["semantic_role"] == "datetime"]
+
+    # Heuristic: determine columns based on question intent
+    relationship_keywords = ["relationship", "correlation", "impact", "effect", "influence"]
+    comparison_keywords = ["compare", "difference", "by", "between"]
+    trend_keywords = ["trend", "over time", "growth", "change"]
+
+    selected_columns = []
+
+    question_lower = question.lower()
+    if any(k in question_lower for k in relationship_keywords):
+        selected_columns = numeric_cols[:4]
+    elif any(k in question_lower for k in comparison_keywords):
+        selected_columns = categorical_cols[:2] + numeric_cols[:2]
+    elif any(k in question_lower for k in trend_keywords):
+        selected_columns = datetime_cols[:1] + numeric_cols[:2]
+    else:
+        selected_columns = list(set(
+            intent_columns +
+            numeric_cols[:3] + 
+            categorical_cols[:2]
+        ))
+        #selected_columns = matched_columns[:4]
+
+    
+    # Force include columns explicitly mentioned in question
+    '''forced_columns = [
+        col for col in df.columns
+        if col.lower() in question_lower
+    ]'''
+
+    # selected_columns = list(set(selected_columns + forced_columns))
+
+    # -------------------------
+    # FORCE INCLUDE INTENT COLUMNS
+    # -------------------------
+    intent = state.get("intent", {})
+    
+    needed_cols = []
+
+    for f in intent.get("filters", []):
+        needed_cols.append(f["column"])
+    
+    if intent.get("group_by"):
+        needed_cols.append(intent["group_by"])
+     
+    if intent.get("aggregate_column"):
+        needed_cols.append(intent["aggregate_column"])
+
+    needed_cols = [c for c in needed_cols if c in df.columns]
+    
+    selected_columns = list(set(selected_columns + needed_cols))
+    '''# Ensure columns exist in the dataframe
+    selected_columns = [col for col in selected_columns if col in df.columns]'''
+
+    '''# Store original dataset for filter recovery
+    if "analysis_dataset_original" not in state:
+        state["analysis_dataset_original"] = df.copy()'''
+    
+    # Remove invalid columns
+    if not needed_cols:
+        raise ValueError("No valid selected after validation.")
+    
+    # Build the analysis dataset
+    analysis_df = df[selected_columns].copy()
+
+    # Optional: drop columns with >80% missing values
+    filtered_columns = [col for col in analysis_df.columns if analysis_df[col].notna().sum() > len(analysis_df) * 0.2]
+    analysis_df = analysis_df[filtered_columns]
+    selected_columns = filtered_columns
+
+    # Update state
+    state["selected_columns"] = selected_columns #analysis_df.reset_index(drop=True)
+    state["analysis_dataset"] = analysis_df.copy()
+    state["raw_analysis_dataset"] = analysis_df.copy()
+
+    # Logging
+    print("\n=== COLUMN SELECTION ===")
+    print(f"Selected columns for analysis: {selected_columns}")
+    print(f"Analysis dataset shape: {analysis_df.shape}")
+
+    return state
+
+"""
+
+
