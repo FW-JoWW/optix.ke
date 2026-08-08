@@ -11,10 +11,9 @@ __pycache__/
 # Virtual enviroment
 myenv/
 
-# Data
-data/
-*.csv
-*.xlsx
+# Backend data and generated outputs
+backend/data/
+backend/charts/
 
 # Outputs 
 charts/
@@ -28,3 +27,6 @@ Thumbs.db
 #IDE
 .vscode/
 .idea/
+
+# Test caches
+.pytest_cache/
