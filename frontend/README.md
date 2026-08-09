@@ -1,16 +1,26 @@
 # Frontend
 
-This folder is the UI scaffold for the Data Analyst Agent.
+This folder now contains a working vanilla JS frontend for the Data Analyst Agent.
 
-Current state:
-- Static starter page
-- No framework installed yet
-- Ready for a future React, Vue, or plain JS app
+Current stack:
+- Plain HTML, CSS, and ES modules
+- No frontend build step required
+- Consumes the local JSON bridge in `backend/api_server.py`
+
+Run it:
+- `python run_api.py`
+- Open `http://127.0.0.1:8787`
 
 Files:
-- `index.html` - entry page
-- `src/main.js` - small interaction script
-- `src/styles.css` - visual system and layout
+- `index.html` - app entry point
+- `src/main.js` - application shell and state management
+- `src/api.js` - frontend API adapter
+- `src/model.js` - investigation normalization and UI mapping
+- `src/styles.css` - visual system and responsive layout
 
-Suggested next step:
-- Choose a frontend stack and replace this static shell with the real app shell.
+What it shows:
+- Home and new investigation flows
+- Dataset catalog
+- Investigation workspace
+- Answer, findings, evidence, confidence, and reports
+- Guided and collaborative control surfaces

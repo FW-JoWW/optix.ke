@@ -6,56 +6,12 @@
     <title>Data Analyst Agent</title>
     <meta
       name="description"
-      content="Frontend scaffold for the Data Analyst Agent."
+      content="Investigation-centered frontend for the Data Analyst Agent."
     />
     <link rel="stylesheet" href="./src/styles.css" />
   </head>
   <body>
-    <div class="page-shell">
-      <header class="hero">
-        <div class="eyebrow">Frontend scaffold</div>
-        <h1>Data Analyst Agent</h1>
-        <p class="lede">
-          A clean workspace for the UI layer that will sit on top of the
-          backend analysis engine.
-        </p>
-      </header>
-
-      <main class="grid">
-        <section class="panel panel-primary">
-          <div class="panel-label">Now online</div>
-          <h2>UI skeleton</h2>
-          <p>
-            This is the starting frame for charts, filters, findings, and human
-            review flows.
-          </p>
-          <div class="pill-row">
-            <span class="pill">Data intake</span>
-            <span class="pill">Analysis summary</span>
-            <span class="pill">Decision view</span>
-          </div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-label">Backend link</div>
-          <h2>Integration boundary</h2>
-          <p>
-            The Python backend now lives in <code>/backend</code> and can be
-            launched with <code>python run_backend.py</code>.
-          </p>
-          <div class="status-list">
-            <div><span class="dot dot-good"></span> Backend isolated</div>
-            <div><span class="dot dot-warn"></span> Frontend scaffolded</div>
-            <div><span class="dot dot-muted"></span> UI features pending</div>
-          </div>
-        </section>
-
-        <section class="panel panel-wide">
-          <div class="panel-label">Next build steps</div>
-          <div id="app"></div>
-        </section>
-      </main>
-    </div>
+    <div id="app"></div>
     <script type="module" src="./src/main.js"></script>
   </body>
 </html>
