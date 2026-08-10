@@ -6,6 +6,7 @@ async function request(path, options = {}) {
       'Content-Type': 'application/json',
       ...(options.headers || {}),
     },
+    signal: options.signal,
     ...options,
   });
 
@@ -30,8 +31,12 @@ export function listInvestigations() {
   return request('/api/investigations');
 }
 
-export function getInvestigation(id) {
-  return request(`/api/investigations/${encodeURIComponent(id)}`);
+export function getInvestigation(id, options = {}) {
+  return request(`/api/investigations/${encodeURIComponent(id)}`, options);
+}
+
+export function getWorkspaceInvestigation(id, options = {}) {
+  return request(`/api/investigations/${encodeURIComponent(id)}/workspace`, options);
 }
 
 export function runInvestigation(payload) {
@@ -41,7 +46,12 @@ export function runInvestigation(payload) {
   });
 }
 
+export function cancelInvestigation(id) {
+  return request(`/api/investigations/${encodeURIComponent(id)}/cancel`, {
+    method: 'POST',
+  });
+}
+
 export function isApiLocal() {
   return API_BASE === '';
 }
-

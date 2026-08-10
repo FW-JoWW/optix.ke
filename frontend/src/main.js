@@ -1,4 +1,4 @@
-import { getBootstrap, getInvestigation, isApiLocal, listInvestigations, runInvestigation } from './api.js';
+import { cancelInvestigation, getBootstrap, getInvestigation, getWorkspaceInvestigation, isApiLocal, listInvestigations, runInvestigation } from './api.js';
 import { createFallbackBootstrap, emptyInvestigation, normalizeBootstrap, normalizeInvestigation, summarizeInvestigations, formatStageLabel } from './model.js';
 
 const app = document.querySelector('#app');
@@ -9,6 +9,7 @@ const state = {
   bootstrap: createFallbackBootstrap(),
   investigations: [],
   activeInvestigationId: null,
+  requestedInvestigationId: null,
   selectedStage: 'answer',
   selectedReport: 'analyst',
   drawer: null,
@@ -23,10 +24,14 @@ const state = {
   },
 };
 
+const RUN_POLL_INTERVAL_MS = 2000;
+const RUN_POLL_TIMEOUT_MS = 300000;
+
 function parseRoute() {
   const hash = window.location.hash.replace(/^#/, '') || 'home';
   const [view, id] = hash.split('/');
   state.view = view || 'home';
+  state.requestedInvestigationId = id || null;
   state.activeInvestigationId = id || state.activeInvestigationId;
 }
 
@@ -34,9 +39,41 @@ function setRoute(view, id = '') {
   window.location.hash = id ? `#${view}/${id}` : `#${view}`;
 }
 
+function getInvestigationUrl(id = getActiveInvestigation()?.id) {
+  if (!id) return window.location.href;
+  const base = `${window.location.origin}${window.location.pathname}`;
+  return `${base}#investigations/${encodeURIComponent(id)}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 function getActiveInvestigation() {
   if (!state.activeInvestigationId) return null;
   return state.investigations.find((item) => item.id === state.activeInvestigationId) || null;
+}
+
+function mergeInvestigationRecords(existing, incoming) {
+  if (!existing) return incoming;
+  const merged = { ...existing, ...incoming };
+  merged.progress = existing.progress?.length ? existing.progress : incoming.progress;
+  merged.findings = existing.findings?.length ? existing.findings : incoming.findings;
+  merged.evidence = existing.evidence?.length ? existing.evidence : incoming.evidence;
+  merged.journey = existing.journey?.length ? existing.journey : incoming.journey;
+  merged.snapshots = existing.snapshots?.length ? existing.snapshots : incoming.snapshots;
+  merged.tasks = existing.tasks?.length ? existing.tasks : incoming.tasks;
+  merged.hypotheses = existing.hypotheses?.length ? existing.hypotheses : incoming.hypotheses;
+  merged.recommendations = existing.recommendations?.length ? existing.recommendations : incoming.recommendations;
+  merged.reports = { ...incoming.reports, ...existing.reports };
+  merged.answer = existing.answer?.direct && existing.answer.direct !== 'The investigation has not reached a direct answer yet.' ? existing.answer : incoming.answer;
+  merged.dataQuality = existing.dataQuality?.issues || existing.dataQuality?.rows || existing.dataQuality?.columns ? existing.dataQuality : incoming.dataQuality;
+  merged.confidence = existing.confidence?.label && existing.confidence.label !== 'Unknown' ? existing.confidence : incoming.confidence;
+  merged.analysisPlan = existing.analysisPlan?.length ? existing.analysisPlan : incoming.analysisPlan;
+  merged.selectedColumns = existing.selectedColumns?.length ? existing.selectedColumns : incoming.selectedColumns;
+  merged.visualizations = existing.visualizations?.length ? existing.visualizations : incoming.visualizations;
+  merged.raw = existing.raw || incoming.raw;
+  return merged;
 }
 
 function setActiveInvestigation(investigation) {
@@ -44,7 +81,7 @@ function setActiveInvestigation(investigation) {
   const normalized = normalizeInvestigation(investigation);
   const existingIndex = state.investigations.findIndex((item) => item.id === normalized.id);
   if (existingIndex >= 0) {
-    state.investigations.splice(existingIndex, 1, normalized);
+    state.investigations.splice(existingIndex, 1, mergeInvestigationRecords(state.investigations[existingIndex], normalized));
   } else {
     state.investigations.unshift(normalized);
   }
@@ -57,6 +94,201 @@ function setActiveInvestigation(investigation) {
 function setDrawer(drawer) {
   state.drawer = drawer;
   render();
+}
+
+async function loadInvestigation(id) {
+  if (!id) return null;
+  const existing = state.investigations.find((item) => item.id === id) || null;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 3500);
+  try {
+    const response = await getWorkspaceInvestigation(id, { signal: controller.signal });
+    const investigation = normalizeInvestigation(response.investigation || response);
+    const existingIndex = state.investigations.findIndex((item) => item.id === investigation.id);
+    if (existingIndex >= 0) {
+      state.investigations.splice(existingIndex, 1, mergeInvestigationRecords(state.investigations[existingIndex], investigation));
+    } else {
+      state.investigations.unshift(investigation);
+    }
+    state.activeInvestigationId = investigation.id;
+    state.selectedStage = investigation.progress.find((stage) => stage.status === 'current')?.key || state.selectedStage || 'answer';
+    state.selectedReport = investigation.reports.analyst ? 'analyst' : investigation.reports.business ? 'business' : investigation.reports.executive ? 'executive' : 'analyst';
+    state.error = null;
+    return investigation;
+  } catch (error) {
+    try {
+      const response = await getInvestigation(id);
+      const investigation = normalizeInvestigation(response.investigation || response);
+      const existingIndex = state.investigations.findIndex((item) => item.id === investigation.id);
+      if (existingIndex >= 0) {
+        state.investigations.splice(existingIndex, 1, mergeInvestigationRecords(state.investigations[existingIndex], investigation));
+      } else {
+        state.investigations.unshift(investigation);
+      }
+      state.activeInvestigationId = investigation.id;
+      state.selectedStage = investigation.progress.find((stage) => stage.status === 'current')?.key || state.selectedStage || 'answer';
+      state.selectedReport = investigation.reports.analyst ? 'analyst' : investigation.reports.business ? 'business' : investigation.reports.executive ? 'executive' : 'analyst';
+      state.error = null;
+      return investigation;
+    } catch (fallbackError) {
+      state.error = null;
+      const inflated = inflateSummaryInvestigation(existing);
+      if (inflated) {
+        const existingIndex = state.investigations.findIndex((item) => item.id === inflated.id);
+        if (existingIndex >= 0) {
+          state.investigations.splice(existingIndex, 1, mergeInvestigationRecords(state.investigations[existingIndex], inflated));
+        } else {
+          state.investigations.unshift(inflated);
+        }
+        state.activeInvestigationId = inflated.id;
+        return inflated;
+      }
+      return existing;
+    }
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+async function waitForInvestigationResult(clientRequestId, fallbackQuery = {}) {
+  if (!clientRequestId) return null;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < RUN_POLL_TIMEOUT_MS) {
+    try {
+      const payload = await listInvestigations();
+      const match = (payload.investigations || []).find((item) => item.client_request_id === clientRequestId);
+      if (match) {
+        return await loadInvestigation(match.id);
+      }
+    } catch (error) {
+      void error;
+    }
+    await sleep(RUN_POLL_INTERVAL_MS);
+  }
+
+  const fallback = state.investigations.find((item) => {
+    if (!item) return false;
+    return (
+      text(item.question).toLowerCase() === text(fallbackQuery.question).toLowerCase() &&
+      text(item.dataset?.path) === text(fallbackQuery.datasetPath) &&
+      text(item.mode?.id || item.mode).toLowerCase() === text(fallbackQuery.mode || 'autonomous').toLowerCase()
+    );
+  });
+
+  if (fallback) {
+    return loadInvestigation(fallback.id);
+  }
+
+  return null;
+}
+
+function createPendingInvestigation(payload) {
+  const dataset = state.bootstrap.datasets.find((item) => item.path === payload.datasetPath) || {
+    name: payload.datasetPath || 'Selected dataset',
+    path: payload.datasetPath || '',
+    sourceType: 'csv',
+    rowCount: null,
+    columnCount: null,
+  };
+  return normalizeInvestigation({
+    id: `pending-${Date.now()}`,
+    question: payload.question,
+    business_question: payload.question,
+    mode: payload.mode || 'autonomous',
+    status: 'running',
+    dataset_path: payload.datasetPath,
+    dataset,
+    dataset_profile: {
+      row_count: dataset.rowCount ?? dataset.row_count ?? null,
+      column_count: dataset.columnCount ?? dataset.column_count ?? null,
+    },
+    analysis_evidence: {},
+    analysis_plan: [],
+    awaiting_user: false,
+  });
+}
+
+function inflateSummaryInvestigation(summary) {
+  if (!summary) return null;
+  const confidenceLabel =
+    typeof summary.confidence === 'number'
+      ? summary.confidence >= 75
+        ? 'High'
+        : summary.confidence >= 45
+          ? 'Moderate'
+          : 'Low'
+      : 'Unknown';
+  return normalizeInvestigation({
+    id: summary.id,
+    question: summary.question,
+    business_question: summary.question,
+    mode: summary.mode,
+    status: summary.status,
+    dataset_path: summary.dataset?.path || summary.dataset_path,
+    dataset: summary.dataset,
+    dataset_profile: {
+      row_count: summary.dataset?.row_count ?? null,
+      column_count: summary.dataset?.column_count ?? null,
+      source_type: summary.dataset?.source_type ?? null,
+    },
+    analysis_evidence: {
+      answer_synthesis: {
+        direct_answer: summary.answer || 'The investigation has not reached a direct answer yet.',
+        business_interpretation: summary.answer || '',
+        confidence: {
+          overall: { label: confidenceLabel },
+        },
+      },
+      judgment_summary: {
+        summary: summary.answer || '',
+        global_confidence: confidenceLabel,
+      },
+      top_stories: [],
+      decision_recommendations: [],
+      report_package: {
+        analyst_report: summary.reports?.analyst ? 'Report available in backend history.' : '',
+        business_report: summary.reports?.business ? 'Report available in backend history.' : '',
+        executive_report: summary.reports?.executive ? 'Report available in backend history.' : '',
+        master_report: '',
+      },
+    },
+    final_report: summary.has_report ? summary.answer || 'Report available in backend history.' : '',
+    analyst_report: summary.reports?.analyst ? 'Report available in backend history.' : '',
+    business_report: summary.reports?.business ? 'Report available in backend history.' : '',
+    executive_report: summary.reports?.executive ? 'Report available in backend history.' : '',
+    master_report: '',
+    selected_columns: [],
+    visualizations: [],
+  });
+}
+
+async function copyTextToClipboard(value) {
+  const textValue = String(value ?? '');
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(textValue);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = textValue;
+  textarea.setAttribute('readonly', 'readonly');
+  textarea.style.position = 'absolute';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+}
+
+function downloadTextFile(filename, content, type = 'application/json') {
+  const blob = new Blob([content], { type: `${type};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function stageBlock(stage, active = false) {
@@ -425,6 +657,41 @@ function renderReports() {
   `;
 }
 
+function renderInvestigations() {
+  const investigations = state.investigations;
+  const running = investigations.filter((item) => String(item.status).toLowerCase().includes('running') || String(item.status).toLowerCase().includes('awaiting'));
+  const completed = investigations.filter((item) => String(item.status).toLowerCase() === 'completed' || item.has_report);
+  return `
+    <section class="page-stack">
+      <header class="page-hero compact">
+        <div class="eyebrow">Investigations</div>
+        <h1>All investigations in one place</h1>
+        <p class="lede">This view is the bridge between the backend records and the workspace. Open a record to load the full analysis bundle, evidence trail, and snapshots.</p>
+      </header>
+      <div class="split-grid investigations-grid">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <div class="section-label">Active</div>
+              <h2>${running.length} running or awaiting review</h2>
+            </div>
+          </div>
+          ${running.length ? renderInvestigationList(running) : renderEmptyState('No active investigations', 'Create a new run to see it here.') }
+        </article>
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <div class="section-label">Completed</div>
+              <h2>${completed.length} finished investigations</h2>
+            </div>
+          </div>
+          ${completed.length ? renderInvestigationList(completed) : renderEmptyState('No completed investigations', 'Finished investigations will appear here once the backend returns a final report.')}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
 function renderSettings() {
   return `
     <section class="page-stack">
@@ -456,17 +723,30 @@ function renderWorkspace() {
   const investigation = getActiveInvestigation() || state.investigations[0] || emptyInvestigation();
   const stage = investigation.progress.find((item) => item.key === state.selectedStage) || investigation.progress.find((item) => item.status === 'current') || investigation.progress[0];
   const reportText = investigation.reports[state.selectedReport] || investigation.reports.analyst || investigation.reports.master;
+  const status = String(investigation.status || '').toLowerCase();
+  const mode = String(investigation.mode?.id || investigation.mode || '').toLowerCase();
+  const isRunning = status.includes('running') || status.includes('queued') || status.includes('in_progress');
+  const isAwaiting = status.includes('await');
+  const isCompleted = status.includes('completed') || investigation.has_report || investigation.reports.analyst !== 'No report available yet.';
 
-  if (investigation.mode.id === 'collaborative') {
+  if (isCompleted) {
+    return renderCompletedWorkspace(investigation, stage, reportText);
+  }
+
+  if (mode === 'collaborative') {
     return renderCollaborativeWorkspace(investigation, stage, reportText);
   }
 
-  if (investigation.mode.id === 'guided' || investigation.status.includes('awaiting')) {
+  if (mode === 'guided') {
     return renderGuidedWorkspace(investigation, stage, reportText);
   }
 
-  if (investigation.status === 'completed' || investigation.has_report || investigation.reports.analyst !== 'No report available yet.') {
-    return renderCompletedWorkspace(investigation, stage, reportText);
+  if (isAwaiting) {
+    return renderGuidedWorkspace(investigation, stage, reportText);
+  }
+
+  if (isRunning) {
+    return renderRunningWorkspace(investigation, stage, reportText);
   }
 
   return renderRunningWorkspace(investigation, stage, reportText);
@@ -524,7 +804,10 @@ function renderCompletedWorkspace(investigation, stage, reportText) {
       ${renderWorkspaceHeader(investigation, {
         status: investigation.status,
         subline: `Completed ${investigation.updatedAt ? `on ${new Date(investigation.updatedAt).toLocaleString()}` : 'recently'}`,
-        secondaryAction: '<button class="link-button" type="button">Share</button>',
+        secondaryAction: `
+          <button class="link-button" type="button" data-action="download-investigation">Download</button>
+          <button class="link-button" type="button" data-action="share-investigation">Share</button>
+        `,
         headerBadge: 'Completed',
       })}
 
@@ -630,7 +913,7 @@ function renderRunningWorkspace(investigation, stage) {
       ${renderWorkspaceHeader(investigation, {
         status: investigation.status.includes('running') ? 'Running' : investigation.status,
         subline: `Run ID: ${investigation.id}`,
-        secondaryAction: '<button class="link-button" type="button">Cancel run</button>',
+        secondaryAction: '<button class="link-button danger" type="button" data-action="cancel-run">Cancel run</button>',
         headerBadge: 'Running',
       })}
 
@@ -1310,7 +1593,7 @@ function renderTopbar() {
         <div class="topbar-title">${escapeHtml(investigation?.question || state.bootstrap.app.tagline)}</div>
       </div>
       <div class="topbar-actions">
-        <span class="topbar-chip">${state.apiState === 'remote' ? 'Live bridge' : 'Local preview'}</span>
+        <span class="topbar-chip">${state.loading ? 'Executing task' : state.apiState === 'remote' ? 'Live bridge' : 'Local preview'}</span>
         <span class="topbar-chip">${investigation ? `${escapeHtml(investigation.mode.label)} mode` : 'No active investigation'}</span>
       </div>
     </header>
@@ -1321,6 +1604,10 @@ function renderApp() {
   const investigation = getActiveInvestigation();
   const content = state.view === 'home'
     ? renderHome()
+    : state.view === 'investigations'
+      ? state.requestedInvestigationId
+        ? renderWorkspace()
+        : renderInvestigations()
     : state.view === 'new'
       ? renderNewInvestigation()
       : state.view === 'datasets'
@@ -1385,7 +1672,9 @@ function renderReportBody(investigation) {
 async function refreshInvestigations() {
   try {
     const payload = await listInvestigations();
-    state.investigations = summarizeInvestigations(payload.investigations || []);
+    const summaries = summarizeInvestigations(payload.investigations || []);
+    const existingById = new Map(state.investigations.map((item) => [item.id, item]));
+    state.investigations = summaries.map((item) => mergeInvestigationRecords(existingById.get(item.id), item));
     if (!state.activeInvestigationId && state.investigations[0]) {
       state.activeInvestigationId = state.investigations[0].id;
     }
@@ -1410,15 +1699,50 @@ async function refreshBootstrap() {
 
 async function runQuestion(payload) {
   state.loading = true;
+  state.error = null;
+  const clientRequestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const pendingInvestigation = createPendingInvestigation(payload);
+  state.investigations = [pendingInvestigation, ...state.investigations.filter((item) => item.id !== pendingInvestigation.id)];
+  state.activeInvestigationId = pendingInvestigation.id;
+  state.view = 'investigations';
+  state.requestedInvestigationId = pendingInvestigation.id;
+  state.selectedStage = pendingInvestigation.progress.find((stage) => stage.status === 'current')?.key || 'answer';
+  state.selectedReport = 'analyst';
   render();
-  try {
-    const response = await runInvestigation(payload);
-    const investigation = response.investigation || response;
+
+  const requestPayload = {
+    ...payload,
+    clientRequestId,
+  };
+
+  const syncCurrent = (investigation) => {
+    if (!investigation) return;
     setActiveInvestigation(investigation);
-    state.bootstrap.recentInvestigations = [normalizeInvestigation(investigation), ...(state.bootstrap.recentInvestigations || []).filter((item) => item.id !== (investigation.id || investigation.investigation_id))].slice(0, 8);
+    state.bootstrap.recentInvestigations = [
+      normalizeInvestigation(investigation),
+      ...(state.bootstrap.recentInvestigations || []).filter((item) => item.id !== (investigation.id || investigation.investigation_id)),
+    ].slice(0, 8);
     state.error = null;
-  } catch (error) {
-    state.error = error;
+    render();
+  };
+
+  void runInvestigation(requestPayload)
+    .then((response) => {
+      const investigation = response.investigation || response;
+      syncCurrent(investigation);
+    })
+    .catch(() => undefined);
+
+  void waitForInvestigationResult(clientRequestId, requestPayload)
+    .then((investigation) => {
+      if (investigation) {
+        syncCurrent(investigation);
+      }
+    })
+    .catch(() => undefined);
+
+  try {
+    await sleep(1000);
   } finally {
     state.loading = false;
     render();
@@ -1436,7 +1760,7 @@ function collectInvestigationForm() {
   };
 }
 
-function handleAction(action, target) {
+async function handleAction(action, target) {
   if (action === 'nav') {
     setRoute(target.dataset.view || 'home');
     render();
@@ -1464,9 +1788,15 @@ function handleAction(action, target) {
     return;
   }
   if (action === 'open-investigation') {
-    state.activeInvestigationId = target.dataset.id;
-    setRoute('investigations', target.dataset.id);
+    const id = target.dataset.id;
+    if (!id) return;
+    setRoute('investigations', id);
+    state.loading = true;
     render();
+    loadInvestigation(id).finally(() => {
+      state.loading = false;
+      render();
+    });
     return;
   }
   if (action === 'stage') {
@@ -1504,15 +1834,54 @@ function handleAction(action, target) {
     render();
     return;
   }
+  if (action === 'share-investigation') {
+    const current = getActiveInvestigation();
+    if (!current) return;
+    try {
+      await copyTextToClipboard(getInvestigationUrl(current.id));
+    } catch (error) {
+      state.error = error;
+    }
+    render();
+    return;
+  }
+  if (action === 'download-investigation') {
+    const current = getActiveInvestigation();
+    if (!current) return;
+    const payload = current.raw || current;
+    downloadTextFile(`investigation-${current.id}.json`, JSON.stringify(payload, null, 2));
+    return;
+  }
+  if (action === 'cancel-run') {
+    const current = getActiveInvestigation();
+    if (!current?.id) return;
+    state.loading = true;
+    render();
+    try {
+      const response = await cancelInvestigation(current.id);
+      const investigation = response.investigation || response;
+      await loadInvestigation(investigation.id);
+      state.error = null;
+    } catch (error) {
+      state.error = error;
+    } finally {
+      state.loading = false;
+      render();
+    }
+    return;
+  }
   if (action === 'run-command') {
     const input = document.querySelector('#commandDraft');
     const command = text(input?.value || state.commandDraft);
     if (!command) return;
     state.commandDraft = command;
+    const active = getActiveInvestigation();
     runQuestion({
       question: command,
-      datasetPath: getActiveInvestigation()?.dataset?.path || state.form.datasetPath,
+      datasetPath: active?.dataset?.path || state.form.datasetPath,
       mode: 'collaborative',
+      initialTasks: active?.tasks || [],
+      collaborativeResponses: [command, 'continue', 'continue', 'continue'],
     });
     return;
   }
@@ -1568,7 +1937,11 @@ window.addEventListener('hashchange', () => {
 
 async function boot() {
   parseRoute();
+  render();
   await Promise.all([refreshBootstrap(), refreshInvestigations()]);
+  if (state.requestedInvestigationId) {
+    await loadInvestigation(state.requestedInvestigationId);
+  }
   if (!state.activeInvestigationId && state.investigations[0]) {
     state.activeInvestigationId = state.investigations[0].id;
   }

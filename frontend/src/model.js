@@ -136,7 +136,7 @@ function extractConfidence(raw) {
 function extractAnswer(raw) {
   const evidence = raw?.analysis_evidence || {};
   const answer = evidence.answer_synthesis || raw?.answer_synthesis || {};
-  const direct = text(answer.direct_answer || answer.best_available_answer || raw?.final_report || '');
+  const direct = text(answer.direct_answer || answer.best_available_answer || raw?.answer || raw?.final_report || '');
   const recommendation = toArray(answer.recommended_next_investigation).slice(0, 3);
   return {
     direct: direct || 'The investigation has not reached a direct answer yet.',
