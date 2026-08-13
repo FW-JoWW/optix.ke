@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import mimetypes
 import os
 import threading
 from datetime import datetime, timezone
@@ -8,7 +10,7 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import pandas as pd
 
@@ -22,6 +24,28 @@ _INVESTIGATIONS: dict[str, dict[str, Any]] = {}
 _INVESTIGATION_ORDER: list[str] = []
 _CACHE_LOCK = threading.Lock()
 _DATASET_CACHE: dict[str, dict[str, Any]] = {}
+
+
+_WORKFLOW_PHASES = {
+    "autonomous": [
+        ("preparing", "Preparing the dataset", 12),
+        ("analyzing", "Running the analytical workflow", 38),
+        ("synthesizing", "Synthesizing findings", 64),
+        ("finalizing", "Finalizing the answer", 86),
+    ],
+    "guided": [
+        ("preparing", "Preparing the guided workflow", 10),
+        ("checking", "Working through guided checkpoints", 34),
+        ("reviewing", "Reviewing evidence and responses", 62),
+        ("finalizing", "Assembling the guided report", 85),
+    ],
+    "collaborative": [
+        ("preparing", "Preparing collaborative tasks", 10),
+        ("coordinating", "Coordinating tasks and hypotheses", 32),
+        ("synthesizing", "Synthesizing shared evidence", 60),
+        ("finalizing", "Finalizing the collaborative answer", 84),
+    ],
+}
 
 
 def _utc_now() -> str:
@@ -198,6 +222,7 @@ def _investigation_summary(record: dict[str, Any]) -> dict[str, Any]:
         "created_at": record.get("created_at"),
         "updated_at": record.get("updated_at"),
         "answer": _safe_text(answer.get("direct_answer") or answer.get("best_available_answer") or judgment.get("summary") or record.get("final_report")),
+        "workflow_status": _jsonable(record.get("workflow_status") or {}),
         "reports": {
             "analyst": bool(record.get("analyst_report")),
             "business": bool(record.get("business_report")),
@@ -216,6 +241,24 @@ def _store_investigation(record: dict[str, Any]) -> dict[str, Any]:
         _INVESTIGATION_ORDER.insert(0, investigation_id)
         _INVESTIGATION_ORDER[:] = _INVESTIGATION_ORDER[:50]
     return sanitized
+
+
+def _update_investigation(investigation_id: str, **updates: Any) -> None:
+    with _CACHE_LOCK:
+        existing = dict(_INVESTIGATIONS.get(investigation_id) or {})
+        if not existing:
+            return
+        existing.update(updates)
+        _INVESTIGATIONS[investigation_id] = existing
+
+
+def _workflow_status(mode: str, progress_index: int, total_phases: int, completed: bool = False) -> dict[str, Any]:
+    phases = _WORKFLOW_PHASES.get(mode, _WORKFLOW_PHASES["autonomous"])
+    phase_key, message, target = phases[min(progress_index, len(phases) - 1)]
+    if completed:
+        return {"phase": "completed", "message": "Investigation complete", "progress": 100}
+    drift = min(12, progress_index * 4)
+    return {"phase": phase_key, "message": message, "progress": min(94, target + drift), "total_phases": total_phases}
 
 
 def _list_investigations() -> list[dict[str, Any]]:
@@ -294,6 +337,34 @@ def _trim_sequence(value: Any, limit: int = 8) -> list[Any]:
     return [_jsonable(item) for item in list(value)[:limit]]
 
 
+def _trim_visualization(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+      return {"summary": _safe_text(value)}
+    result = {
+        "type": _safe_text(value.get("type") or value.get("chart_type") or ""),
+        "title": _safe_text(value.get("title") or value.get("caption") or value.get("label") or ""),
+        "caption": _safe_text(value.get("caption") or value.get("summary") or ""),
+        "file_path": _safe_text(value.get("file_path") or value.get("path") or ""),
+        "priority": _safe_text(value.get("priority") or ""),
+        "based_on": _jsonable(value.get("based_on") or {}),
+    }
+    file_path = result.get("file_path") or ""
+    if file_path:
+        chart_path = Path(file_path)
+        if not chart_path.is_absolute():
+            chart_path = ROOT_DIR / file_path
+        if not chart_path.exists():
+            chart_path = ROOT_DIR / "backend" / "charts" / Path(file_path).name
+        try:
+            if chart_path.exists() and chart_path.is_file():
+                mime_type = mimetypes.guess_type(chart_path.name)[0] or "image/png"
+                encoded = base64.b64encode(chart_path.read_bytes()).decode("ascii")
+                result["data_url"] = f"data:{mime_type};base64,{encoded}"
+        except Exception:
+            pass
+    return result
+
+
 def _public_investigation(record: dict[str, Any]) -> dict[str, Any]:
     evidence = record.get("analysis_evidence") or {}
     report_package = evidence.get("report_package") or record.get("report_package") or {}
@@ -329,6 +400,7 @@ def _public_investigation(record: dict[str, Any]) -> dict[str, Any]:
             "top_stories": [_trim_story(story) for story in _trim_sequence(evidence.get("top_stories") or record.get("top_stories") or [], limit=6)],
             "decision_recommendations": [_trim_decision(item) for item in _trim_sequence(evidence.get("decision_recommendations") or record.get("decision_recommendations") or [], limit=6)],
             "tool_results": {str(key): _trim_tool_result(value) for key, value in list(tool_results.items())[:6]},
+            "visualizations": [_trim_visualization(item) for item in _trim_sequence(evidence.get("visualizations") or record.get("visualizations") or [], limit=6)],
             "report_package": report_bundle,
             "guided_version_snapshots": _trim_mapping(evidence.get("guided_version_snapshots") or record.get("guided_version_snapshots") or {}, limit=8),
             "guided_checkpoint_summaries": _trim_mapping(evidence.get("guided_checkpoint_summaries") or record.get("guided_checkpoint_summaries") or {}, limit=8),
@@ -350,6 +422,7 @@ def _public_investigation(record: dict[str, Any]) -> dict[str, Any]:
         "selected_columns": _trim_sequence(record.get("selected_columns") or [], limit=16),
         "visualizations": _trim_sequence(record.get("visualizations") or [], limit=6),
         "awaiting_user": record.get("awaiting_user") or False,
+        "workflow_status": _jsonable(record.get("workflow_status") or {}),
         "raw": {},
     }
 
@@ -388,9 +461,9 @@ def _run_autonomous(question: str, dataset_path: str, mode: str) -> dict[str, An
         "dataset_path": dataset_path,
         "dataframe": df,
         "mode": mode,
-        "enable_llm_reasoning": True,
-        "disable_llm_reasoning": False,
-        "disable_semantic_matcher": False,
+        "enable_llm_reasoning": False,
+        "disable_llm_reasoning": True,
+        "disable_semantic_matcher": True,
         "analysis_evidence": {},
     }
     final_state = graph.invoke(state)
@@ -438,7 +511,7 @@ def _run_collaborative(
     return _jsonable(result.final_state)
 
 
-def _run_investigation(payload: dict[str, Any]) -> dict[str, Any]:
+def _run_investigation_sync(payload: dict[str, Any], record_id: str | None = None) -> dict[str, Any]:
     question = _safe_text(payload.get("question") or payload.get("business_question"))
     if not question:
         raise ValueError("A business question is required.")
@@ -463,7 +536,7 @@ def _run_investigation(payload: dict[str, Any]) -> dict[str, Any]:
         final_state = _run_autonomous(question, dataset_path, mode)
 
     dataset_meta = _dataset_metadata(_resolve_dataset_path(dataset_path))
-    record_id = _safe_text(final_state.get("id") or final_state.get("investigation_id") or f"inv-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
+    record_id = _safe_text(record_id or final_state.get("id") or final_state.get("investigation_id") or f"inv-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}")
     final_state.update(
         {
             "id": record_id,
@@ -479,6 +552,89 @@ def _run_investigation(payload: dict[str, Any]) -> dict[str, Any]:
     )
     _store_investigation(final_state)
     return final_state
+
+
+def _build_running_investigation(payload: dict[str, Any], record_id: str) -> dict[str, Any]:
+    question = _safe_text(payload.get("question") or payload.get("business_question") or "Untitled investigation")
+    mode = _safe_text(payload.get("mode") or "autonomous").lower() or "autonomous"
+    dataset_path = _safe_text(payload.get("datasetPath") or payload.get("dataset_path") or _default_dataset_path() or "")
+    dataset = _dataset_metadata(_resolve_dataset_path(dataset_path)) if dataset_path else {}
+    return {
+        "id": record_id,
+        "question": question,
+        "business_question": question,
+        "mode": mode,
+        "client_request_id": _safe_text(payload.get("clientRequestId") or payload.get("client_request_id") or ""),
+        "dataset_path": dataset_path,
+        "dataset": dataset,
+        "dataset_profile": {},
+        "analysis_plan": [],
+        "analysis_evidence": {},
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+        "status": "running",
+        "workflow_status": _workflow_status(mode, 0, 4),
+        "awaiting_user": False,
+        "final_report": "",
+    }
+
+
+def _run_investigation_worker(payload: dict[str, Any], record_id: str) -> None:
+    mode = _safe_text(payload.get("mode") or "autonomous").lower() or "autonomous"
+    phases = _WORKFLOW_PHASES.get(mode, _WORKFLOW_PHASES["autonomous"])
+    phase_count = max(1, len(phases))
+    done = threading.Event()
+    result_box: dict[str, Any] = {}
+    error_box: dict[str, Any] = {}
+
+    def run_graph() -> None:
+        try:
+            result_box["final_state"] = _run_investigation_sync(payload, record_id=record_id)
+        except Exception as exc:
+            error_box["error"] = exc
+        finally:
+            done.set()
+
+    graph_thread = threading.Thread(target=run_graph, daemon=True)
+    graph_thread.start()
+
+    try:
+        while not done.wait(3.0):
+            elapsed_phases = min(phase_count - 1, int((datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(_INVESTIGATIONS[record_id]["created_at"]).timestamp()) // 8))
+            _update_investigation(
+                record_id,
+                updated_at=_utc_now(),
+                workflow_status=_workflow_status(mode, elapsed_phases, phase_count),
+            )
+        graph_thread.join()
+        if "error" in error_box:
+            raise error_box["error"]
+        final_state = result_box.get("final_state") or {}
+        final_state["workflow_status"] = _workflow_status(mode, phase_count, phase_count, completed=True)
+        final_state["status"] = "completed" if final_state.get("final_report") else final_state.get("status") or "running"
+        final_state["updated_at"] = _utc_now()
+        _store_investigation(final_state)
+    except Exception as exc:
+        _update_investigation(
+            record_id,
+            status="failed",
+            updated_at=_utc_now(),
+            workflow_status={"phase": "failed", "message": _safe_text(exc) or "Investigation failed", "progress": 0},
+            final_report="",
+        )
+
+
+def _start_investigation_job(payload: dict[str, Any]) -> dict[str, Any]:
+    record_id = _safe_text(
+        payload.get("clientRequestId")
+        or payload.get("client_request_id")
+        or f"inv-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    )
+    running = _build_running_investigation(payload, record_id)
+    _store_investigation(running)
+    worker = threading.Thread(target=_run_investigation_worker, args=(dict(payload), record_id), daemon=True)
+    worker.start()
+    return running
 
 
 class DataAnalystAPIHandler(SimpleHTTPRequestHandler):
@@ -521,6 +677,20 @@ class DataAnalystAPIHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
+        if path.startswith("/charts/") or path.startswith("/backend/charts/"):
+            chart_name = unquote(Path(path).name)
+            chart_path = ROOT_DIR / "backend" / "charts" / chart_name
+            if not chart_path.exists() or not chart_path.is_file():
+                return self._write_json({"error": "Chart not found."}, status=HTTPStatus.NOT_FOUND)
+            data = chart_path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mimetypes.guess_type(chart_path.name)[0] or "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if path == "/api/health":
             return self._write_json({"ok": True, "time": _utc_now()})
         if path == "/api/bootstrap":
@@ -530,7 +700,7 @@ class DataAnalystAPIHandler(SimpleHTTPRequestHandler):
         if path == "/api/investigations":
             return self._write_json({"investigations": _list_investigations()})
         if path.startswith("/api/investigations/") and path.endswith("/workspace"):
-            investigation_id = path.split("/", 3)[-1].removesuffix("/workspace")
+            investigation_id = path.rsplit("/", 2)[1]
             with _CACHE_LOCK:
                 investigation = _INVESTIGATIONS.get(investigation_id)
             if not investigation:
@@ -551,7 +721,7 @@ class DataAnalystAPIHandler(SimpleHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
 
         if path.startswith("/api/investigations/") and path.endswith("/cancel"):
-            investigation_id = path.split("/", 3)[-1].removesuffix("/cancel")
+            investigation_id = path.rsplit("/", 2)[1]
             with _CACHE_LOCK:
                 investigation = _INVESTIGATIONS.get(investigation_id)
                 if not investigation:
@@ -567,7 +737,7 @@ class DataAnalystAPIHandler(SimpleHTTPRequestHandler):
 
         try:
             payload = self._read_json()
-            investigation = _run_investigation(payload)
+            investigation = _start_investigation_job(payload)
             return self._write_json({"investigation": _public_investigation(investigation), "summary": _investigation_summary(investigation)})
         except Exception as exc:
             return self._write_json(

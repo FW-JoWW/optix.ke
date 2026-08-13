@@ -1,0 +1,2 @@
+C:\Users\JoWW\Desktop\data-analyst-agent\backend\nodes\visualization_generator_node.py:153: UserWarning: Starting a Matplotlib GUI outside of the main thread will likely fail.
+  plt.figure()

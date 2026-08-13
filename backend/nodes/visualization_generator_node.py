@@ -1,5 +1,8 @@
 # nodes/visualization_node.py
 import os
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -356,7 +359,7 @@ def visualization_generator_node(state: AnalystState) -> AnalystState:
         print("No top stories available for visualization.")
         return state
 
-    os.makedirs("charts", exist_ok=True)
+    os.makedirs("backend/charts", exist_ok=True)
 
     # 1️⃣ Derive decision context
     state["decision_context"] = derive_decision_from_top_stories(top_stories)

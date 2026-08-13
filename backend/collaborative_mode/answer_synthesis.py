@@ -431,11 +431,16 @@ def _semantic_answer_fallback(
             else "The answer is still provisional."
         )
     else:
-        business_answer = (
-            f"The current evidence does not yet answer {humanize_text(business_question)}."
-            if business_question
-            else "The current evidence does not yet support a direct answer."
-        )
+        if deterministic_answer:
+            business_answer = (
+                f"The exact question cannot be confirmed yet, but the best available answer is {deterministic_answer}."
+            )
+        else:
+            business_answer = (
+                f"The current evidence does not yet answer {humanize_text(business_question)}."
+                if business_question
+                else "The current evidence does not yet support a direct answer."
+            )
     return {
         "answer_status": answer_status if answer_status in {"direct", "partial", "insufficient"} else "partial",
         "direct_answer": business_answer,
@@ -775,6 +780,19 @@ def synthesize_answer(
                     "insufficient": "needs_more_evidence",
                 }[semantic_status]
             direct_answer = _normalize_text(semantic_answer.get("direct_answer") or direct_answer)
+            if semantic_status == "insufficient" and direct_answer and direct_answer_core:
+                refusal_markers = (
+                    "cannot yet be answered",
+                    "cannot be answered",
+                    "does not yet answer",
+                    "does not yet support a direct answer",
+                    "not yet answer",
+                )
+                if any(marker in direct_answer.lower() for marker in refusal_markers):
+                    direct_answer = (
+                        f"The exact question still cannot be confirmed, but the best available answer is "
+                        f"{humanize_text(direct_answer_core, dataframe=dataframe)}."
+                    )
             business_interpretation = _normalize_text(semantic_answer.get("business_interpretation") or business_interpretation)
             supporting_evidence_summary = _unique_lines(semantic_answer.get("supporting_evidence_summary") or supporting_evidence_summary)
             facts = _unique_lines(semantic_answer.get("observed_facts") or facts)

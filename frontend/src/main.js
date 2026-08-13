@@ -57,22 +57,31 @@ function getActiveInvestigation() {
 function mergeInvestigationRecords(existing, incoming) {
   if (!existing) return incoming;
   const merged = { ...existing, ...incoming };
-  merged.progress = existing.progress?.length ? existing.progress : incoming.progress;
-  merged.findings = existing.findings?.length ? existing.findings : incoming.findings;
-  merged.evidence = existing.evidence?.length ? existing.evidence : incoming.evidence;
-  merged.journey = existing.journey?.length ? existing.journey : incoming.journey;
-  merged.snapshots = existing.snapshots?.length ? existing.snapshots : incoming.snapshots;
-  merged.tasks = existing.tasks?.length ? existing.tasks : incoming.tasks;
-  merged.hypotheses = existing.hypotheses?.length ? existing.hypotheses : incoming.hypotheses;
-  merged.recommendations = existing.recommendations?.length ? existing.recommendations : incoming.recommendations;
-  merged.reports = { ...incoming.reports, ...existing.reports };
-  merged.answer = existing.answer?.direct && existing.answer.direct !== 'The investigation has not reached a direct answer yet.' ? existing.answer : incoming.answer;
-  merged.dataQuality = existing.dataQuality?.issues || existing.dataQuality?.rows || existing.dataQuality?.columns ? existing.dataQuality : incoming.dataQuality;
-  merged.confidence = existing.confidence?.label && existing.confidence.label !== 'Unknown' ? existing.confidence : incoming.confidence;
-  merged.analysisPlan = existing.analysisPlan?.length ? existing.analysisPlan : incoming.analysisPlan;
-  merged.selectedColumns = existing.selectedColumns?.length ? existing.selectedColumns : incoming.selectedColumns;
-  merged.visualizations = existing.visualizations?.length ? existing.visualizations : incoming.visualizations;
-  merged.raw = existing.raw || incoming.raw;
+  const hasArray = (value) => Array.isArray(value) && value.length > 0;
+  const hasAnswer = (value) => value?.direct && value.direct !== 'The investigation has not reached a direct answer yet.';
+  const hasReport = (value) =>
+    value &&
+    Object.values(value).some((item) => {
+      const result = text(item);
+      return result && result !== 'No report available yet.';
+    });
+
+  merged.progress = hasArray(incoming.progress) ? incoming.progress : existing.progress;
+  merged.findings = hasArray(incoming.findings) ? incoming.findings : existing.findings;
+  merged.evidence = hasArray(incoming.evidence) ? incoming.evidence : existing.evidence;
+  merged.journey = hasArray(incoming.journey) ? incoming.journey : existing.journey;
+  merged.snapshots = hasArray(incoming.snapshots) ? incoming.snapshots : existing.snapshots;
+  merged.tasks = hasArray(incoming.tasks) ? incoming.tasks : existing.tasks;
+  merged.hypotheses = hasArray(incoming.hypotheses) ? incoming.hypotheses : existing.hypotheses;
+  merged.recommendations = hasArray(incoming.recommendations) ? incoming.recommendations : existing.recommendations;
+  merged.reports = hasReport(incoming.reports) ? incoming.reports : existing.reports;
+  merged.answer = hasAnswer(incoming.answer) ? incoming.answer : existing.answer;
+  merged.dataQuality = incoming.dataQuality?.issues || incoming.dataQuality?.rows || incoming.dataQuality?.columns ? incoming.dataQuality : existing.dataQuality;
+  merged.confidence = incoming.confidence?.label && incoming.confidence.label !== 'Unknown' ? incoming.confidence : existing.confidence;
+  merged.analysisPlan = hasArray(incoming.analysisPlan) ? incoming.analysisPlan : existing.analysisPlan;
+  merged.selectedColumns = hasArray(incoming.selectedColumns) ? incoming.selectedColumns : existing.selectedColumns;
+  merged.visualizations = hasArray(incoming.visualizations) ? incoming.visualizations : existing.visualizations;
+  merged.raw = incoming.raw || existing.raw;
   return merged;
 }
 
@@ -100,7 +109,7 @@ async function loadInvestigation(id) {
   if (!id) return null;
   const existing = state.investigations.find((item) => item.id === id) || null;
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 3500);
+  const timeout = window.setTimeout(() => controller.abort(), 20000);
   try {
     const response = await getWorkspaceInvestigation(id, { signal: controller.signal });
     const investigation = normalizeInvestigation(response.investigation || response);
@@ -157,7 +166,8 @@ async function waitForInvestigationResult(clientRequestId, fallbackQuery = {}) {
     try {
       const payload = await listInvestigations();
       const match = (payload.investigations || []).find((item) => item.client_request_id === clientRequestId);
-      if (match) {
+      const status = text(match?.status).toLowerCase();
+      if (match && (status === 'completed' || status === 'awaiting_user' || status === 'cancelled' || status === 'failed' || match.has_report)) {
         return await loadInvestigation(match.id);
       }
     } catch (error) {
@@ -182,7 +192,7 @@ async function waitForInvestigationResult(clientRequestId, fallbackQuery = {}) {
   return null;
 }
 
-function createPendingInvestigation(payload) {
+function createPendingInvestigation(payload, id) {
   const dataset = state.bootstrap.datasets.find((item) => item.path === payload.datasetPath) || {
     name: payload.datasetPath || 'Selected dataset',
     path: payload.datasetPath || '',
@@ -191,7 +201,7 @@ function createPendingInvestigation(payload) {
     columnCount: null,
   };
   return normalizeInvestigation({
-    id: `pending-${Date.now()}`,
+    id: id || `pending-${Date.now()}`,
     question: payload.question,
     business_question: payload.question,
     mode: payload.mode || 'autonomous',
@@ -349,8 +359,8 @@ function renderSidebar() {
 function renderHome() {
   const bootstrap = state.bootstrap;
   const investigations = bootstrap.recentInvestigations || [];
-  const completedCount = investigations.filter((item) => String(item.status).toLowerCase() === 'completed' || item.has_report).length;
-  const runningCount = investigations.filter((item) => String(item.status).toLowerCase().includes('running') || String(item.status).toLowerCase().includes('awaiting')).length;
+  const completedCount = investigations.filter((item) => text(item.status).toLowerCase() === 'completed' || item.has_report).length;
+  const runningCount = investigations.filter((item) => text(item.status).toLowerCase().includes('running') || text(item.status).toLowerCase().includes('awaiting')).length;
   return `
     <section class="page-stack">
       <header class="page-hero">
@@ -542,14 +552,14 @@ function renderInvestigationList(items) {
           (item) => `
             <button class="investigation-card" data-action="open-investigation" data-id="${escapeHtml(item.id)}">
               <div class="card-topline">
-                <span class="card-mode">${escapeHtml(item.mode)}</span>
-                <span class="card-status ${escapeHtml(item.status)}">${escapeHtml(item.status)}</span>
+                <span class="card-mode">${escapeHtml(text(item.mode?.label || item.mode))}</span>
+                <span class="card-status ${escapeHtml(text(item.status))}">${escapeHtml(text(item.status))}</span>
               </div>
               <h3>${escapeHtml(item.question)}</h3>
-              <p>${escapeHtml(item.answer || 'No direct answer yet.')}</p>
+              <p>${escapeHtml(text(item.answer?.direct || item.answer?.business || item.answer) || 'No direct answer yet.')}</p>
               <div class="card-meta">
                 <span>${escapeHtml(item.dataset?.name || 'Unknown dataset')}</span>
-                <span>${escapeHtml(item.confidence || 'Unknown confidence')}</span>
+                <span>${escapeHtml(text(item.confidence) || 'Unknown confidence')}</span>
               </div>
             </button>
           `,
@@ -624,7 +634,7 @@ function renderDatasets() {
 }
 
 function renderReports() {
-  const completed = state.investigations.filter((item) => item.status === 'completed' || item.raw?.final_report);
+  const completed = state.investigations.filter((item) => text(item.status).toLowerCase() === 'completed' || item.raw?.final_report);
   const selected = completed.find((item) => item.id === state.activeInvestigationId) || completed[0];
   return `
     <section class="page-stack">
@@ -659,8 +669,8 @@ function renderReports() {
 
 function renderInvestigations() {
   const investigations = state.investigations;
-  const running = investigations.filter((item) => String(item.status).toLowerCase().includes('running') || String(item.status).toLowerCase().includes('awaiting'));
-  const completed = investigations.filter((item) => String(item.status).toLowerCase() === 'completed' || item.has_report);
+  const running = investigations.filter((item) => text(item.status).toLowerCase().includes('running') || text(item.status).toLowerCase().includes('awaiting'));
+  const completed = investigations.filter((item) => text(item.status).toLowerCase() === 'completed' || item.has_report);
   return `
     <section class="page-stack">
       <header class="page-hero compact">
@@ -723,26 +733,26 @@ function renderWorkspace() {
   const investigation = getActiveInvestigation() || state.investigations[0] || emptyInvestigation();
   const stage = investigation.progress.find((item) => item.key === state.selectedStage) || investigation.progress.find((item) => item.status === 'current') || investigation.progress[0];
   const reportText = investigation.reports[state.selectedReport] || investigation.reports.analyst || investigation.reports.master;
-  const status = String(investigation.status || '').toLowerCase();
-  const mode = String(investigation.mode?.id || investigation.mode || '').toLowerCase();
+  const status = text(investigation.status).toLowerCase();
+  const mode = text(investigation.mode?.id || investigation.mode).toLowerCase();
   const isRunning = status.includes('running') || status.includes('queued') || status.includes('in_progress');
   const isAwaiting = status.includes('await');
   const isCompleted = status.includes('completed') || investigation.has_report || investigation.reports.analyst !== 'No report available yet.';
+
+  if (mode === 'collaborative') {
+    return renderCollaborativeWorkspace(investigation, stage, { completed: isCompleted });
+  }
 
   if (isCompleted) {
     return renderCompletedWorkspace(investigation, stage, reportText);
   }
 
-  if (mode === 'collaborative') {
-    return renderCollaborativeWorkspace(investigation, stage, reportText);
-  }
-
   if (mode === 'guided') {
-    return renderGuidedWorkspace(investigation, stage, reportText);
+    return renderGuidedWorkspace(investigation, stage, reportText, isAwaiting, isRunning);
   }
 
   if (isAwaiting) {
-    return renderGuidedWorkspace(investigation, stage, reportText);
+    return renderGuidedWorkspace(investigation, stage, reportText, true, isRunning);
   }
 
   if (isRunning) {
@@ -833,10 +843,19 @@ function renderCompletedWorkspace(investigation, stage, reportText) {
         <main class="main-pane">
           ${activeTab === 'overview' ? `
             <section class="stage-panel answer-panel">
-              <div class="section-label">Direct Answer</div>
+              <div class="section-head">
+                <div>
+                  <div class="section-label">Direct Answer</div>
+                  <h2>${escapeHtml(investigation.answer.direct)}</h2>
+                </div>
+                <button class="link-button" type="button" data-action="open-answer">View more</button>
+              </div>
               <div class="answer-card answer-hero">
-                <h2>${escapeHtml(investigation.answer.direct)}</h2>
                 <p>${escapeHtml(investigation.answer.business || 'The answer is supported by the evidence trail below.')}</p>
+                <div class="answer-meta">
+                  <span class="status-badge ${investigation.confidence.label === 'High' ? 'good' : investigation.confidence.label === 'Moderate' ? 'warn' : 'active'}">Confidence ${escapeHtml(investigation.confidence.label)}</span>
+                  <span>${escapeHtml(investigation.answer.position || 'unknown')}${investigation.selectedColumns.length ? ` | ${escapeHtml(investigation.selectedColumns.join(' | '))}` : ''}</span>
+                </div>
               </div>
             </section>
             <section class="stage-panel">
@@ -845,8 +864,9 @@ function renderCompletedWorkspace(investigation, stage, reportText) {
                   <div class="section-label">Key Recommendations</div>
                   <h2>What to do next</h2>
                 </div>
+                <button class="link-button" type="button" data-action="open-recommendation" data-index="0">View more</button>
               </div>
-              ${investigation.recommendations.length ? investigation.recommendations.map((item) => `<div class="recommendation-row"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></div>`).join('') : '<p class="subtle">No recommendations were exposed.</p>'}
+              ${investigation.recommendations.length ? investigation.recommendations.map((item, index) => `<button class="recommendation-row" type="button" data-action="open-recommendation" data-index="${index}"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></button>`).join('') : '<p class="subtle">No recommendations were exposed.</p>'}
             </section>
           ` : ''}
 
@@ -857,7 +877,13 @@ function renderCompletedWorkspace(investigation, stage, reportText) {
           ` : ''}
           ${activeTab === 'reports' ? `
             <section class="stage-panel">
-              <div class="section-label">Report</div>
+              <div class="section-head">
+                <div>
+                  <div class="section-label">Report</div>
+                  <h2>Investigation output</h2>
+                </div>
+                <button class="link-button" type="button" data-action="open-report">View more</button>
+              </div>
               <div class="report-tabs">
                 ${['analyst', 'business', 'executive']
                   .map(
@@ -869,7 +895,9 @@ function renderCompletedWorkspace(investigation, stage, reportText) {
                   )
                   .join('')}
               </div>
-              <pre>${escapeHtml(reportText)}</pre>
+              <div class="report-body">
+                <pre>${escapeHtml(reportText)}</pre>
+              </div>
             </section>
           ` : ''}
         </main>
@@ -897,8 +925,11 @@ function renderRunningWorkspace(investigation, stage) {
   ];
   const currentIndex = Math.max(0, investigation.progress.findIndex((item) => item.key === stage.key));
   const activeLabel = progressSteps[Math.min(progressSteps.length - 1, currentIndex)];
+  const workflowStatus = investigation.workflowStatus || {};
+  const workflowMessage = workflowStatus.message || `Working on ${activeLabel.toLowerCase()} for ${investigation.question}`;
+  const workflowPercent = Number.isFinite(Number(workflowStatus.progress)) ? Number(workflowStatus.progress) : Math.round(((currentIndex + 1) / Math.max(1, investigation.progress.length)) * 100);
   const activityLines = [
-    `Working on ${activeLabel.toLowerCase()} for ${investigation.question}`,
+    workflowMessage,
     ...investigation.analysisPlan.slice(0, 5).map((item) => text(typeof item === 'string' ? item : item.description || item.purpose || item.tool || JSON.stringify(item))),
   ].filter(Boolean);
   const logLines = [
@@ -907,7 +938,7 @@ function renderRunningWorkspace(investigation, stage) {
     `Current stage: ${stage.label}`,
     ...(investigation.journey.slice(0, 5).map((item) => `${item.label}: ${item.detail}`)),
   ];
-  const percent = Math.round(((currentIndex + 1) / Math.max(1, investigation.progress.length)) * 100);
+  const percent = workflowPercent;
   return `
     <section class="workspace running-workspace">
       ${renderWorkspaceHeader(investigation, {
@@ -943,6 +974,7 @@ function renderRunningWorkspace(investigation, stage) {
               <div class="progress-bar"><span style="width: ${percent}%;"></span></div>
               <div class="progress-percent">${percent}%</div>
             </div>
+            <p class="subtle">${escapeHtml(workflowMessage)}</p>
             <div class="metrics-grid">
               <div><span class="metric-label">Elapsed</span><strong>--:--</strong></div>
               <div><span class="metric-label">Remaining</span><strong>--:--</strong></div>
@@ -961,24 +993,34 @@ function renderRunningWorkspace(investigation, stage) {
   `;
 }
 
-function renderGuidedWorkspace(investigation, stage) {
+function renderGuidedWorkspace(investigation, stage, reportText, canInteract = false, isRunning = false) {
   const established = investigation.findings.slice(0, 3);
   const proposals = investigation.recommendations.slice(0, 3);
   const currentPhase = stage.label || 'Checkpoint';
+  const workflowStatus = investigation.workflowStatus || {};
+  const progressPercent = Number.isFinite(Number(workflowStatus.progress))
+    ? Number(workflowStatus.progress)
+    : Math.round((Math.max(1, investigation.progress.findIndex((item) => item.key === stage.key) + 1) / Math.max(1, investigation.progress.length)) * 100);
+  const statusLabel = canInteract ? 'Awaiting your input' : isRunning ? 'Running guided workflow' : 'Guided';
+  const bannerTitle = canInteract ? 'Review required' : isRunning ? 'Running guided workflow' : 'Guided workflow';
   return `
     <section class="workspace guided-workspace">
       ${renderWorkspaceHeader(investigation, {
-        status: 'Awaiting your input',
+        status: statusLabel,
         subline: `Checkpoint: ${currentPhase}`,
-        headerBadge: 'Review required',
+        headerBadge: canInteract ? 'Review required' : `Progress ${progressPercent}%`,
       })}
 
       ${renderProgressRail(investigation, stage)}
 
       <section class="review-banner">
         <div>
-          <div class="review-label">Review required</div>
-          <p>${escapeHtml(investigation.answer.business || 'The workflow has reached a checkpoint and is waiting for your decision before it proceeds.')}</p>
+          <div class="review-label">${escapeHtml(bannerTitle)}</div>
+          <p>${escapeHtml(canInteract ? (investigation.answer.business || 'The workflow has reached a checkpoint and is waiting for your decision before it proceeds.') : (workflowStatus.message || 'The guided workflow is still maturing. Checkpoints and decisions will appear as the backend advances.'))}</p>
+          <div class="progress-bar-row">
+            <div class="progress-bar"><span style="width: ${progressPercent}%;"></span></div>
+            <div class="progress-percent">${progressPercent}%</div>
+          </div>
         </div>
       </section>
 
@@ -1026,15 +1068,15 @@ function renderGuidedWorkspace(investigation, stage) {
               </div>
             </div>
             <div class="decision-grid">
-              <button class="decision-card continue" data-action="guided-continue">
+              <button class="decision-card continue" data-action="guided-continue" ${canInteract ? '' : 'disabled aria-disabled="true"'}>
                 <strong>Continue</strong>
                 <span>Proceed with this plan</span>
               </button>
-              <button class="decision-card modify" data-action="guided-modify">
+              <button class="decision-card modify" data-action="guided-modify" ${canInteract ? '' : 'disabled aria-disabled="true"'}>
                 <strong>Modify</strong>
                 <span>Adjust the approach</span>
               </button>
-              <button class="decision-card cancel" data-action="guided-stop">
+              <button class="decision-card cancel" data-action="guided-stop" ${canInteract ? '' : 'disabled aria-disabled="true"'}>
                 <strong>Cancel</strong>
                 <span>Stop this investigation</span>
               </button>
@@ -1047,7 +1089,7 @@ function renderGuidedWorkspace(investigation, stage) {
           ${renderSnapshotsPanel(investigation)}
           <section class="panel">
             <div class="section-label">What happens next</div>
-            <p class="subtle">The workflow will pause until you make a decision.</p>
+            <p class="subtle">${escapeHtml(canInteract ? 'The workflow will pause until you make a decision.' : 'The backend is still progressing toward the checkpoint. The controls will unlock when input is needed.')}</p>
           </section>
         </aside>
       </div>
@@ -1057,13 +1099,14 @@ function renderGuidedWorkspace(investigation, stage) {
   `;
 }
 
-function renderCollaborativeWorkspace(investigation, stage) {
+function renderCollaborativeWorkspace(investigation, stage, options = {}) {
+  const completed = Boolean(options.completed || text(investigation.status).toLowerCase().includes('completed'));
   return `
     <section class="workspace collaborative-workspace">
       ${renderWorkspaceHeader(investigation, {
-        status: 'Collaborative',
+        status: completed ? 'completed' : 'collaborative',
         subline: `Question: ${investigation.question}`,
-        headerBadge: 'Active',
+        headerBadge: completed ? 'Completed' : 'Active',
       })}
 
       <div class="workspace-grid collaborative-grid">
@@ -1127,7 +1170,7 @@ function renderCollaborativeWorkspace(investigation, stage) {
           ${renderSnapshotsPanel(investigation)}
           <section class="panel">
             <div class="section-label">Next best actions</div>
-            ${investigation.recommendations.length ? investigation.recommendations.slice(0, 4).map((item) => `<div class="recommendation-row"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></div>`).join('') : '<p class="subtle">No next action is currently exposed.</p>'}
+            ${investigation.recommendations.length ? investigation.recommendations.slice(0, 4).map((item, index) => `<button class="recommendation-row" type="button" data-action="open-recommendation" data-index="${index}"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></button>`).join('') : '<p class="subtle">No next action is currently exposed.</p>'}
           </section>
         </aside>
       </div>
@@ -1200,9 +1243,14 @@ function renderMainStage(investigation, stage) {
   if (stage.key === 'finding') {
     return `
       <section class="stage-panel">
-        <div class="section-label">Direct Answer</div>
+        <div class="section-head">
+          <div>
+            <div class="section-label">Direct Answer</div>
+            <h2>${escapeHtml(investigation.answer.direct)}</h2>
+          </div>
+          <button class="link-button" type="button" data-action="open-answer">View more</button>
+        </div>
         <div class="answer-card">
-          <h2>${escapeHtml(investigation.answer.direct)}</h2>
           <p>${escapeHtml(investigation.answer.business || 'The answer is derived from the strongest evidence in the investigation.')}</p>
         </div>
       </section>
@@ -1210,14 +1258,20 @@ function renderMainStage(investigation, stage) {
   }
 
   if (stage.key === 'answer') {
+    const selectedColumns = investigation.selectedColumns.map((column) => text(column)).filter(Boolean);
     return `
       <section class="stage-panel">
-        <div class="section-label">Answer</div>
+        <div class="section-head">
+          <div>
+            <div class="section-label">Answer</div>
+            <h2>${escapeHtml(investigation.answer.direct)}</h2>
+          </div>
+          <button class="link-button" type="button" data-action="open-answer">View more</button>
+        </div>
         <div class="answer-card answer-hero">
-          <h2>${escapeHtml(investigation.answer.direct)}</h2>
           <div class="answer-meta">
             <span class="status-badge ${investigation.confidence.label === 'High' ? 'good' : investigation.confidence.label === 'Moderate' ? 'warn' : 'active'}">Confidence ${escapeHtml(investigation.confidence.label)}</span>
-            <span>${escapeHtml(investigation.answer.position || 'unknown')}${investigation.selectedColumns.length ? ` | ${investigation.selectedColumns.join(' | ')}` : ''}</span>
+            <span>${escapeHtml(investigation.answer.position || 'unknown')}${selectedColumns.length ? ` | ${escapeHtml(selectedColumns.join(' | '))}` : ''}</span>
           </div>
           <p>${escapeHtml(investigation.answer.business || investigation.confidence.reason || 'The answer is supported by the evidence trail below.')}</p>
         </div>
@@ -1245,6 +1299,7 @@ function renderFindingsSection(investigation) {
           <div class="section-label">Findings</div>
           <h2>Evidence-backed observations</h2>
         </div>
+        <button class="link-button" type="button" data-action="open-finding" data-index="0">View more</button>
         <div class="subtle">${findings.length ? `${findings.length} finding${findings.length === 1 ? '' : 's'}` : 'No findings yet'}</div>
       </div>
       <div class="finding-list">
@@ -1274,6 +1329,7 @@ function renderFindingsSection(investigation) {
 }
 
 function renderEvidenceSection(investigation) {
+  const chartItems = toArray(investigation.visualizations).filter(Boolean);
   return `
     <section class="stage-panel">
       <div class="section-head">
@@ -1281,7 +1337,7 @@ function renderEvidenceSection(investigation) {
           <div class="section-label">Evidence</div>
           <h2>Supporting evidence and supporting details</h2>
         </div>
-        <button class="link-button" data-action="toggle-evidence-summary">Toggle drawer</button>
+        <button class="link-button" type="button" data-action="open-evidence" data-index="0">View more</button>
       </div>
       <div class="evidence-grid">
         ${investigation.evidence.length
@@ -1296,6 +1352,25 @@ function renderEvidenceSection(investigation) {
             ).join('')
           : '<div class="empty-state">The backend has not exposed supporting evidence yet.</div>'}
       </div>
+      ${chartItems.length ? `
+        <div class="section-label mt">Charts</div>
+        <div class="evidence-chart-grid">
+          ${chartItems.slice(0, 6).map((visual, index) => {
+            const src = chartAssetUrl(visual);
+            const title = text(visual.title || visual.caption || visual.type || `Chart ${index + 1}`);
+            const summary = text(visual.caption || visual.summary || visual.file_path || visual.path || 'Generated chart');
+            return `
+              <button class="evidence-chart-card" type="button" data-action="open-visualization" data-index="${index}">
+                ${src ? `<img class="evidence-chart-image" src="${escapeHtml(src)}" alt="${escapeHtml(title)}" loading="lazy" />` : ''}
+                <div class="evidence-chart-body">
+                  <strong>${escapeHtml(title)}</strong>
+                  <span>${escapeHtml(summary)}</span>
+                </div>
+              </button>
+            `;
+          }).join('')}
+        </div>
+      ` : ''}
     </section>
   `;
 }
@@ -1308,6 +1383,7 @@ function renderReportSection(investigation, reportText) {
           <div class="section-label">Reports</div>
           <h2>Investigation outputs</h2>
         </div>
+        <button class="link-button" type="button" data-action="open-report">View more</button>
         <div class="report-tabs compact">
           ${['analyst', 'business', 'executive']
             .map(
@@ -1341,7 +1417,7 @@ function renderConfidencePanel(investigation) {
           investigation.confidence.recommendation,
         ]
           .filter(Boolean)
-          .map((signal) => `<div class="signal-row"><span class="signal-check">+</span><span>${escapeHtml(signal.label || signal.reason || String(signal))}</span></div>`)
+          .map((signal) => `<div class="signal-row"><span class="signal-check">+</span><span>${escapeHtml(text(signal))}</span></div>`)
           .join('')}
       </div>
     </section>
@@ -1359,15 +1435,39 @@ function renderSummaryPanel(investigation) {
         <div><dt>Mode</dt><dd>${escapeHtml(investigation.mode.label)}</dd></div>
       </dl>
       <div class="section-label mt">Recommended action</div>
-      ${investigation.recommendations.length ? investigation.recommendations.map((item) => `<div class="recommendation-row"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></div>`).join('') : '<p class="subtle">No recommendation is currently exposed.</p>'}
+      ${investigation.recommendations.length ? investigation.recommendations.map((item, index) => `<button class="recommendation-row" type="button" data-action="open-recommendation" data-index="${index}"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></button>`).join('') : '<p class="subtle">No recommendation is currently exposed.</p>'}
     </section>
+  `;
+}
+
+function renderJsonPanel(title, value) {
+  return `
+    <div class="drawer-block">
+      <h3>${escapeHtml(title)}</h3>
+      <pre>${escapeHtml(JSON.stringify(value ?? {}, null, 2))}</pre>
+    </div>
+  `;
+}
+
+function renderListPanel(title, items, formatter) {
+  return `
+    <div class="drawer-block">
+      <h3>${escapeHtml(title)}</h3>
+      ${items.length ? `<ul>${items.map((item) => `<li>${escapeHtml(formatter(item))}</li>`).join('')}</ul>` : '<p class="subtle">None available.</p>'}
+    </div>
   `;
 }
 
 function renderJourneyPanel(investigation) {
   return `
     <section class="context-card">
-      <div class="section-label">Journey</div>
+      <div class="section-head compact-head">
+        <div>
+          <div class="section-label">Journey</div>
+          <div class="subtle">${investigation.journey.length ? `${investigation.journey.length} steps available` : 'Journey available from the workflow trail'}</div>
+        </div>
+        <button class="link-button" type="button" data-action="open-journey">View more</button>
+      </div>
       <div class="journey-list">
         ${investigation.journey.length
           ? investigation.journey.map(
@@ -1503,7 +1603,181 @@ function renderDrawer(investigation, drawer) {
           </div>
           <div class="drawer-body">
             <p>${escapeHtml(item.summary)}</p>
+            ${item.kind === 'visual' && chartAssetUrl(item.detail) ? `<img class="drawer-chart-image" src="${escapeHtml(chartAssetUrl(item.detail))}" alt="${escapeHtml(item.label)}" />` : ''}
             <pre>${escapeHtml(item.detail)}</pre>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  if (drawer.kind === 'visualization') {
+    const visual = investigation.visualizations[drawer.index];
+    if (!visual) return '';
+    const src = chartAssetUrl(visual);
+    const title = text(visual.title || visual.caption || visual.type || 'Chart');
+    return `
+      <div class="drawer-backdrop" data-action="close-drawer">
+        <div class="drawer drawer-wide" role="dialog" aria-modal="true" aria-label="Visualization details">
+          <div class="drawer-head">
+            <div>
+              <div class="section-label">Visualization</div>
+              <h2>${escapeHtml(title)}</h2>
+            </div>
+            <button class="icon-button" data-action="close-drawer">Close</button>
+          </div>
+          <div class="drawer-body">
+            ${src ? `<img class="drawer-chart-image" src="${escapeHtml(src)}" alt="${escapeHtml(title)}" />` : ''}
+            <p>${escapeHtml(text(visual.caption || visual.summary || visual.file_path || visual.path || 'Generated chart'))}</p>
+            ${renderJsonPanel('Raw visualization payload', visual)}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  if (drawer.kind === 'answer') {
+    return `
+      <div class="drawer-backdrop" data-action="close-drawer">
+        <div class="drawer drawer-wide" role="dialog" aria-modal="true" aria-label="Answer details">
+          <div class="drawer-head">
+            <div>
+              <div class="section-label">Direct Answer</div>
+              <h2>${escapeHtml(investigation.answer.direct)}</h2>
+            </div>
+            <button class="icon-button" data-action="close-drawer">Close</button>
+          </div>
+          <div class="drawer-body">
+            <div class="drawer-block">
+              <h3>Business interpretation</h3>
+              <p>${escapeHtml(investigation.answer.business || 'No business interpretation was exposed.')}</p>
+            </div>
+            <div class="snapshot-card-grid">
+              <article class="snapshot-detail-card"><span class="snapshot-detail-label">Confidence</span><strong>${escapeHtml(investigation.confidence.label)}</strong></article>
+              <article class="snapshot-detail-card"><span class="snapshot-detail-label">Position</span><strong>${escapeHtml(investigation.answer.position || 'unknown')}</strong></article>
+              <article class="snapshot-detail-card"><span class="snapshot-detail-label">Mode</span><strong>${escapeHtml(investigation.mode.label)}</strong></article>
+              <article class="snapshot-detail-card"><span class="snapshot-detail-label">Selected columns</span><strong>${escapeHtml(investigation.selectedColumns.length ? investigation.selectedColumns.join(' | ') : 'None')}</strong></article>
+            </div>
+            ${renderListPanel('Supporting evidence', investigation.answer.supportingEvidence, (item) => plainText(item.statement || item.summary || item.insight || item))}
+            ${renderListPanel('Observed facts', investigation.answer.observedFacts, (item) => plainText(item))}
+            ${renderListPanel('Analytical interpretation', investigation.answer.analyticalInterpretation, (item) => plainText(item))}
+            ${renderListPanel('Assumptions', investigation.answer.assumptions, (item) => plainText(item))}
+            ${renderListPanel('Uncertainty', investigation.answer.uncertainty, (item) => plainText(item))}
+            ${renderListPanel('Next investigation', investigation.answer.nextInvestigation, (item) => plainText(typeof item === 'string' ? item : item.request || item.title || item.summary || item.value || JSON.stringify(item)))}
+            ${renderJsonPanel('Raw answer payload', investigation.raw?.analysis_evidence?.answer_synthesis || investigation.raw?.answer_synthesis || {})}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  if (drawer.kind === 'report') {
+    const reportKey = state.selectedReport || 'analyst';
+    const reports = investigation.reports || {};
+    const reportMap = {
+      analyst: reports.analyst,
+      business: reports.business,
+      executive: reports.executive,
+      master: reports.master,
+      answer: reports.answerSynthesis,
+      decision: reports.decision,
+    };
+    const selectedReport = reportMap[reportKey] || reports.analyst || reports.master || '';
+    const reportPackage = investigation.raw?.analysis_evidence?.report_package || investigation.raw?.report_package || {};
+    return `
+      <div class="drawer-backdrop" data-action="close-drawer">
+        <div class="drawer drawer-wide" role="dialog" aria-modal="true" aria-label="Report details">
+          <div class="drawer-head">
+            <div>
+              <div class="section-label">Reports</div>
+              <h2>${escapeHtml(investigation.question)}</h2>
+            </div>
+            <button class="icon-button" data-action="close-drawer">Close</button>
+          </div>
+          <div class="drawer-body">
+            <div class="report-tabs">
+              ${[
+                ['analyst', 'Analyst'],
+                ['business', 'Business'],
+                ['executive', 'Executive'],
+                ['master', 'Master'],
+                ['answer', 'Answer synthesis'],
+                ['decision', 'Decision'],
+              ].map(([key, label]) => `
+                <button class="report-tab ${reportKey === key ? 'active' : ''}" data-action="select-report" data-report="${key}">${label}</button>
+              `).join('')}
+            </div>
+            <div class="drawer-block">
+              <h3>${escapeHtml(reportKey.charAt(0).toUpperCase() + reportKey.slice(1))} report</h3>
+              <pre>${escapeHtml(selectedReport || 'No report available yet.')}</pre>
+            </div>
+            ${renderJsonPanel('Report bundle', reportPackage)}
+            ${renderJsonPanel('Traceability', reportPackage.traceability || {})}
+            ${renderJsonPanel('Answer synthesis', investigation.raw?.analysis_evidence?.answer_synthesis || investigation.raw?.answer_synthesis || {})}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  if (drawer.kind === 'recommendation') {
+    const recommendations = investigation.recommendations || [];
+    const selected = recommendations[drawer.index] || recommendations[0] || null;
+    return `
+      <div class="drawer-backdrop" data-action="close-drawer">
+        <div class="drawer drawer-wide" role="dialog" aria-modal="true" aria-label="Recommendation details">
+          <div class="drawer-head">
+            <div>
+              <div class="section-label">Recommendations</div>
+              <h2>What to do next</h2>
+            </div>
+            <button class="icon-button" data-action="close-drawer">Close</button>
+          </div>
+          <div class="drawer-body">
+            ${selected ? `
+              <div class="drawer-block">
+                <h3>${escapeHtml(selected.label || 'Recommended action')}</h3>
+                <p>${escapeHtml(selected.value || '')}</p>
+              </div>
+            ` : ''}
+            ${recommendations.length ? recommendations.map((item, index) => `
+              <div class="drawer-block">
+                <h3>${escapeHtml(item.label || `Recommendation ${index + 1}`)}</h3>
+                <p>${escapeHtml(item.value)}</p>
+              </div>
+            `).join('') : '<p class="subtle">No recommendations were exposed.</p>'}
+            ${renderJsonPanel('Raw recommendation payload', investigation.raw?.analysis_evidence?.answer_synthesis || investigation.raw?.answer_synthesis || {})}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  if (drawer.kind === 'journey') {
+    return `
+      <div class="drawer-backdrop" data-action="close-drawer">
+        <div class="drawer drawer-wide" role="dialog" aria-modal="true" aria-label="Journey details">
+          <div class="drawer-head">
+            <div>
+              <div class="section-label">Journey</div>
+              <h2>Workflow trail</h2>
+            </div>
+            <button class="icon-button" data-action="close-drawer">Close</button>
+          </div>
+          <div class="drawer-body">
+            <div class="journey-list">
+              ${investigation.journey.length
+                ? investigation.journey.map((step, index) => `
+                  <div class="journey-step ${step.status}">
+                    <div class="journey-bullet"></div>
+                    <div>
+                      <strong>${escapeHtml(step.label)}</strong>
+                      <p>${escapeHtml(step.detail)}</p>
+                      <div class="subtle">Step ${index + 1}${step.timestamp ? ` | ${escapeHtml(new Date(step.timestamp).toLocaleString())}` : ''}</div>
+                    </div>
+                  </div>
+                `).join('')
+                : '<p class="subtle">No journey trail was exposed.</p>'}
+            </div>
+            ${renderJsonPanel('Raw journey payload', {
+              guided_decision_log: investigation.raw?.guided_decision_log || investigation.raw?.analysis_evidence?.guided_decision_log || [],
+              collaborative_decision_log: investigation.raw?.collaborative_decision_log || investigation.raw?.analysis_evidence?.collaborative_decision_log || [],
+            })}
           </div>
         </div>
       </div>
@@ -1646,11 +1920,74 @@ function escapeHtml(value) {
 }
 
 function text(value) {
-  return String(value ?? '').trim();
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => text(item))
+      .filter(Boolean)
+      .join(', ')
+      .trim();
+  }
+  if (typeof value === 'object') {
+    const preferredKeys = [
+      'label',
+      'name',
+      'title',
+      'headline',
+      'summary',
+      'text',
+      'value',
+      'reason',
+      'description',
+      'insight',
+      'message',
+      'direct_answer',
+      'business_interpretation',
+      'statement',
+      'request',
+      'question',
+      'answer',
+      'detail',
+      'explanation',
+      'recommended_action',
+      'decision_summary',
+      'confidence',
+    ];
+    for (const key of preferredKeys) {
+      const result = text(value[key]);
+      if (result) return result;
+    }
+    const entries = Object.entries(value);
+    if (entries.length === 1) {
+      return text(entries[0][1]);
+    }
+    try {
+      const result = JSON.stringify(value);
+      if (result && result !== '{}') return result;
+    } catch (error) {
+      void error;
+    }
+    return '';
+  }
+  return String(value).trim();
 }
 
 function plainText(value) {
-  return String(value ?? '').trim();
+  return text(value);
+}
+
+function chartAssetUrl(value) {
+  if (typeof value === 'object' && value?.data_url) {
+    return text(value.data_url);
+  }
+  const rawPath = text(typeof value === 'string' ? value : value?.file_path || value?.path || value?.src || '');
+  if (!rawPath) return '';
+  const normalized = rawPath.replace(/\\/g, '/');
+  const fileName = normalized.split('/').pop();
+  if (!fileName) return '';
+  return `/charts/${encodeURIComponent(fileName)}`;
 }
 
 function renderReportBody(investigation) {
@@ -1662,7 +1999,10 @@ function renderReportBody(investigation) {
           <strong>${escapeHtml(investigation.question)}</strong>
           <div class="subtle">${escapeHtml(investigation.dataset?.name || 'Unknown dataset')}</div>
         </div>
-        <div class="status-badge ${investigation.confidence.label === 'High' ? 'good' : investigation.confidence.label === 'Moderate' ? 'warn' : 'active'}">Confidence ${escapeHtml(investigation.confidence.label)}</div>
+        <div class="report-summary-actions">
+          <div class="status-badge ${investigation.confidence.label === 'High' ? 'good' : investigation.confidence.label === 'Moderate' ? 'warn' : 'active'}">Confidence ${escapeHtml(investigation.confidence.label)}</div>
+          <button class="link-button" type="button" data-action="open-report">View more</button>
+        </div>
       </div>
       <pre>${escapeHtml(reportText)}</pre>
     </div>
@@ -1701,7 +2041,7 @@ async function runQuestion(payload) {
   state.loading = true;
   state.error = null;
   const clientRequestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const pendingInvestigation = createPendingInvestigation(payload);
+  const pendingInvestigation = createPendingInvestigation(payload, clientRequestId);
   state.investigations = [pendingInvestigation, ...state.investigations.filter((item) => item.id !== pendingInvestigation.id)];
   state.activeInvestigationId = pendingInvestigation.id;
   state.view = 'investigations';
@@ -1726,6 +2066,17 @@ async function runQuestion(payload) {
     render();
   };
 
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    window.clearTimeout(timeoutId);
+    state.loading = false;
+    render();
+  };
+
+  const timeoutId = window.setTimeout(finish, RUN_POLL_TIMEOUT_MS + 1000);
+
   void runInvestigation(requestPayload)
     .then((response) => {
       const investigation = response.investigation || response;
@@ -1738,15 +2089,9 @@ async function runQuestion(payload) {
       if (investigation) {
         syncCurrent(investigation);
       }
+      finish();
     })
     .catch(() => undefined);
-
-  try {
-    await sleep(1000);
-  } finally {
-    state.loading = false;
-    render();
-  }
 }
 
 function collectInvestigationForm() {
@@ -1805,12 +2150,45 @@ async function handleAction(action, target) {
     return;
   }
   if (action === 'open-finding') {
+    const current = getActiveInvestigation();
+    if (!current?.findings?.length) return;
     state.drawer = { kind: 'finding', index: Number(target.dataset.index || 0) };
     render();
     return;
   }
   if (action === 'open-evidence') {
+    const current = getActiveInvestigation();
+    if (!current?.evidence?.length) return;
     state.drawer = { kind: 'evidence', index: Number(target.dataset.index || 0) };
+    render();
+    return;
+  }
+  if (action === 'open-visualization') {
+    const current = getActiveInvestigation();
+    if (!current?.visualizations?.length) return;
+    state.drawer = { kind: 'visualization', index: Number(target.dataset.index || 0) };
+    render();
+    return;
+  }
+  if (action === 'open-answer') {
+    state.drawer = { kind: 'answer' };
+    render();
+    return;
+  }
+  if (action === 'open-report') {
+    state.drawer = { kind: 'report' };
+    render();
+    return;
+  }
+  if (action === 'open-recommendation') {
+    const current = getActiveInvestigation();
+    if (!current?.recommendations?.length) return;
+    state.drawer = { kind: 'recommendation', index: Number(target.dataset.index || 0) };
+    render();
+    return;
+  }
+  if (action === 'open-journey') {
+    state.drawer = { kind: 'journey' };
     render();
     return;
   }
@@ -1886,6 +2264,11 @@ async function handleAction(action, target) {
     return;
   }
   if (action === 'guided-continue' || action === 'guided-modify' || action === 'guided-stop') {
+    const current = getActiveInvestigation();
+    const currentStatus = text(current?.status).toLowerCase();
+    if (!currentStatus.includes('await')) {
+      return;
+    }
     const input = document.querySelector('#guideDraft');
     const detail = text(input?.value || state.guideDraft || 'refine the current plan');
     state.guideDraft = detail;

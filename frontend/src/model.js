@@ -64,6 +64,63 @@ function toArray(value) {
 
 function text(value, fallback = '') {
   if (value === null || value === undefined) return fallback;
+  if (typeof value === 'string') {
+    const result = value.trim();
+    return result || fallback;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const result = value
+      .map((item) => text(item, ''))
+      .filter(Boolean)
+      .join(', ')
+      .trim();
+    return result || fallback;
+  }
+  if (typeof value === 'object') {
+    const preferredKeys = [
+      'label',
+      'name',
+      'title',
+      'headline',
+      'summary',
+      'text',
+      'value',
+      'reason',
+      'description',
+      'insight',
+      'message',
+      'direct_answer',
+      'business_interpretation',
+      'statement',
+      'request',
+      'question',
+      'answer',
+      'detail',
+      'explanation',
+      'recommended_action',
+      'decision_summary',
+    ];
+    for (const key of preferredKeys) {
+      const result = text(value[key], '');
+      if (result) return result;
+    }
+    const entries = Object.entries(value);
+    if (entries.length === 1) {
+      const [, onlyValue] = entries[0];
+      const result = text(onlyValue, '');
+      if (result) return result;
+    }
+    try {
+      const result = JSON.stringify(value);
+      if (result && result !== '{}') return result;
+    } catch (error) {
+      void error;
+    }
+    return fallback;
+  }
   const result = String(value).trim();
   return result || fallback;
 }
@@ -118,7 +175,7 @@ function extractConfidence(raw) {
   const evidence = raw?.analysis_evidence || {};
   const answer = evidence.answer_synthesis || raw?.answer_synthesis || {};
   const judgment = evidence.judgment_summary || raw?.judgment_summary || {};
-  const diagnostics = answer.confidence_diagnostics || [];
+  const diagnostics = toArray(answer.confidence_diagnostics || answer.confidence?.diagnostics || []);
   const overall = answer.confidence?.overall || {};
   const label = confidenceLabel(overall.label || judgment.global_confidence || answer.confidence || overall.score);
   return {
@@ -231,13 +288,15 @@ function normalizeDataQuality(raw) {
 function extractReports(raw) {
   const evidence = raw?.analysis_evidence || {};
   const reportPackage = evidence.report_package || raw?.report_package || {};
+  const finalReport = text(raw?.final_report || evidence.final_report || '');
+  const fallbackReport = finalReport || EMPTY_REPORT;
   return {
-    analyst: text(raw?.analyst_report || reportPackage.analyst_report || EMPTY_REPORT),
-    business: text(raw?.business_report || reportPackage.business_report || EMPTY_REPORT),
-    executive: text(raw?.executive_report || reportPackage.executive_report || EMPTY_REPORT),
-    master: text(raw?.master_report || reportPackage.master_report || EMPTY_REPORT),
-    answerSynthesis: text(evidence.answer_synthesis_report || raw?.answer_synthesis_report || EMPTY_REPORT),
-    decision: text(evidence.investigation_decision_report || raw?.investigation_decision_report || EMPTY_REPORT),
+    analyst: text(raw?.analyst_report || reportPackage.analyst_report || fallbackReport),
+    business: text(raw?.business_report || reportPackage.business_report || fallbackReport),
+    executive: text(raw?.executive_report || reportPackage.executive_report || fallbackReport),
+    master: text(raw?.master_report || reportPackage.master_report || fallbackReport),
+    answerSynthesis: text(evidence.answer_synthesis_report || raw?.answer_synthesis_report || fallbackReport),
+    decision: text(evidence.investigation_decision_report || raw?.investigation_decision_report || fallbackReport),
   };
 }
 
@@ -615,7 +674,10 @@ export function normalizeInvestigation(raw) {
     reports,
     analysisPlan: toArray(raw?.analysis_plan || evidence.analysis_plan),
     computationPlan: raw?.analysis_evidence?.computation_plan || raw?.computation_plan || null,
-    selectedColumns: toArray(raw?.selected_columns),
+    workflowStatus: raw?.workflow_status || evidence.workflow_status || null,
+    selectedColumns: toArray(raw?.selected_columns)
+      .map((item) => text(item))
+      .filter(Boolean),
     visualizations: toArray(evidence.visualizations || raw?.visualizations),
     raw,
   };
