@@ -8,10 +8,12 @@ from typing import Any, Dict, List
 import pandas as pd
 
 from backend.utils.numeric_parsing import normalize_numeric_token
+from backend.utils.dataset_artifact_cache import get_cached_artifact, set_cached_artifact
 
 
 PROFILE_SAMPLE_SIZE = 1000
 PATTERN_SCAN_ROWS = 1000
+LARGE_DATASET_ROW_THRESHOLD = 25000
 
 
 def _sample_series(series: pd.Series, max_non_null: int = PROFILE_SAMPLE_SIZE) -> pd.Series:
@@ -53,7 +55,7 @@ def _base_name(column: str) -> str:
     return lowered
 
 
-def _infer_type(series: pd.Series) -> str:
+def _infer_type(series: pd.Series, large_dataset: bool = False) -> str:
     if pd.api.types.is_numeric_dtype(series):
         return "numeric"
     if pd.api.types.is_datetime64_any_dtype(series):
@@ -62,7 +64,10 @@ def _infer_type(series: pd.Series) -> str:
     numeric_ratio = _numeric_ratio(series)
     datetime_ratio = _datetime_ratio(series)
     non_null_count = int(series.notna().sum())
-    unique_count = int(series.nunique(dropna=True))
+    if large_dataset:
+        unique_count = int(_sample_series(series).nunique(dropna=True))
+    else:
+        unique_count = int(series.nunique(dropna=True))
     unique_ratio = float(unique_count / max(len(series), 1))
 
     if numeric_ratio >= 0.8:
@@ -182,25 +187,32 @@ def _detect_repeated_row_blocks(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 
 def profile_dataset(df: pd.DataFrame, sample_rows: int = 5) -> Dict[str, Any]:
+    cached = get_cached_artifact("profile_dataset", df, extra_key=str(sample_rows))
+    if cached is not None:
+        return cached
+
+    large_dataset = len(df) > LARGE_DATASET_ROW_THRESHOLD or df.shape[1] > 25
     columns: Dict[str, Any] = {}
 
     for col in df.columns:
         series = df[col]
-        inferred_type = _infer_type(series)
+        profile_source = _sample_series(series) if large_dataset else series
+        inferred_type = _infer_type(series, large_dataset=large_dataset)
         columns[col] = {
             "inferred_type": inferred_type,
             "dtype": str(series.dtype),
             "missing_ratio": round(float(series.isna().mean()), 4),
             "missing_count": int(series.isna().sum()),
-            "unique_count": int(series.nunique(dropna=True)),
-            "unique_ratio": round(float(series.nunique(dropna=True) / max(len(df), 1)), 4),
+            "unique_count": int(profile_source.nunique(dropna=True)),
+            "unique_ratio": round(float(profile_source.nunique(dropna=True) / max(len(profile_source), 1)), 4),
             "numeric_like_ratio": round(_numeric_ratio(series), 4),
             "datetime_like_ratio": round(_datetime_ratio(series), 4),
-            "distribution_summary": _numeric_summary(series) if inferred_type == "numeric" else {},
-            "value_patterns": _top_value_patterns(series),
+            "distribution_summary": _numeric_summary(profile_source) if inferred_type == "numeric" else {},
+            "value_patterns": _top_value_patterns(profile_source),
         }
 
-    return {
+    profile_scope = "sampled" if large_dataset else "exact"
+    profile = {
         "row_count": int(len(df)),
         "column_count": int(df.shape[1]),
         "column_names": list(df.columns),
@@ -210,7 +222,17 @@ def profile_dataset(df: pd.DataFrame, sample_rows: int = 5) -> Dict[str, Any]:
             "sparsity_patterns": _detect_sparsity_patterns(df),
             "column_similarity": _detect_similar_columns(df),
         },
+        "profiling_mode": profile_scope,
+        "evidence_scope": profile_scope,
+        "provenance": {
+            "source": "dataset_profile",
+            "scope": profile_scope,
+            "verified": not large_dataset,
+            "method": "sampled reconnaissance" if large_dataset else "exact profiling",
+        },
         "sample_rows": df.head(sample_rows).replace({pd.NA: None}).to_dict(orient="records"),
     }
+
+    return set_cached_artifact("profile_dataset", df, profile, extra_key=str(sample_rows))
 
 

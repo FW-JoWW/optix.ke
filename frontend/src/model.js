@@ -420,6 +420,7 @@ function extractEvidence(raw) {
       summary,
       detail: JSON.stringify(value, null, 2),
       confidence: confidenceLabel(value.confidence?.label || value.confidence?.score || value.confidence || ''),
+      scope: text(value.evidence_scope || value.provenance?.scope || ''),
     });
   });
 
@@ -432,6 +433,7 @@ function extractEvidence(raw) {
       summary: `${formatCount(profile.row_count)} rows | ${formatCount(profile.column_count)} columns`,
       detail: JSON.stringify(profile, null, 2),
       confidence: 'High',
+      scope: text(profile.evidence_scope || profile.profiling_mode || profile.provenance?.scope || ''),
     });
   }
 
@@ -444,6 +446,7 @@ function extractEvidence(raw) {
       summary: validation.anomalies?.length || validation.warnings?.length ? 'Issues were identified during validation.' : 'Validation completed without major issues.',
       detail: JSON.stringify(validation, null, 2),
       confidence: validation.anomalies?.length ? 'Moderate' : 'High',
+      scope: text(validation.evidence_scope || validation.provenance?.scope || ''),
     });
   }
 
@@ -456,6 +459,7 @@ function extractEvidence(raw) {
       summary: text(visual.caption || visual.file_path || visual.path || 'Generated chart'),
       detail: JSON.stringify(visual, null, 2),
       confidence: 'High',
+      scope: text(visual.evidence_scope || visual.provenance?.scope || ''),
     });
   });
 
@@ -483,6 +487,7 @@ function extractEvidence(raw) {
       summary: text(value.statement || value.summary || value.insight || 'Collaborative evidence item.'),
       detail: JSON.stringify(value, null, 2),
       confidence: confidenceLabel(value.confidence || ''),
+      scope: text(value.evidence_scope || value.provenance?.scope || ''),
     });
   });
 
@@ -491,12 +496,30 @@ function extractEvidence(raw) {
 
 function buildProgress(raw) {
   const evidence = raw?.analysis_evidence || {};
+  const workflowStatus = raw?.workflow_status || evidence.workflow_status || {};
+  const trace = toArray(evidence.execution_trace || raw?.execution_trace);
   const hasData = Boolean(raw?.dataset_profile || raw?.dataframe || raw?.dataset || raw?.dataset_path);
   const hasQuality = Boolean(raw?.data_validation || evidence.cleaning_validation || evidence.data_quality_issues);
   const hasPlan = Boolean((raw?.analysis_plan || evidence.analysis_plan || []).length);
   const hasInvestigation = Boolean((toArray(evidence.tool_results || raw?.tool_results).length || toArray(evidence.top_stories || raw?.top_stories).length));
   const hasFinding = Boolean(toArray(evidence.top_stories || raw?.top_stories).length);
   const hasAnswer = Boolean(evidence.answer_synthesis?.direct_answer || raw?.final_report || raw?.answer);
+  const phase = text(workflowStatus.phase || '').toLowerCase();
+  const phaseToStage = {
+    question: 'question',
+    loading: 'data',
+    data: 'data',
+    data_quality: 'quality',
+    planning: 'plan',
+    plan: 'plan',
+    investigation: 'investigation',
+    reasoning: 'finding',
+    reporting: 'answer',
+    synthesizing: 'answer',
+    awaiting_user: 'answer',
+    completed: 'answer',
+  };
+  const currentStageKey = phaseToStage[phase] || null;
   const flags = {
     question: true,
     data: hasData,
@@ -508,20 +531,27 @@ function buildProgress(raw) {
   };
   let activeSeen = false;
   return STAGE_ORDER.map((stage) => {
-    const done = flags[stage.key];
+    const done = flags[stage.key] || (currentStageKey ? STAGE_ORDER.findIndex((item) => item.key === stage.key) < STAGE_ORDER.findIndex((item) => item.key === currentStageKey) : false);
     let status = 'pending';
-    if (done) {
+    if (phase === 'failed' && stage.key === 'answer') {
+      status = 'current';
+    } else if (done) {
       status = 'complete';
-    } else if (!activeSeen) {
+    } else if (currentStageKey === stage.key || (!currentStageKey && !activeSeen)) {
       status = 'current';
       activeSeen = true;
     }
+    const traceMatch = trace.find((entry) => {
+      const entryPhase = text(entry?.phase || '').toLowerCase();
+      const entryOperation = text(entry?.operation || '').toLowerCase();
+      return entryPhase === stage.key || entryOperation.includes(stage.key);
+    });
     return {
       ...stage,
       status,
       done,
-      detail:
-        stage.key === 'question'
+      detail: text(workflowStatus.current_operation || workflowStatus.message || traceMatch?.message) ||
+        (stage.key === 'question'
           ? 'The business question was captured.'
           : stage.key === 'data'
             ? 'Dataset selected and loaded.'
@@ -533,7 +563,7 @@ function buildProgress(raw) {
                   ? 'Analytical evidence is being gathered.'
                   : stage.key === 'finding'
                     ? 'Findings are being synthesized.'
-                    : 'A direct answer is available.',
+                    : 'A direct answer is available.'),
     };
   });
 }
@@ -679,6 +709,8 @@ export function normalizeInvestigation(raw) {
       .map((item) => text(item))
       .filter(Boolean),
     visualizations: toArray(evidence.visualizations || raw?.visualizations),
+    executionTrace: toArray(evidence.execution_trace || raw?.execution_trace),
+    evidenceProvenance: evidence.evidence_provenance || raw?.evidence_provenance || {},
     raw,
   };
 }

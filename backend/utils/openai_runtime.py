@@ -9,18 +9,36 @@ from openai import OpenAI
 
 load_dotenv()
 
-_client: OpenAI | None = None
+_clients: Dict[str, OpenAI] = {}
 
 
-def get_openai_client() -> OpenAI | None:
+def _operation_timeout(operation: str | None = None) -> httpx.Timeout:
+    operation_key = (operation or "default").strip().lower()
+    default_read = float(os.getenv("OPENAI_READ_TIMEOUT_SECONDS", "15"))
+    default_connect = float(os.getenv("OPENAI_CONNECT_TIMEOUT_SECONDS", "5"))
+    operation_read_overrides = {
+        "reasoning": float(os.getenv("OPENAI_REASONING_READ_TIMEOUT_SECONDS", "20")),
+        "answer_synthesis": float(os.getenv("OPENAI_ANSWER_SYNTHESIS_READ_TIMEOUT_SECONDS", "22")),
+        "report": float(os.getenv("OPENAI_REPORT_READ_TIMEOUT_SECONDS", "25")),
+        "context_inference": float(os.getenv("OPENAI_CONTEXT_INFERENCE_READ_TIMEOUT_SECONDS", "18")),
+        "cleaning": float(os.getenv("OPENAI_CLEANING_READ_TIMEOUT_SECONDS", "18")),
+        "insight_generation": float(os.getenv("OPENAI_INSIGHT_GENERATION_READ_TIMEOUT_SECONDS", "22")),
+        "default": default_read,
+    }
+    read_timeout = operation_read_overrides.get(operation_key, default_read)
+    return httpx.Timeout(read_timeout, connect=default_connect)
+
+
+def get_openai_client(operation: str | None = None) -> OpenAI | None:
     """
     Build a shared OpenAI client for this process.
     `trust_env=False` prevents broken proxy env vars from hijacking requests.
     """
-    global _client
+    cache_key = (operation or "default").strip().lower() or "default"
 
-    if _client is not None:
-        return _client
+    cached = _clients.get(cache_key)
+    if cached is not None:
+        return cached
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -30,12 +48,9 @@ def get_openai_client() -> OpenAI | None:
     organization = os.getenv("OPENAI_ORG_ID") or None
     project = os.getenv("OPENAI_PROJECT_ID") or None
 
-    http_client = httpx.Client(
-        timeout=httpx.Timeout(60.0, connect=10.0),
-        trust_env=False,
-    )
+    http_client = httpx.Client(timeout=_operation_timeout(operation), trust_env=False)
 
-    _client = OpenAI(
+    _clients[cache_key] = OpenAI(
         api_key=api_key,
         base_url=base_url,
         organization=organization,
@@ -43,7 +58,7 @@ def get_openai_client() -> OpenAI | None:
         max_retries=2,
         http_client=http_client,
     )
-    return _client
+    return _clients[cache_key]
 
 
 def get_openai_runtime_info() -> Dict[str, Any]:

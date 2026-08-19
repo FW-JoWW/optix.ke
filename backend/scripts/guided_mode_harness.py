@@ -80,6 +80,9 @@ def build_guided_state(
     question: str,
     dataset_path: str | None = None,
     dataframe: pd.DataFrame | None = None,
+    fast_finalization: bool = False,
+    record_id: str | None = None,
+    live_status_hook=None,
 ) -> tuple[AnalystState, str]:
     df = dataframe if dataframe is not None else build_guided_sample_dataframe()
     if dataset_path is None:
@@ -90,11 +93,17 @@ def build_guided_state(
         "dataset_path": dataset_path,
         "dataframe": df,
         "mode": "guided",
-        "enable_llm_reasoning": False,
-        "disable_llm_reasoning": True,
+        "enable_llm_reasoning": True,
+        "disable_llm_reasoning": False,
         "disable_semantic_matcher": True,
         "analysis_evidence": {},
+        "fast_finalization": fast_finalization,
     }
+    if record_id:
+        state["id"] = record_id
+        state["investigation_id"] = record_id
+    if live_status_hook is not None:
+        state["_live_status_hook"] = live_status_hook
     return state, dataset_path
 
 
@@ -103,11 +112,17 @@ def run_guided_workflow(
     responses: Sequence[str],
     dataset_path: str | None = None,
     dataframe: pd.DataFrame | None = None,
+    fast_finalization: bool = False,
+    record_id: str | None = None,
+    live_status_hook=None,
 ) -> GuidedHarnessResult:
     state, resolved_path = build_guided_state(
         question=question,
         dataset_path=dataset_path,
         dataframe=dataframe,
+        fast_finalization=fast_finalization,
+        record_id=record_id,
+        live_status_hook=live_status_hook,
     )
 
     try:

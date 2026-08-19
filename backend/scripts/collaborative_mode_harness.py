@@ -50,6 +50,9 @@ def run_collaborative_workflow(
     dataframe: Any | None = None,
     initial_tasks: Sequence[Dict[str, Any] | str] | None = None,
     build_final_report: bool = True,
+    fast_finalization: bool = False,
+    record_id: str | None = None,
+    live_status_hook=None,
 ) -> CollaborativeHarnessResult:
     """
     Script-friendly collaborative harness.
@@ -65,6 +68,9 @@ def run_collaborative_workflow(
         dataframe=dataframe if dataframe is not None else build_guided_sample_dataframe(),
         initial_tasks=initial_tasks,
         build_final_report=build_final_report,
+        fast_finalization=fast_finalization,
+        record_id=record_id,
+        live_status_hook=live_status_hook,
     )
     return CollaborativeHarnessResult(
         final_state=result.final_state,

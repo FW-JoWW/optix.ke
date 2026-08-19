@@ -130,14 +130,23 @@ def _validate_reasoning_payload(payload: Dict[str, Any], decision_object: Dict[s
     return True
 
 
-def explain_decision(decision_object: Dict[str, Any], cache: Dict[str, Any] | None = None) -> Tuple[Dict[str, Any], str]:
+def explain_decision(
+    decision_object: Dict[str, Any],
+    cache: Dict[str, Any] | None = None,
+    allow_llm: bool = True,
+) -> Tuple[Dict[str, Any], str]:
     cache = cache if cache is not None else {}
     cache_key = reasoning_cache_key(decision_object)
     cached = cache.get(cache_key)
     if isinstance(cached, dict):
         return cached, "cache_hit"
 
-    client = get_openai_client()
+    if not allow_llm:
+        fallback = _fallback_reasoning(decision_object)
+        cache[cache_key] = fallback
+        return fallback, "deterministic_fallback"
+
+    client = get_openai_client("reasoning")
     if client is None:
         fallback = _fallback_reasoning(decision_object)
         cache[cache_key] = fallback

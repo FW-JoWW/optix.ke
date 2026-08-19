@@ -205,7 +205,7 @@ def llm_reasoning_node(state: AnalystState) -> AnalystState:
         print("\n[INFO] LLM reasoning disabled by state flag")
         return state
 
-    client = get_openai_client()
+    client = get_openai_client("reasoning")
     if client is None:
         state["llm_reasoning"] = None
         state["llm_reasoning_status"] = "unavailable: OPENAI_API_KEY not set"

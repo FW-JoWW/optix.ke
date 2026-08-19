@@ -5,6 +5,7 @@ from typing import Any, Dict
 import pandas as pd
 
 from backend.analytics.data_profiling import profile_dataset
+from backend.utils.dataset_artifact_cache import get_cached_artifact, set_cached_artifact
 
 
 def validate_cleaning(
@@ -12,6 +13,14 @@ def validate_cleaning(
     after_df: pd.DataFrame,
     before_profile: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    cached = get_cached_artifact(
+        "validate_cleaning",
+        after_df,
+        extra_key=f"before={before_profile is not None}:{len(before_df)}x{before_df.shape[1]}",
+    )
+    if cached is not None and list(before_df.columns) == list(after_df.columns):
+        return cached
+
     before_profile = before_profile or profile_dataset(before_df)
     after_profile = profile_dataset(after_df)
 
@@ -38,7 +47,7 @@ def validate_cleaning(
     if list(before_df.columns) != list(after_df.columns):
         anomalies.append("schema_changed")
 
-    return {
+    result = {
         "row_count_before": int(len(before_df)),
         "row_count_after": int(len(after_df)),
         "row_count_delta": int(row_change),
@@ -55,5 +64,12 @@ def validate_cleaning(
         "anomalies": anomalies,
         "after_profile": after_profile,
     }
+
+    return set_cached_artifact(
+        "validate_cleaning",
+        after_df,
+        result,
+        extra_key=f"before={before_profile is not None}:{len(before_df)}x{before_df.shape[1]}",
+    )
 
 

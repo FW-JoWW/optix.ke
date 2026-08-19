@@ -26,6 +26,7 @@ ALLOWED_ACTIONS = {
 
 PROFILE_SAMPLE_SIZE = 1000
 ROW_PATTERN_SAMPLE_SIZE = 1000
+LARGE_DATASET_ROW_THRESHOLD = 25000
 
 
 def _sample_non_null(series: pd.Series, max_non_null: int = PROFILE_SAMPLE_SIZE) -> pd.Series:
@@ -140,10 +141,13 @@ def build_column_profiles(
 ) -> Dict[str, Dict[str, Any]]:
     profiles: Dict[str, Dict[str, Any]] = {}
     total_rows = max(len(df), 1)
+    large_dataset = len(df) > LARGE_DATASET_ROW_THRESHOLD or df.shape[1] > 25
+    profile_scope = "sampled" if large_dataset else "exact"
 
     for col in df.columns:
         series = df[col]
         non_null = series.dropna()
+        profile_source = _sample_non_null(series) if large_dataset else non_null
         unique_count = int(non_null.nunique()) if not non_null.empty else 0
         label_profile = _label_quality_profile(series)
         existing = (base_profiles or {}).get(col, {})
@@ -151,13 +155,23 @@ def build_column_profiles(
             "dtype": existing.get("dtype", str(series.dtype)),
             "missing_count": existing.get("missing_count", int(series.isna().sum())),
             "missing_ratio": existing.get("missing_ratio", round(float(series.isna().mean()), 4)),
-            "unique_count": existing.get("unique_count", unique_count),
-            "unique_ratio": existing.get("unique_ratio", round(unique_count / total_rows, 4)),
+            "unique_count": existing.get("unique_count", int(profile_source.nunique()) if not profile_source.empty else unique_count),
+            "unique_ratio": existing.get("unique_ratio", round(float(profile_source.nunique() / max(len(profile_source), 1)), 4) if not profile_source.empty else round(unique_count / total_rows, 4)),
             "numeric_like_ratio": existing.get("numeric_like_ratio", round(_numeric_like_ratio(series), 4)),
             "datetime_like_ratio": existing.get("datetime_like_ratio", round(_datetime_like_ratio(series), 4)),
-            "sample_values": non_null.astype(str).head(5).tolist(),
+            "sample_values": profile_source.astype(str).head(5).tolist(),
             "missing_pattern": _missing_pattern_profile(series),
             "label_quality": label_profile,
+            "evidence_scope": existing.get("evidence_scope", profile_scope),
+            "provenance": existing.get(
+                "provenance",
+                {
+                    "source": "cleaning_profile",
+                    "scope": profile_scope,
+                    "verified": not large_dataset,
+                    "method": "sampled reconnaissance" if large_dataset else "exact profile",
+                },
+            ),
         }
     return profiles
 
@@ -281,7 +295,7 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
 
 
 def _llm_recommendation(issue: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any] | None:
-    client = get_openai_client()
+    client = get_openai_client("cleaning")
     if client is None:
         return None
 
@@ -342,12 +356,13 @@ def recommend_cleaning_issues(
     detected_issues: Dict[str, Any],
     df: pd.DataFrame,
     base_profiles: Dict[str, Dict[str, Any]] | None = None,
+    allow_llm: bool = True,
 ) -> Dict[str, Any]:
     column_profiles = build_column_profiles(df, base_profiles=base_profiles)
     recommendations: List[Dict[str, Any]] = []
     llm_used = False
     issue_count = len(detected_issues.get("detected_issues", []))
-    if df.shape[1] > 40 or issue_count > 25:
+    if not allow_llm or df.shape[1] > 40 or issue_count > 25 or len(df) > 25000:
         max_llm_recommendations = 0
     else:
         max_llm_recommendations = 5
@@ -396,6 +411,13 @@ def recommend_cleaning_issues(
         "issues": recommendations,
         "column_profiles": column_profiles,
         "cleaning_reasoning_status": "live_llm" if llm_used else "rules_only",
+        "evidence_scope": "sampled" if len(df) > LARGE_DATASET_ROW_THRESHOLD or df.shape[1] > 25 else "exact",
+        "provenance": {
+            "source": "cleaning_recommender",
+            "scope": "sampled" if len(df) > LARGE_DATASET_ROW_THRESHOLD or df.shape[1] > 25 else "exact",
+            "verified": not (len(df) > LARGE_DATASET_ROW_THRESHOLD or df.shape[1] > 25),
+            "method": "rules + sampled reconnaissance" if len(df) > LARGE_DATASET_ROW_THRESHOLD or df.shape[1] > 25 else "rules + exact profile",
+        },
     }
 
 

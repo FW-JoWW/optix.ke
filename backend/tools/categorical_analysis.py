@@ -12,6 +12,8 @@ from pandas.api.types import (
     is_string_dtype,
 )
 
+from backend.utils.dataset_artifact_cache import get_cached_artifact, set_cached_artifact
+
 try:
     from scipy.stats import chi2_contingency
 except Exception:  # pragma: no cover - graceful fallback when scipy is unavailable
@@ -28,6 +30,9 @@ class CategoricalAnalysisConfig:
     max_categories_for_cross_analysis: int = 50
     max_contingency_cells: int = 2_500
     max_numeric_interaction_groups: int = 100
+
+
+MAX_ANALYSIS_ROWS = 25_000
 
 
 def detect_categorical_columns(
@@ -90,6 +95,12 @@ def _label_key(value: Any) -> str:
 
 def _series_as_clean_strings(series: pd.Series) -> pd.Series:
     return series.dropna().astype(str)
+
+
+def _analysis_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if len(df) <= MAX_ANALYSIS_ROWS:
+        return df
+    return df.sample(MAX_ANALYSIS_ROWS, random_state=42).sort_index()
 
 
 def _frequency_distribution(
@@ -290,6 +301,18 @@ def analyze_categorical_columns(
         col for col in df.select_dtypes(include="number").columns.tolist()
         if col not in categorical_columns
     ]
+    analysis_df = _analysis_frame(df)
+
+    cache_key = "|".join(
+        [
+            ",".join(categorical_columns),
+            ",".join(numeric_columns),
+            str(config),
+        ]
+    )
+    cached = get_cached_artifact("categorical_analysis", df, extra_key=cache_key)
+    if cached is not None:
+        return cached
 
     results: Dict[str, Dict[str, Any]] = {}
 
@@ -304,7 +327,7 @@ def analyze_categorical_columns(
         for other_col in categorical_columns:
             if other_col == col:
                 continue
-            cross_analysis[other_col] = _contingency_analysis(df, col, other_col, config)
+            cross_analysis[other_col] = _contingency_analysis(analysis_df, col, other_col, config)
 
         results[col] = {
             "type": "categorical",
@@ -321,14 +344,14 @@ def analyze_categorical_columns(
             "quality_issues": quality,
             "cross_analysis": cross_analysis,
             "numeric_interactions": _numeric_interactions(
-                df,
+                analysis_df,
                 col,
                 numeric_columns,
                 config,
             ),
         }
 
-    return results
+    return set_cached_artifact("categorical_analysis", df, results, extra_key=cache_key)
 
 
 def categorical_analysis_config_to_dict(

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from backend.state.state import AnalystState
 from backend.collaborative_mode.answer_synthesis import render_answer_synthesis_report, synthesize_answer
+from backend.core.execution_state import record_execution_event, record_evidence_provenance
 from backend.collaborative_mode.confidence_diagnostics import render_investigation_decision_report
 from backend.collaborative_mode.narrative_composer import compose_analyst_sections, render_analyst_report
 from backend.collaborative_mode.narration import format_suggestion_line, humanize_columns, humanize_text, suggestion_impact_percent
@@ -1696,6 +1697,123 @@ def report_node(state: AnalystState) -> AnalystState:
     collaborative_question = _normalize_text(collaborative_session.get("original_question"))
     business_question = collaborative_question or state.get("business_question", "N/A")
     evidence["business_question"] = business_question
+    fast_finalization = bool(state.get("fast_finalization") or evidence.get("fast_finalization"))
+    record_execution_event(
+        state,
+        phase="reporting",
+        message="Preparing the final analytical synthesis.",
+        progress=82,
+        operation="report_synthesis",
+        evidence_scope="sampled" if any(
+            item.get("evidence_scope") == "sampled"
+            for item in [
+                (evidence.get("answer_synthesis") or {}).get("confidence") or {},
+                evidence.get("judgment_summary") or {},
+            ]
+            if isinstance(item, dict)
+        ) else "exact",
+    )
+
+    if fast_finalization:
+        top_stories = evidence.get("top_stories", [])
+        judgment = evidence.get("judgment_summary", {}) or {}
+        decision_recommendations = evidence.get("decision_recommendations", []) or []
+        primary_story = top_stories[0] if top_stories else {}
+        direct_answer = (
+            _normalize_text(primary_story.get("insight"))
+            or _normalize_text(judgment.get("summary"))
+            or business_question
+        )
+        business_interpretation = (
+            _normalize_text(primary_story.get("summary"))
+            or _normalize_text(judgment.get("summary"))
+            or direct_answer
+        )
+        recommended_next = []
+        if decision_recommendations:
+            first_recommendation = decision_recommendations[0] if isinstance(decision_recommendations[0], dict) else {}
+            recommended_next = [_normalize_text(first_recommendation.get("decision_summary") or first_recommendation.get("recommended_action"))]
+        answer_synthesis = {
+            "direct_answer": direct_answer,
+            "best_available_answer": direct_answer,
+            "business_interpretation": business_interpretation,
+            "supporting_evidence_summary": [primary_story.get("summary") or primary_story.get("insight") or direct_answer] if primary_story or direct_answer else [],
+            "observed_facts": [primary_story.get("insight") or direct_answer] if primary_story or direct_answer else [],
+            "analytical_interpretation": [primary_story.get("summary") or business_interpretation] if primary_story or business_interpretation else [],
+            "remaining_uncertainty": [],
+            "recommended_next_investigation": recommended_next or ["Review the evidence trail before deciding the next step."],
+            "answer_position": "unknown",
+            "confidence": {
+                "overall": {
+                    "label": judgment.get("global_confidence") or "Unknown",
+                    "score": judgment.get("global_confidence"),
+                    "reason": judgment.get("summary") or "",
+                }
+            },
+        }
+        evidence["answer_synthesis"] = answer_synthesis
+        state["answer_synthesis"] = answer_synthesis
+        evidence["investigation_decision"] = {}
+        state["investigation_decision"] = {}
+        answer_synthesis_report = render_answer_synthesis_report(answer_synthesis)
+        concise_master_lines = [
+            f"Business question: {business_question}",
+            f"Direct answer: {direct_answer}",
+            f"Confidence: {_confidence_label(judgment.get('global_confidence'))}",
+        ]
+        if primary_story:
+            concise_master_lines.append(f"Primary evidence: {primary_story.get('insight') or primary_story.get('summary')}")
+        master_report = "\n".join(concise_master_lines)
+        business_report = "\n".join(
+            [
+                f"Business question: {business_question}",
+                f"Interpretation: {business_interpretation}",
+                f"Key evidence: {primary_story.get('summary') or primary_story.get('insight') or 'Not available'}",
+            ]
+        )
+        executive_report = "\n".join(
+            [
+                f"Answer: {direct_answer}",
+                f"Confidence: {_confidence_label(judgment.get('global_confidence'))}",
+                f"Next step: {recommended_next[0] if recommended_next else 'Review the evidence trail'}",
+            ]
+        )
+        analyst_report = "\n".join(
+            [
+                f"Question: {business_question}",
+                f"Evidence count: {len(top_stories)}",
+                f"Visualization count: {len(evidence.get('visualizations', []))}",
+            ]
+        )
+        evidence["master_report"] = master_report
+        evidence["business_report"] = business_report
+        evidence["executive_report"] = executive_report
+        evidence["analyst_report"] = analyst_report
+        evidence["report_package"] = {
+            "master_report": master_report,
+            "business_report": business_report,
+            "executive_report": executive_report,
+            "analyst_report": analyst_report,
+            "answer_synthesis": answer_synthesis,
+            "investigation_decision": {},
+        }
+        evidence["answer_synthesis_report"] = answer_synthesis_report
+        state["master_report"] = master_report
+        state["business_report"] = business_report
+        state["executive_report"] = executive_report
+        state["analyst_report"] = analyst_report
+        state["report_package"] = evidence["report_package"]
+        state["final_report"] = "\n\n".join([part for part in [answer_synthesis_report, master_report, business_report, executive_report] if part])
+        record_evidence_provenance(
+            state,
+            "final_report",
+            scope="sampled" if fast_finalization else "exact",
+            source="report_node",
+            verified=not fast_finalization,
+            method="deterministic fast synthesis" if fast_finalization else "full analytical synthesis",
+        )
+        return state
+
     llm_insights = state.get("llm_insights") or evidence.get("llm_insights") or "None"
     clarification_questions: List[str] = (
         state.get("clarification_questions")
@@ -1726,6 +1844,121 @@ def report_node(state: AnalystState) -> AnalystState:
         _normalize_text((collaborative_memory.get("best_answer") or {}).get("answer"))
         or _normalize_text(((collaborative_session.get("investigation_memory") or {}).get("best_answer") or {}).get("answer"))
     )
+    if fast_finalization:
+        primary_story = top_stories[0] if top_stories else {}
+        direct_answer = (
+            _normalize_text(primary_story.get("insight"))
+            or _normalize_text(judgment.get("summary"))
+            or collaborative_best_answer
+            or business_question
+        )
+        business_interpretation = (
+            _normalize_text(primary_story.get("summary"))
+            or _normalize_text(judgment.get("summary"))
+            or direct_answer
+        )
+        recommended_next = []
+        if decision_recommendations:
+            first_recommendation = decision_recommendations[0] if isinstance(decision_recommendations[0], dict) else {}
+            recommended_next = [_normalize_text(first_recommendation.get("decision_summary") or first_recommendation.get("recommended_action"))]
+        answer_synthesis = {
+            "direct_answer": direct_answer,
+            "best_available_answer": direct_answer,
+            "business_interpretation": business_interpretation,
+            "supporting_evidence_summary": [primary_story.get("summary") or primary_story.get("insight") or direct_answer] if primary_story or direct_answer else [],
+            "observed_facts": [primary_story.get("insight") or direct_answer] if primary_story or direct_answer else [],
+            "analytical_interpretation": [primary_story.get("summary") or business_interpretation] if primary_story or business_interpretation else [],
+            "remaining_uncertainty": [],
+            "recommended_next_investigation": recommended_next or ["Review the evidence trail before taking the next step."],
+            "answer_position": "unknown",
+            "confidence": {
+                "overall": {
+                    "label": judgment.get("global_confidence") or "Unknown",
+                    "score": judgment.get("global_confidence"),
+                    "reason": judgment.get("summary") or "",
+                }
+            },
+        }
+        evidence["answer_synthesis"] = answer_synthesis
+        state["answer_synthesis"] = answer_synthesis
+        decision = {}
+        evidence["investigation_decision"] = decision
+        state["investigation_decision"] = decision
+        answer_synthesis_report = render_answer_synthesis_report(answer_synthesis)
+        concise_master_lines = [
+            f"Business question: {business_question}",
+            f"Direct answer: {direct_answer}",
+            f"Confidence: {_confidence_label(judgment.get('global_confidence'))}",
+        ]
+        if primary_story:
+            concise_master_lines.append(f"Primary evidence: {primary_story.get('insight') or primary_story.get('summary')}")
+        master_report = "\n".join(concise_master_lines)
+        business_report = "\n".join(
+            [
+                f"Business question: {business_question}",
+                f"Interpretation: {business_interpretation}",
+                f"Key evidence: {primary_story.get('summary') or primary_story.get('insight') or 'Not available'}",
+            ]
+        )
+        executive_report = "\n".join(
+            [
+                f"Answer: {direct_answer}",
+                f"Confidence: {_confidence_label(judgment.get('global_confidence'))}",
+                f"Next step: {recommended_next[0] if recommended_next else 'Review the evidence trail'}",
+            ]
+        )
+        analyst_report = "\n".join(
+            [
+                f"Question: {business_question}",
+                f"Evidence count: {len(top_stories)}",
+                f"Visualization count: {len(visualizations)}",
+            ]
+        )
+        report_package = {
+            "master_report": master_report,
+            "business_report": business_report,
+            "executive_report": executive_report,
+            "analyst_report": analyst_report,
+            "answer_synthesis": answer_synthesis,
+            "investigation_decision": decision,
+            "sections": {
+                "master": {"EXECUTIVE SUMMARY": [master_report]},
+                "business": {"BUSINESS SUMMARY": [business_report]},
+                "executive": {"EXECUTIVE SUMMARY": [executive_report]},
+                "analyst": {"ANALYST SUMMARY": [analyst_report]},
+            },
+            "analytical_reasoning": reasoning,
+            "traceability": {
+                "business_question": business_question,
+                "selected_columns": selected_columns,
+                "decision_context": decision_context,
+                "judgment_summary": judgment,
+                "human_in_loop": human_in_loop,
+                "decision_log": decision_log,
+                "clarification_questions": clarification_questions,
+            },
+            "confidence": {
+                "global_confidence": judgment.get("global_confidence"),
+                "predictive_confidence": predictive_sections.get("confidence"),
+                "primary_story_confidence": _story_confidence(primary_story) if primary_story else "unknown",
+                "analytical_reasoning_confidence": (reasoning.get("confidence") or {}).get("score") if reasoning else None,
+            },
+        }
+        evidence["master_report"] = master_report
+        evidence["business_report"] = business_report
+        evidence["executive_report"] = executive_report
+        evidence["analyst_report"] = analyst_report
+        evidence["report_package"] = report_package
+        evidence["answer_synthesis_report"] = answer_synthesis_report
+        evidence["investigation_decision_report"] = ""
+        state["master_report"] = master_report
+        state["business_report"] = business_report
+        state["executive_report"] = executive_report
+        state["analyst_report"] = analyst_report
+        state["report_package"] = report_package
+        state["final_report"] = "\n\n".join([part for part in [answer_synthesis_report, master_report, business_report, executive_report] if part])
+        return state
+
     answer_synthesis = synthesize_answer(
         business_question=business_question,
         evidence=evidence,
@@ -1740,6 +1973,137 @@ def report_node(state: AnalystState) -> AnalystState:
         investigation_memory=collaborative_memory,
         dataframe=state.get("dataframe"),
     )
+
+    if fast_finalization:
+        primary_story = top_stories[0] if top_stories else {}
+        direct_answer = (
+            _normalize_text(answer_synthesis.get("direct_answer"))
+            or _normalize_text(answer_synthesis.get("best_available_answer"))
+            or _normalize_text(primary_story.get("insight"))
+            or _normalize_text(judgment.get("summary"))
+            or collaborative_best_answer
+            or business_question
+        )
+        business_interpretation = (
+            _normalize_text(answer_synthesis.get("business_interpretation"))
+            or _normalize_text(primary_story.get("summary"))
+            or _normalize_text(judgment.get("summary"))
+            or direct_answer
+        )
+        recommended_next = _normalize_questions(answer_synthesis.get("recommended_next_investigation") or [])
+        if not recommended_next and decision_recommendations:
+            recommended_next = [_normalize_text((decision_recommendations[0] or {}).get("decision_summary"))]
+        supporting_summary = [primary_story.get("summary") or primary_story.get("insight") or direct_answer]
+        observed_facts = [primary_story.get("insight") or direct_answer]
+        analytical_interpretation = [primary_story.get("summary") or business_interpretation]
+        answer_synthesis = {
+            "direct_answer": direct_answer,
+            "best_available_answer": direct_answer,
+            "business_interpretation": business_interpretation,
+            "supporting_evidence_summary": supporting_summary,
+            "observed_facts": observed_facts,
+            "analytical_interpretation": analytical_interpretation,
+            "remaining_uncertainty": [],
+            "recommended_next_investigation": recommended_next or ["Review the generated evidence before deciding on the next step."],
+            "answer_position": _normalize_text(answer_synthesis.get("answer_position") or "unknown"),
+            "confidence": answer_synthesis.get("confidence")
+            or {
+                "overall": {
+                    "label": judgment.get("global_confidence") or "Unknown",
+                    "score": judgment.get("global_confidence"),
+                    "reason": judgment.get("summary") or "",
+                }
+            },
+        }
+        evidence["answer_synthesis"] = answer_synthesis
+        state["answer_synthesis"] = answer_synthesis
+        decision = answer_synthesis.get("investigation_decision") or {}
+        evidence["investigation_decision"] = decision
+        state["investigation_decision"] = decision
+        answer_synthesis_report = render_answer_synthesis_report(answer_synthesis)
+        decision_report = render_investigation_decision_report(decision, include_internal_metrics=False) if decision else ""
+        concise_master_lines = [
+            f"Business question: {business_question}",
+            f"Direct answer: {direct_answer}",
+            f"Confidence: {_confidence_label(judgment.get('global_confidence'))}",
+        ]
+        if primary_story:
+            concise_master_lines.append(f"Primary evidence: {primary_story.get('insight') or primary_story.get('summary')}")
+        master_report = "\n".join(concise_master_lines)
+        business_report = "\n".join(
+            [
+                f"Business question: {business_question}",
+                f"Interpretation: {business_interpretation}",
+                f"Key evidence: {primary_story.get('summary') or primary_story.get('insight') or 'Not available'}",
+            ]
+        )
+        executive_report = "\n".join(
+            [
+                f"Answer: {direct_answer}",
+                f"Confidence: {_confidence_label(judgment.get('global_confidence'))}",
+                f"Recommendation: {recommended_next[0] if recommended_next else 'Review the evidence trail'}",
+            ]
+        )
+        analyst_report = "\n".join(
+            [
+                f"Question: {business_question}",
+                f"Evidence count: {len(top_stories)}",
+                f"Visualization count: {len(visualizations)}",
+            ]
+        )
+        report_package = {
+            "master_report": master_report,
+            "business_report": business_report,
+            "executive_report": executive_report,
+            "analyst_report": analyst_report,
+            "answer_synthesis": answer_synthesis,
+            "investigation_decision": decision,
+            "sections": {
+                "master": {"EXECUTIVE SUMMARY": [master_report]},
+                "business": {"BUSINESS SUMMARY": [business_report]},
+                "executive": {"EXECUTIVE SUMMARY": [executive_report]},
+                "analyst": {"ANALYST SUMMARY": [analyst_report]},
+            },
+            "analytical_reasoning": reasoning,
+            "traceability": {
+                "business_question": business_question,
+                "selected_columns": selected_columns,
+                "decision_context": decision_context,
+                "judgment_summary": judgment,
+                "human_in_loop": human_in_loop,
+                "decision_log": decision_log,
+                "clarification_questions": clarification_questions,
+            },
+            "confidence": {
+                "global_confidence": judgment.get("global_confidence"),
+                "predictive_confidence": predictive_sections.get("confidence"),
+                "primary_story_confidence": _story_confidence(primary_story) if primary_story else "unknown",
+                "analytical_reasoning_confidence": (reasoning.get("confidence") or {}).get("score") if reasoning else None,
+            },
+        }
+        evidence["master_report"] = master_report
+        evidence["business_report"] = business_report
+        evidence["executive_report"] = executive_report
+        evidence["analyst_report"] = analyst_report
+        evidence["report_package"] = report_package
+        evidence["answer_synthesis_report"] = answer_synthesis_report
+        evidence["investigation_decision_report"] = decision_report
+        state["master_report"] = master_report
+        state["business_report"] = business_report
+        state["executive_report"] = executive_report
+        state["analyst_report"] = analyst_report
+        state["report_package"] = report_package
+        state["final_report"] = "\n\n".join([part for part in [answer_synthesis_report, decision_report, master_report] if part])
+        record_evidence_provenance(
+            state,
+            "final_report",
+            scope="sampled" if fast_finalization else "exact",
+            source="report_node",
+            verified=not fast_finalization,
+            method="deterministic fast synthesis" if fast_finalization else "full analytical synthesis",
+        )
+        return state
+
     # Keep the executive report focused on the business question instead of branch noise.
     question_tokens = {
         token.strip(".,:;!?()[]{}<>\"'")
@@ -1886,6 +2250,14 @@ def report_node(state: AnalystState) -> AnalystState:
         state["final_report"] = "\n\n".join([part for part in [answer_synthesis_report, decision_report, analyst_report] if part])
     else:
         state["final_report"] = "\n\n".join([part for part in [answer_synthesis_report, decision_report, combined_report] if part])
+    record_evidence_provenance(
+        state,
+        "final_report",
+        scope="exact",
+        source="report_node",
+        verified=True,
+        method="full analytical synthesis",
+    )
 
     print("\n===== FINAL REPORT =====")
     print(state["final_report"])

@@ -52,6 +52,13 @@ export function cancelInvestigation(id) {
   });
 }
 
+export function continueInvestigation(id, payload) {
+  return request(`/api/investigations/${encodeURIComponent(id)}/action`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export function isApiLocal() {
   return API_BASE === '';
 }

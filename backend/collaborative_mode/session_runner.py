@@ -64,8 +64,8 @@ def _build_base_state(question: str, dataset_path: str | None, dataframe: Any | 
         "dataset_path": dataset_path,
         "dataframe": df,
         "mode": "collaborative",
-        "enable_llm_reasoning": False,
-        "disable_llm_reasoning": True,
+        "enable_llm_reasoning": True,
+        "disable_llm_reasoning": False,
         "disable_semantic_matcher": True,
         "analysis_evidence": {},
     }

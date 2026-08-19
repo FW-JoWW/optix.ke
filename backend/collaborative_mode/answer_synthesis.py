@@ -476,7 +476,7 @@ def _semantic_synthesize_answer(
     current_understanding: str,
     business_interpretation: str,
 ) -> tuple[Dict[str, Any], str]:
-    client = get_openai_client()
+    client = get_openai_client("answer_synthesis")
     if client is None:
         return (
             _semantic_answer_fallback(

@@ -1,4 +1,4 @@
-import { cancelInvestigation, getBootstrap, getInvestigation, getWorkspaceInvestigation, isApiLocal, listInvestigations, runInvestigation } from './api.js';
+import { cancelInvestigation, continueInvestigation, getBootstrap, getInvestigation, getWorkspaceInvestigation, isApiLocal, listInvestigations, runInvestigation } from './api.js';
 import { createFallbackBootstrap, emptyInvestigation, normalizeBootstrap, normalizeInvestigation, summarizeInvestigations, formatStageLabel } from './model.js';
 
 const app = document.querySelector('#app');
@@ -54,6 +54,14 @@ function getActiveInvestigation() {
   return state.investigations.find((item) => item.id === state.activeInvestigationId) || null;
 }
 
+function isPlaceholderInvestigationId(id) {
+  return text(id).toLowerCase().startsWith('pending-');
+}
+
+function hasRealInvestigationId(investigation) {
+  return Boolean(investigation?.id) && !isPlaceholderInvestigationId(investigation.id);
+}
+
 function mergeInvestigationRecords(existing, incoming) {
   if (!existing) return incoming;
   const merged = { ...existing, ...incoming };
@@ -95,7 +103,9 @@ function setActiveInvestigation(investigation) {
     state.investigations.unshift(normalized);
   }
   state.activeInvestigationId = normalized.id;
-  state.selectedStage = normalized.progress.find((stage) => stage.status === 'current')?.key || 'answer';
+  state.selectedStage =
+    normalized.progress.find((stage) => stage.status === 'current')?.key ||
+    (normalized.mode?.id === 'collaborative' ? 'evidence' : 'answer');
   state.selectedReport = normalized.reports.analyst ? 'analyst' : normalized.reports.business ? 'business' : normalized.reports.executive ? 'executive' : 'analyst';
   setRoute('investigations', normalized.id);
 }
@@ -216,6 +226,71 @@ function createPendingInvestigation(payload, id) {
     analysis_plan: [],
     awaiting_user: false,
   });
+}
+
+function buildCollaborativeInitialTasks(question) {
+  const safeQuestion = text(question) || 'the business question';
+  return [
+    {
+      title: 'Primary investigation',
+      request: safeQuestion,
+    },
+    {
+      title: 'Supporting evidence',
+      request: `Gather the strongest supporting evidence for ${safeQuestion}.`,
+    },
+    {
+      title: 'Next actions',
+      request: `Identify the next best actions after answering ${safeQuestion}.`,
+    },
+  ];
+}
+
+function extractRawEvidenceItems(investigation) {
+  const rawEvidence = investigation?.raw?.analysis_evidence || {};
+  const toolResults = rawEvidence.tool_results || investigation?.raw?.tool_results || {};
+  const items = [];
+
+  Object.entries(toolResults || {}).forEach(([key, value]) => {
+    if (!value) return;
+    items.push({
+      id: `raw-tool-${key}`,
+      kind: value.kind || value.type || 'tool',
+      label: text(value.label || value.tool || value.type || key || 'Evidence'),
+      summary: text(value.summary || value.insight || value.message || value.direct_answer || value.business_interpretation || value.recommended_next_step || 'Structured analytical output.'),
+      detail: JSON.stringify(value, null, 2),
+      confidence: text(value.confidence?.label || value.confidence?.score || value.confidence || ''),
+    });
+  });
+
+  const visuals = toArray(rawEvidence.visualizations || investigation?.raw?.visualizations);
+  visuals.forEach((visual, index) => {
+    if (!visual) return;
+    items.push({
+      id: `raw-visual-${index}`,
+      kind: 'visual',
+      label: text(visual.title || visual.caption || visual.type || `Visualization ${index + 1}`),
+      summary: text(visual.caption || visual.summary || visual.file_path || visual.path || 'Generated chart'),
+      detail: JSON.stringify(visual, null, 2),
+      confidence: 'High',
+    });
+  });
+
+  const session = rawEvidence.collaborative_session || investigation?.raw?.collaborative_session || {};
+  const store = session.evidence_store || rawEvidence.collaborative_evidence_store || investigation?.raw?.collaborative_evidence_store || {};
+  Object.entries(store || {}).forEach(([key, value]) => {
+    if (!value) return;
+    items.push({
+      id: `raw-collab-${key}`,
+      kind: 'collaborative',
+      label: text(value.evidence_type || value.task_source || `Evidence ${key}`),
+      summary: text(value.statement || value.summary || value.insight || 'Collaborative evidence item.'),
+      detail: JSON.stringify(value, null, 2),
+      confidence: text(value.confidence || ''),
+    });
+  });
+
+  return items;
 }
 
 function inflateSummaryInvestigation(summary) {
@@ -998,6 +1073,10 @@ function renderGuidedWorkspace(investigation, stage, reportText, canInteract = f
   const proposals = investigation.recommendations.slice(0, 3);
   const currentPhase = stage.label || 'Checkpoint';
   const workflowStatus = investigation.workflowStatus || {};
+  const checkpointSnapshot =
+    investigation.snapshots.find((snapshot) => snapshot.stage === stage.key && snapshot.kind === 'snapshot') ||
+    investigation.snapshots.find((snapshot) => snapshot.stage === stage.key) ||
+    null;
   const progressPercent = Number.isFinite(Number(workflowStatus.progress))
     ? Number(workflowStatus.progress)
     : Math.round((Math.max(1, investigation.progress.findIndex((item) => item.key === stage.key) + 1) / Math.max(1, investigation.progress.length)) * 100);
@@ -1026,6 +1105,34 @@ function renderGuidedWorkspace(investigation, stage, reportText, canInteract = f
 
       <div class="workspace-grid guided-grid">
         <main class="main-pane">
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <div class="section-label">Checkpoint context</div>
+                <h2>What the backend is waiting on</h2>
+              </div>
+            </div>
+            <div class="summary-grid compact-summary">
+              <div class="summary-card">
+                <span class="summary-label">Stage</span>
+                <strong>${escapeHtml(currentPhase)}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Mode</span>
+                <strong>Guided</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Status</span>
+                <strong>${escapeHtml(canInteract ? 'Awaiting input' : isRunning ? 'Running' : 'Checkpointed')}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Snapshots</span>
+                <strong>${investigation.snapshots.length}</strong>
+              </div>
+            </div>
+            <p class="subtle">${escapeHtml(checkpointSnapshot?.summary || 'Each guided checkpoint can be reviewed, revised, or continued before the workflow moves on.')}</p>
+          </section>
+
           <section class="panel">
             <div class="panel-heading">
               <div>
@@ -1058,6 +1165,20 @@ function renderGuidedWorkspace(investigation, stage, reportText, canInteract = f
                 </article>
               `).join('') : '<div class="empty-state">No proposal is currently exposed.</div>'}
             </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <div>
+                <div class="section-label">Your input</div>
+                <h2>Guide this checkpoint</h2>
+              </div>
+            </div>
+            <div class="command-input">
+              <label for="guideDraft">Checkpoint note</label>
+              <textarea id="guideDraft" name="guideDraft" rows="4" placeholder="Describe the change you want, or leave a short note for the checkpoint...">${escapeHtml(state.guideDraft)}</textarea>
+            </div>
+            <p class="subtle">Use the buttons above to continue, modify, or cancel this checkpoint. The note is sent along when you choose modify.</p>
           </section>
 
           <section class="panel">
@@ -1101,6 +1222,13 @@ function renderGuidedWorkspace(investigation, stage, reportText, canInteract = f
 
 function renderCollaborativeWorkspace(investigation, stage, options = {}) {
   const completed = Boolean(options.completed || text(investigation.status).toLowerCase().includes('completed'));
+  const collabSession = investigation.raw?.analysis_evidence?.collaborative_session || investigation.raw?.collaborative_session || {};
+  const collabTaskCount = toArray(collabSession.tasks).length || investigation.tasks.length;
+  const collabHypothesisCount = toArray(collabSession.hypotheses).length || investigation.hypotheses.length;
+  const collabEvidenceCount =
+    toArray(collabSession.evidence_store ? Object.values(collabSession.evidence_store) : []).length ||
+    toArray(investigation.raw?.analysis_evidence?.collaborative_evidence_store ? Object.values(investigation.raw.analysis_evidence.collaborative_evidence_store) : []).length ||
+    investigation.evidence.length;
   return `
     <section class="workspace collaborative-workspace">
       ${renderWorkspaceHeader(investigation, {
@@ -1111,6 +1239,29 @@ function renderCollaborativeWorkspace(investigation, stage, options = {}) {
 
       <div class="workspace-grid collaborative-grid">
         <aside class="collab-left">
+          <section class="panel">
+            <div class="section-label">Desk summary</div>
+            <div class="summary-grid compact-summary">
+              <div class="summary-card">
+                <span class="summary-label">Current understanding</span>
+                <strong>${escapeHtml(text(collabSession.current_understanding || investigation.answer.business || investigation.answer.direct) || 'Building')}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Queued tasks</span>
+                <strong>${collabSession.queued_tasks?.length ?? investigation.tasks.filter((task) => task.status === 'queued').length}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Evidence items</span>
+                <strong>${collabEvidenceCount}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Hypotheses</span>
+                <strong>${collabHypothesisCount}</strong>
+              </div>
+            </div>
+            <p class="subtle">${escapeHtml(collabSession.question_for_user || 'Collaborative mode is designed to queue, refine, compare, and challenge tasks as a shared investigation desk.')}</p>
+          </section>
+
           <section class="panel">
             <div class="section-label">Tasks</div>
             <div class="task-list">
@@ -1167,6 +1318,29 @@ function renderCollaborativeWorkspace(investigation, stage, options = {}) {
         <aside class="running-side">
           ${renderConfidencePanel(investigation)}
           ${renderSummaryPanel(investigation)}
+          <section class="panel">
+            <div class="section-label">Collaboration status</div>
+            <div class="summary-grid compact-summary">
+              <div class="summary-card">
+                <span class="summary-label">Workflow</span>
+                <strong>${escapeHtml(investigation.workflowStatus?.phase || 'unknown')}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Tasks</span>
+                <strong>${collabTaskCount}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Hypotheses</span>
+                <strong>${collabHypothesisCount}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Evidence</span>
+                <strong>${collabEvidenceCount}</strong>
+              </div>
+            </div>
+            <p class="subtle">${escapeHtml(investigation.workflowStatus?.message || 'The collaboration trace will appear once the backend exposes tasks, hypotheses, and evidence.')}</p>
+          </section>
+          ${renderControlPanel(investigation)}
           ${renderSnapshotsPanel(investigation)}
           <section class="panel">
             <div class="section-label">Next best actions</div>
@@ -1329,7 +1503,9 @@ function renderFindingsSection(investigation) {
 }
 
 function renderEvidenceSection(investigation) {
-  const chartItems = toArray(investigation.visualizations).filter(Boolean);
+  const rawEvidence = investigation.raw?.analysis_evidence || {};
+  const chartItems = toArray(investigation.visualizations.length ? investigation.visualizations : rawEvidence.visualizations || investigation.raw?.visualizations).filter(Boolean);
+  const evidenceItems = investigation.evidence.length ? investigation.evidence : extractRawEvidenceItems(investigation);
   return `
     <section class="stage-panel">
       <div class="section-head">
@@ -1340,17 +1516,22 @@ function renderEvidenceSection(investigation) {
         <button class="link-button" type="button" data-action="open-evidence" data-index="0">View more</button>
       </div>
       <div class="evidence-grid">
-        ${investigation.evidence.length
-          ? investigation.evidence.slice(0, 6).map(
+        ${evidenceItems.length
+          ? evidenceItems.slice(0, 6).map(
               (item, index) => `
                 <button class="evidence-chip" data-action="open-evidence" data-index="${index}">
-                  <span class="evidence-kind">${escapeHtml(item.label)}</span>
-                  <span class="evidence-summary">${escapeHtml(item.summary)}</span>
-                  <span class="evidence-meta">${escapeHtml(item.confidence)}</span>
+                  <span class="evidence-kind">${escapeHtml(item.label || item.tool || item.type || `Evidence ${index + 1}`)}</span>
+                  <span class="evidence-summary">${escapeHtml(item.summary || item.insight || item.message || item.direct_answer || plainText(item))}</span>
+                  <span class="evidence-meta">${escapeHtml([item.confidence, item.scope, item.priority || item.caption || ''].filter(Boolean).join(' · '))}</span>
                 </button>
               `,
             ).join('')
-          : '<div class="empty-state">The backend has not exposed supporting evidence yet.</div>'}
+          : `
+            <div class="empty-state">
+              <strong>No evidence items were exposed yet.</strong>
+              <p>The backend may still be building the investigation trail. When it does, supporting evidence cards and chart thumbnails will appear here.</p>
+            </div>
+          `}
       </div>
       ${chartItems.length ? `
         <div class="section-label mt">Charts</div>
@@ -1370,7 +1551,12 @@ function renderEvidenceSection(investigation) {
             `;
           }).join('')}
         </div>
-      ` : ''}
+      ` : `
+        <div class="empty-state">
+          <strong>No charts were exposed yet.</strong>
+          <p>When the backend produces visualizations, this section will render the generated charts directly from the investigation payload.</p>
+        </div>
+      `}
     </section>
   `;
 }
@@ -1589,7 +1775,7 @@ function renderDrawer(investigation, drawer) {
     `;
   }
   if (drawer.kind === 'evidence') {
-    const item = investigation.evidence[drawer.index];
+    const item = investigation.evidence[drawer.index] || extractRawEvidenceItems(investigation)[drawer.index];
     if (!item) return '';
     return `
       <div class="drawer-backdrop" data-action="close-drawer">
@@ -2037,10 +2223,10 @@ async function refreshBootstrap() {
   }
 }
 
-async function runQuestion(payload) {
+async function runQuestion(payload, options = {}) {
   state.loading = true;
   state.error = null;
-  const clientRequestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const clientRequestId = options.clientRequestId || `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const pendingInvestigation = createPendingInvestigation(payload, clientRequestId);
   state.investigations = [pendingInvestigation, ...state.investigations.filter((item) => item.id !== pendingInvestigation.id)];
   state.activeInvestigationId = pendingInvestigation.id;
@@ -2054,6 +2240,9 @@ async function runQuestion(payload) {
     ...payload,
     clientRequestId,
   };
+  if ((text(payload.mode).toLowerCase() || 'autonomous') === 'collaborative' && !requestPayload.initialTasks) {
+    requestPayload.initialTasks = buildCollaborativeInitialTasks(payload.question);
+  }
 
   const syncCurrent = (investigation) => {
     if (!investigation) return;
@@ -2158,7 +2347,8 @@ async function handleAction(action, target) {
   }
   if (action === 'open-evidence') {
     const current = getActiveInvestigation();
-    if (!current?.evidence?.length) return;
+    const availableEvidence = current?.evidence?.length ? current.evidence : extractRawEvidenceItems(current);
+    if (!availableEvidence.length) return;
     state.drawer = { kind: 'evidence', index: Number(target.dataset.index || 0) };
     render();
     return;
@@ -2232,7 +2422,7 @@ async function handleAction(action, target) {
   }
   if (action === 'cancel-run') {
     const current = getActiveInvestigation();
-    if (!current?.id) return;
+    if (!hasRealInvestigationId(current)) return;
     state.loading = true;
     render();
     try {
@@ -2254,19 +2444,32 @@ async function handleAction(action, target) {
     if (!command) return;
     state.commandDraft = command;
     const active = getActiveInvestigation();
-    runQuestion({
-      question: command,
-      datasetPath: active?.dataset?.path || state.form.datasetPath,
-      mode: 'collaborative',
-      initialTasks: active?.tasks || [],
-      collaborativeResponses: [command, 'continue', 'continue', 'continue'],
-    });
+    if (!hasRealInvestigationId(active)) return;
+    state.loading = true;
+    render();
+    try {
+      const response = await continueInvestigation(active.id, {
+        action: 'queue',
+        details: command,
+        question: active.question,
+        datasetPath: active?.dataset?.path || state.form.datasetPath,
+        mode: 'collaborative',
+      });
+      const investigation = response.investigation || response;
+      await loadInvestigation(investigation.id);
+      state.error = null;
+    } catch (error) {
+      state.error = error;
+    } finally {
+      state.loading = false;
+      render();
+    }
     return;
   }
   if (action === 'guided-continue' || action === 'guided-modify' || action === 'guided-stop') {
     const current = getActiveInvestigation();
     const currentStatus = text(current?.status).toLowerCase();
-    if (!currentStatus.includes('await')) {
+    if (!currentStatus.includes('await') || !hasRealInvestigationId(current)) {
       return;
     }
     const input = document.querySelector('#guideDraft');
@@ -2278,12 +2481,27 @@ async function handleAction(action, target) {
         : action === 'guided-modify'
           ? ['modify', detail, 'continue', 'continue']
           : ['continue', 'continue', 'continue', 'continue'];
-    runQuestion({
-      question: getActiveInvestigation()?.question || state.form.question,
-      datasetPath: getActiveInvestigation()?.dataset?.path || state.form.datasetPath,
-      mode: 'guided',
-      guidedResponses: responses,
-    });
+    if (!current?.id) return;
+    state.loading = true;
+    render();
+    try {
+      const response = await continueInvestigation(current.id, {
+        action: action === 'guided-stop' ? 'cancel' : action === 'guided-modify' ? 'modify' : 'continue',
+        details: detail,
+        question: current.question || state.form.question,
+        datasetPath: current?.dataset?.path || state.form.datasetPath,
+        mode: 'guided',
+        guidedResponses: responses,
+      });
+      const investigation = response.investigation || response;
+      await loadInvestigation(investigation.id);
+      state.error = null;
+    } catch (error) {
+      state.error = error;
+    } finally {
+      state.loading = false;
+      render();
+    }
     return;
   }
 }

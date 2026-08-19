@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from io import StringIO
 from contextlib import redirect_stdout
+import uuid
 from typing import Any, Dict, Iterable, List, Sequence
 
 import pandas as pd
@@ -38,7 +39,7 @@ class CollaborativeRunResult:
 def _utc_session_id() -> str:
     from datetime import datetime, timezone
 
-    return datetime.now(timezone.utc).strftime("inv-%Y%m%d-%H%M%S")
+    return f"inv-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')}-{uuid.uuid4().hex[:6]}"
 
 
 def create_investigation_session(question: str) -> InvestigationSession:
@@ -633,6 +634,9 @@ def run_collaborative_investigation(
     dataframe: Any | None = None,
     initial_tasks: Sequence[Dict[str, Any] | str] | None = None,
     build_final_report: bool = True,
+    fast_finalization: bool = False,
+    record_id: str | None = None,
+    live_status_hook=None,
 ) -> CollaborativeRunResult:
     """
     Run an investigation by dispatching each task through the existing analytical pipeline.
@@ -655,11 +659,17 @@ def run_collaborative_investigation(
         "dataset_path": dataset_path,
         "dataframe": df,
         "mode": "collaborative",
-        "enable_llm_reasoning": False,
-        "disable_llm_reasoning": True,
+        "enable_llm_reasoning": True,
+        "disable_llm_reasoning": False,
         "disable_semantic_matcher": True,
         "analysis_evidence": {},
+        "fast_finalization": fast_finalization,
     }
+    if record_id:
+        base_state["id"] = record_id
+        base_state["investigation_id"] = record_id
+    if live_status_hook is not None:
+        base_state["_live_status_hook"] = live_status_hook
 
     session = create_investigation_session(question)
     manager = TaskManager(session)
@@ -770,7 +780,10 @@ def run_collaborative_investigation(
                 session.investigation_memory["current_understanding"] = session.original_question
         session.investigation_memory.setdefault("previous_findings", []).append(summary["task_finding"])
         session.investigation_memory.setdefault("task_references", []).append(task.task_id)
-        next_suggestions = _suggest_next_investigations(session, final_state, task.task_id)
+        if fast_finalization:
+            next_suggestions: List[Dict[str, Any]] = []
+        else:
+            next_suggestions = _suggest_next_investigations(session, final_state, task.task_id)
         session.ai_suggestions = next_suggestions
         session.checkpoint_summaries.append(
             {
@@ -794,7 +807,7 @@ def run_collaborative_investigation(
                 "next_investigations": list(next_suggestions),
             }
         )
-        if len(session.completed_tasks) >= 2:
+        if not fast_finalization and len(session.completed_tasks) >= 2:
             comparison = manager.compare_tasks(session.completed_tasks[-2], session.completed_tasks[-1])
             session.investigation_memory.setdefault("comparison_history", []).append(comparison)
         task_outputs[task.task_id] = summary
@@ -828,6 +841,13 @@ def run_collaborative_investigation(
     final_state["analysis_evidence"]["collaborative_desk"] = _build_desk_view(session)
     final_state["analysis_evidence"]["investigation_decision"] = session.investigation_memory.get("investigation_decision") or {}
     final_state["investigation_decision"] = session.investigation_memory.get("investigation_decision") or {}
+    final_state["status"] = "completed" if final_state.get("final_report") else ("awaiting_user" if session.current_status == "awaiting_user" else "running")
+    final_state["workflow_status"] = final_state.get("workflow_status") or {
+        "phase": "completed" if session.current_status == "completed" else "running",
+        "message": "Collaborative investigation finished." if session.current_status == "completed" else "Collaborative investigation is still active.",
+        "progress": 100 if session.current_status == "completed" else 80,
+        "current_operation": "final synthesis" if session.current_status == "completed" else "collaboration",
+    }
 
     if build_final_report:
         final_state = report_node(final_state)
@@ -857,6 +877,13 @@ def run_collaborative_investigation(
         final_state["final_report"] = "\n".join(report_lines)
         session.final_executive_report = final_state["final_report"]
 
+    final_state["workflow_status"] = {
+        "phase": "completed" if final_state.get("final_report") else ("awaiting_user" if session.current_status == "awaiting_user" else "running"),
+        "message": "Collaborative investigation complete." if final_state.get("final_report") else ("Awaiting user input." if session.current_status == "awaiting_user" else "Collaborative investigation is still active."),
+        "progress": 100 if final_state.get("final_report") else (94 if session.current_status == "awaiting_user" else 80),
+        "current_operation": "final synthesis" if final_state.get("final_report") else ("awaiting_user" if session.current_status == "awaiting_user" else "collaboration"),
+        "status": "completed" if final_state.get("final_report") else ("awaiting_user" if session.current_status == "awaiting_user" else "running"),
+    }
     final_state["collaborative_final_report"] = final_state.get("final_report")
 
     return CollaborativeRunResult(

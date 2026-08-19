@@ -167,7 +167,7 @@ def infer_context(
         fallback["reasoning_status"] = "rules_only"
         return fallback
 
-    client = get_openai_client()
+    client = get_openai_client("context_inference")
     if client is None:
         fallback["reasoning_status"] = "unavailable"
         return fallback

@@ -189,7 +189,7 @@ def generate_insights(
         details = [fallback_detail(story) for story in top_stories]
         return format_details(details), [], details, "disabled"
 
-    client = get_openai_client()
+    client = get_openai_client("insight_generation")
     if client is None:
         details = [fallback_detail(story) for story in top_stories]
         return format_details(details), [], details, "fallback_used: OPENAI_API_KEY not set"
