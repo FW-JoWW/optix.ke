@@ -57,7 +57,7 @@ export function formatStageLabel(stage) {
   return labels[stage] || capitalize(stage);
 }
 
-function toArray(value) {
+export function toArray(value) {
   if (!value) return [];
   return Array.isArray(value) ? value : [value];
 }
@@ -775,5 +775,6 @@ export function emptyInvestigation() {
     analysisPlan: [],
     selectedColumns: [],
     visualizations: [],
+    executionTrace: [],
   };
 }

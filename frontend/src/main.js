@@ -1,5 +1,5 @@
 import { cancelInvestigation, continueInvestigation, getBootstrap, getInvestigation, getWorkspaceInvestigation, isApiLocal, listInvestigations, runInvestigation } from './api.js';
-import { createFallbackBootstrap, emptyInvestigation, normalizeBootstrap, normalizeInvestigation, summarizeInvestigations, formatStageLabel } from './model.js';
+import { createFallbackBootstrap, emptyInvestigation, normalizeBootstrap, normalizeInvestigation, summarizeInvestigations, formatStageLabel, toArray } from './model.js';
 
 const app = document.querySelector('#app');
 
@@ -1002,9 +1002,12 @@ function renderRunningWorkspace(investigation, stage) {
   const activeLabel = progressSteps[Math.min(progressSteps.length - 1, currentIndex)];
   const workflowStatus = investigation.workflowStatus || {};
   const workflowMessage = workflowStatus.message || `Working on ${activeLabel.toLowerCase()} for ${investigation.question}`;
+  const workflowOperation = text(workflowStatus.current_operation || workflowStatus.currentOperation || 'working');
   const workflowPercent = Number.isFinite(Number(workflowStatus.progress)) ? Number(workflowStatus.progress) : Math.round(((currentIndex + 1) / Math.max(1, investigation.progress.length)) * 100);
   const activityLines = [
     workflowMessage,
+    `Current operation: ${workflowOperation}`,
+    `Execution trace entries: ${investigation.executionTrace.length}`,
     ...investigation.analysisPlan.slice(0, 5).map((item) => text(typeof item === 'string' ? item : item.description || item.purpose || item.tool || JSON.stringify(item))),
   ].filter(Boolean);
   const logLines = [
@@ -1050,6 +1053,7 @@ function renderRunningWorkspace(investigation, stage) {
               <div class="progress-percent">${percent}%</div>
             </div>
             <p class="subtle">${escapeHtml(workflowMessage)}</p>
+            <p class="subtle">Current operation: ${escapeHtml(workflowOperation)}</p>
             <div class="metrics-grid">
               <div><span class="metric-label">Elapsed</span><strong>--:--</strong></div>
               <div><span class="metric-label">Remaining</span><strong>--:--</strong></div>
@@ -1082,6 +1086,7 @@ function renderGuidedWorkspace(investigation, stage, reportText, canInteract = f
     : Math.round((Math.max(1, investigation.progress.findIndex((item) => item.key === stage.key) + 1) / Math.max(1, investigation.progress.length)) * 100);
   const statusLabel = canInteract ? 'Awaiting your input' : isRunning ? 'Running guided workflow' : 'Guided';
   const bannerTitle = canInteract ? 'Review required' : isRunning ? 'Running guided workflow' : 'Guided workflow';
+  const workflowOperation = text(workflowStatus.current_operation || workflowStatus.currentOperation || 'working');
   return `
     <section class="workspace guided-workspace">
       ${renderWorkspaceHeader(investigation, {
@@ -1096,6 +1101,7 @@ function renderGuidedWorkspace(investigation, stage, reportText, canInteract = f
         <div>
           <div class="review-label">${escapeHtml(bannerTitle)}</div>
           <p>${escapeHtml(canInteract ? (investigation.answer.business || 'The workflow has reached a checkpoint and is waiting for your decision before it proceeds.') : (workflowStatus.message || 'The guided workflow is still maturing. Checkpoints and decisions will appear as the backend advances.'))}</p>
+          <p class="subtle">Current operation: ${escapeHtml(workflowOperation)} | Trace entries: ${investigation.executionTrace.length}</p>
           <div class="progress-bar-row">
             <div class="progress-bar"><span style="width: ${progressPercent}%;"></span></div>
             <div class="progress-percent">${progressPercent}%</div>
@@ -1326,6 +1332,10 @@ function renderCollaborativeWorkspace(investigation, stage, options = {}) {
                 <strong>${escapeHtml(investigation.workflowStatus?.phase || 'unknown')}</strong>
               </div>
               <div class="summary-card">
+                <span class="summary-label">Operation</span>
+                <strong>${escapeHtml(text(investigation.workflowStatus?.current_operation || investigation.workflowStatus?.currentOperation || 'working'))}</strong>
+              </div>
+              <div class="summary-card">
                 <span class="summary-label">Tasks</span>
                 <strong>${collabTaskCount}</strong>
               </div>
@@ -1336,6 +1346,10 @@ function renderCollaborativeWorkspace(investigation, stage, options = {}) {
               <div class="summary-card">
                 <span class="summary-label">Evidence</span>
                 <strong>${collabEvidenceCount}</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">Trace</span>
+                <strong>${investigation.executionTrace.length}</strong>
               </div>
             </div>
             <p class="subtle">${escapeHtml(investigation.workflowStatus?.message || 'The collaboration trace will appear once the backend exposes tasks, hypotheses, and evidence.')}</p>
@@ -1725,6 +1739,10 @@ function renderControlPanel(investigation) {
         <div class="signal-list">
           ${investigation.tasks.length ? investigation.tasks.slice(0, 4).map((task) => `<div class="signal-row"><span class="signal-check">-</span><span>${escapeHtml(task.title)} <em>(${escapeHtml(task.status)})</em></span></div>`).join('') : '<div class="signal-row"><span class="signal-check">-</span><span>No tasks tracked yet.</span></div>'}
         </div>
+        <div class="panel-actions">
+          <button class="link-button" type="button" data-action="open-collaboration">View collaboration details</button>
+          <button class="link-button" type="button" data-action="open-evidence" data-index="0">View evidence</button>
+        </div>
       </section>
     `;
   }
@@ -1775,7 +1793,9 @@ function renderDrawer(investigation, drawer) {
     `;
   }
   if (drawer.kind === 'evidence') {
-    const item = investigation.evidence[drawer.index] || extractRawEvidenceItems(investigation)[drawer.index];
+    const evidenceItems = investigation.evidence.length ? investigation.evidence : extractRawEvidenceItems(investigation);
+    const safeIndex = Number.isFinite(Number(drawer.index)) ? Number(drawer.index) : 0;
+    const item = evidenceItems[safeIndex] || evidenceItems[0];
     if (!item) return '';
     return `
       <div class="drawer-backdrop" data-action="close-drawer">
@@ -1791,6 +1811,71 @@ function renderDrawer(investigation, drawer) {
             <p>${escapeHtml(item.summary)}</p>
             ${item.kind === 'visual' && chartAssetUrl(item.detail) ? `<img class="drawer-chart-image" src="${escapeHtml(chartAssetUrl(item.detail))}" alt="${escapeHtml(item.label)}" />` : ''}
             <pre>${escapeHtml(item.detail)}</pre>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  if (drawer.kind === 'collaboration') {
+    const session = investigation.raw?.analysis_evidence?.collaborative_session || investigation.raw?.collaborative_session || {};
+    const tasks = toArray(session.tasks || investigation.tasks);
+    const hypotheses = toArray(session.hypotheses || investigation.hypotheses);
+    const evidenceItems = investigation.evidence.length ? investigation.evidence : extractRawEvidenceItems(investigation);
+    const traceItems = investigation.executionTrace.slice(-8);
+    return `
+      <div class="drawer-backdrop" data-action="close-drawer">
+        <div class="drawer drawer-wide" role="dialog" aria-modal="true" aria-label="Collaboration details">
+          <div class="drawer-head">
+            <div>
+              <div class="section-label">Collaborative context</div>
+              <h2>${escapeHtml(investigation.question)}</h2>
+            </div>
+            <button class="icon-button" data-action="close-drawer">Close</button>
+          </div>
+          <div class="drawer-body">
+            <div class="snapshot-card-grid">
+              <article class="snapshot-detail-card"><span class="snapshot-detail-label">Status</span><strong>${escapeHtml(investigation.workflowStatus?.phase || investigation.status || 'unknown')}</strong></article>
+              <article class="snapshot-detail-card"><span class="snapshot-detail-label">Tasks</span><strong>${tasks.length}</strong></article>
+              <article class="snapshot-detail-card"><span class="snapshot-detail-label">Hypotheses</span><strong>${hypotheses.length}</strong></article>
+              <article class="snapshot-detail-card"><span class="snapshot-detail-label">Evidence</span><strong>${evidenceItems.length}</strong></article>
+            </div>
+            <div class="drawer-block">
+              <h3>Tasks</h3>
+              ${tasks.length ? `<ul>${tasks.slice(0, 8).map((task) => `<li>${escapeHtml(text(task.title || task.request || 'Task'))} <span class="subtle">(${escapeHtml(text(task.status || 'queued'))})</span></li>`).join('')}</ul>` : '<p class="subtle">No tasks are currently exposed.</p>'}
+            </div>
+            <div class="drawer-block">
+              <h3>Hypotheses</h3>
+              ${hypotheses.length ? `<ul>${hypotheses.slice(0, 8).map((hypothesis) => `<li>${escapeHtml(text(hypothesis.statement || hypothesis.hypothesis || 'Hypothesis'))}</li>`).join('')}</ul>` : '<p class="subtle">No hypotheses are currently exposed.</p>'}
+            </div>
+            <div class="drawer-block">
+              <h3>Evidence</h3>
+              ${evidenceItems.length ? `
+                <ul>
+                  ${evidenceItems.slice(0, 8).map((item, index) => `
+                    <li>
+                      <button class="inline-link-button" type="button" data-action="open-evidence" data-index="${index}">
+                        <strong>${escapeHtml(text(item.label || item.kind || 'Evidence'))}</strong>
+                      </button>
+                      <span class="subtle"> ${escapeHtml(text(item.summary || item.detail || ''))}</span>
+                    </li>
+                  `).join('')}
+                </ul>
+              ` : '<p class="subtle">No evidence is currently exposed.</p>'}
+            </div>
+            <div class="drawer-block">
+              <h3>Live trace</h3>
+              ${traceItems.length ? `
+                <ol>
+                  ${traceItems.map((entry) => `
+                    <li>
+                      <strong>${escapeHtml(text(entry.phase || 'step'))}</strong>
+                      <span class="subtle"> ${escapeHtml(text(entry.message || entry.operation || ''))}</span>
+                      ${entry.progress !== undefined ? `<div class="subtle">Progress: ${escapeHtml(text(entry.progress))}%</div>` : ''}
+                    </li>
+                  `).join('')}
+                </ol>
+              ` : '<p class="subtle">No execution trace has been captured yet.</p>'}
+            </div>
           </div>
         </div>
       </div>
@@ -2349,7 +2434,15 @@ async function handleAction(action, target) {
     const current = getActiveInvestigation();
     const availableEvidence = current?.evidence?.length ? current.evidence : extractRawEvidenceItems(current);
     if (!availableEvidence.length) return;
-    state.drawer = { kind: 'evidence', index: Number(target.dataset.index || 0) };
+    const requestedIndex = Number(target.dataset.index || 0);
+    state.drawer = { kind: 'evidence', index: Number.isFinite(requestedIndex) ? requestedIndex : 0 };
+    render();
+    return;
+  }
+  if (action === 'open-collaboration') {
+    const current = getActiveInvestigation();
+    if (!current) return;
+    state.drawer = { kind: 'collaboration' };
     render();
     return;
   }
